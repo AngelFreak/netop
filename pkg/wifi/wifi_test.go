@@ -1,0 +1,760 @@
+package wifi
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// Mock implementations
+type mockSystemExecutor struct {
+	commands    map[string]string
+	errors      map[string]error
+	callCount   map[string]int
+	hasCommands map[string]bool // which commands are "installed"
+}
+
+func (m *mockSystemExecutor) Execute(cmd string, args ...string) (string, error) {
+	fullCmd := cmd
+	for _, arg := range args {
+		fullCmd += " " + arg
+	}
+
+	// Special handling for wpa_cli status when callCount is set (for association simulation)
+	if fullCmd == "wpa_cli -i wlan0 status" && m.callCount != nil {
+		count := m.callCount[fullCmd]
+		m.callCount[fullCmd] = count + 1
+		if count == 0 {
+			return "wpa_state=SCANNING", nil
+		} else {
+			return "wpa_state=COMPLETED\nssid=TestSSID", nil
+		}
+	}
+
+	// Check for errors first
+	if err, hasErr := m.errors[fullCmd]; hasErr {
+		output := ""
+		if val, ok := m.commands[fullCmd]; ok {
+			output = val
+		}
+		return output, err
+	}
+
+	if output, ok := m.commands[fullCmd]; ok {
+		return output, nil
+	}
+	return "mock output", nil
+}
+
+func (m *mockSystemExecutor) ExecuteContext(ctx context.Context, cmd string, args ...string) (string, error) {
+	return m.Execute(cmd, args...)
+}
+
+func (m *mockSystemExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
+	return m.Execute(cmd, args...)
+}
+
+func (m *mockSystemExecutor) ExecuteWithInput(cmd string, input string, args ...string) (string, error) {
+	return "mock output with input", nil
+}
+
+func (m *mockSystemExecutor) ExecuteWithInputContext(ctx context.Context, cmd string, input string, args ...string) (string, error) {
+	return m.ExecuteWithInput(cmd, input, args...)
+}
+
+func (m *mockSystemExecutor) HasCommand(cmd string) bool {
+	if m.hasCommands == nil {
+		return false // default: no commands installed (use dhclient fallback)
+	}
+	return m.hasCommands[cmd]
+}
+
+type mockLogger struct{}
+
+func (m *mockLogger) Debug(msg string, fields ...interface{}) {}
+func (m *mockLogger) Info(msg string, fields ...interface{})  {}
+func (m *mockLogger) Warn(msg string, fields ...interface{})  {}
+func (m *mockLogger) Error(msg string, fields ...interface{}) {}
+
+func TestNewManager(t *testing.T) {
+	executor := &mockSystemExecutor{}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0")
+	assert.NotNil(t, manager)
+	assert.Equal(t, "wlan0", manager.iface)
+}
+
+func TestScan(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip link set wlan0 up": "",
+				"iw wlan0 scan":        "",
+				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: TestNetwork
+signal: -50.00
+freq: 2412
+
+BSS 11:22:33:44:55:66(on wlan0)
+SSID: AnotherNetwork
+signal: -60.00
+freq: 2437
+`,
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0")
+
+		networks, err := manager.Scan()
+		assert.NoError(t, err)
+		assert.Len(t, networks, 2)
+
+		// Networks should be sorted by signal strength (strongest first)
+		// TestNetwork (-50 dBm) should come before AnotherNetwork (-60 dBm)
+		assert.Equal(t, "TestNetwork", networks[0].SSID)
+		assert.Equal(t, "aa:bb:cc:dd:ee:ff", networks[0].BSSID)
+		assert.Equal(t, -50, networks[0].Signal)
+		assert.Equal(t, 2412, networks[0].Frequency)
+
+		assert.Equal(t, "AnotherNetwork", networks[1].SSID)
+		assert.Equal(t, "11:22:33:44:55:66", networks[1].BSSID)
+		assert.Equal(t, -60, networks[1].Signal)
+		assert.Equal(t, 2437, networks[1].Frequency)
+	})
+
+	t.Run("scan fails", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip link set wlan0 up": "",
+				"iw wlan0 scan":        "",
+			},
+			errors: map[string]error{
+				"iw wlan0 scan": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0")
+
+		_, err := manager.Scan()
+		assert.Error(t, err)
+	})
+}
+
+func TestConnect(t *testing.T) {
+	t.Run("reconnects even if already connected to different network", func(t *testing.T) {
+		// When connected to a different network, disconnect first
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
+SSID: OtherSSID`,
+				// Disconnect commands (using new fast kill with -9)
+				"pkill -9 -f wpa_supplicant":    "",
+				"pkill -9 -f dhclient":          "",
+				"ip addr flush dev wlan0":    "",
+				"ip route flush dev wlan0":   "",
+				"ip link set wlan0 down":     "",
+				// Reconnect commands
+				"ip link set wlan0 up":       "",
+				"mkdir -p /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /tmp/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				"wpa_cli -i wlan0 status":    "wpa_state=COMPLETED\nssid=TestSSID",
+				// New streamlined DHCP flow
+				"pkill -9 -f udhcpc.*wlan0":   "",
+				"pkill -9 -f dhclient.*wlan0":   "",
+				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /tmp/dhclient.wlan0.leases": "",
+				"timeout 15 dhclient -v wlan0": "",
+				"ip addr show wlan0":         "inet 192.168.1.100/24",
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0")
+
+		err := manager.Connect("TestSSID", "password", "")
+		assert.NoError(t, err)
+	})
+
+	t.Run("needs connection", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 link":           "Not connected",
+				"ip link set wlan0 up":    "",
+				"pkill -9 -f wpa_supplicant": "",
+				"mkdir -p /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /tmp/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				// New streamlined DHCP flow
+				"pkill -9 -f udhcpc.*wlan0":   "",
+				"pkill -9 -f dhclient.*wlan0":   "",
+				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /tmp/dhclient.wlan0.leases": "",
+				"timeout 15 dhclient -v wlan0": "",
+				"ip addr show wlan0":         "inet 192.168.1.100/24",
+			},
+			callCount: make(map[string]int),
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0")
+
+		err := manager.Connect("TestSSID", "password", "")
+		assert.NoError(t, err)
+	})
+
+	t.Run("association timeout", func(t *testing.T) {
+		// Test that timeout is properly handled when network is unavailable
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 link":           "Not connected",
+				"ip link set wlan0 up":    "",
+				"pkill -f wpa_supplicant": "",
+				"mkdir -p /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /tmp/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				"wpa_cli -i wlan0 status": "wpa_state=SCANNING", // Never completes
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0")
+		manager.associationTimeout = 1 * time.Second // Short timeout for test
+
+		err := manager.Connect("UnavailableSSID", "password", "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "timeout waiting for association")
+	})
+}
+
+func TestDisconnect(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pkill -9 -f wpa_supplicant": "",
+			"pkill -9 -f dhclient":       "",
+			"ip addr flush dev wlan0":   "",
+			"ip route flush dev wlan0":  "",
+			"ip link set wlan0 down":    "",
+		},
+	}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0")
+
+	err := manager.Disconnect()
+	assert.NoError(t, err)
+}
+
+func TestListConnections(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0
+       valid_lft forever preferred_lft forever`,
+			"ip route show dev wlan0": `default via 192.168.1.1 dev wlan0`,
+			"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
+SSID: TestNetwork`,
+			"cat /etc/resolv.conf": `nameserver 8.8.8.8
+nameserver 1.1.1.1`,
+		},
+	}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0")
+
+	connections, err := manager.ListConnections()
+	assert.NoError(t, err)
+	assert.Len(t, connections, 1)
+	conn := connections[0]
+	assert.Equal(t, "wlan0", conn.Interface)
+	assert.Equal(t, "TestNetwork", conn.SSID)
+	assert.Equal(t, "connected", conn.State)
+	assert.Equal(t, net.ParseIP("192.168.1.100"), conn.IP)
+	assert.Equal(t, net.ParseIP("192.168.1.1"), conn.Gateway)
+	assert.Len(t, conn.DNS, 2)
+}
+
+func TestGetInterface(t *testing.T) {
+	executor := &mockSystemExecutor{}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0")
+
+	assert.Equal(t, "wlan0", manager.GetInterface())
+}
+
+func TestParseScanResults(t *testing.T) {
+	manager := &Manager{}
+
+	output := `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: TestNetwork
+signal: -50.00
+freq: 2412
+
+BSS 11:22:33:44:55:66(on wlan0)
+SSID: AnotherNetwork
+signal: -60.00
+freq: 2437
+`
+
+	networks, err := manager.parseScanResults(output)
+	assert.NoError(t, err)
+	assert.Len(t, networks, 2)
+
+	// Networks should be sorted by signal strength (strongest first)
+	assert.Equal(t, "TestNetwork", networks[0].SSID)
+	assert.Equal(t, "aa:bb:cc:dd:ee:ff", networks[0].BSSID)
+	assert.Equal(t, -50, networks[0].Signal)
+	assert.Equal(t, 2412, networks[0].Frequency)
+
+	assert.Equal(t, "AnotherNetwork", networks[1].SSID)
+	assert.Equal(t, "11:22:33:44:55:66", networks[1].BSSID)
+	assert.Equal(t, -60, networks[1].Signal)
+	assert.Equal(t, 2437, networks[1].Frequency)
+}
+
+func TestParseScanResultsSignalSorting(t *testing.T) {
+	manager := &Manager{}
+
+	// Test with multiple networks having different signal strengths
+	output := `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: WeakNetwork
+signal: -85.00
+freq: 2412
+
+BSS 11:22:33:44:55:66(on wlan0)
+SSID: StrongNetwork
+signal: -30.00
+freq: 2437
+
+BSS 77:88:99:aa:bb:cc(on wlan0)
+SSID: MediumNetwork
+signal: -55.00
+freq: 2462
+
+BSS dd:ee:ff:11:22:33(on wlan0)
+SSID: VeryWeakNetwork
+signal: -95.00
+freq: 5180
+`
+
+	networks, err := manager.parseScanResults(output)
+	assert.NoError(t, err)
+	assert.Len(t, networks, 4)
+
+	// Networks should be sorted by signal strength (strongest first)
+	// Expected order: StrongNetwork (-30), MediumNetwork (-55), WeakNetwork (-85), VeryWeakNetwork (-95)
+	assert.Equal(t, "StrongNetwork", networks[0].SSID)
+	assert.Equal(t, -30, networks[0].Signal)
+
+	assert.Equal(t, "MediumNetwork", networks[1].SSID)
+	assert.Equal(t, -55, networks[1].Signal)
+
+	assert.Equal(t, "WeakNetwork", networks[2].SSID)
+	assert.Equal(t, -85, networks[2].Signal)
+
+	assert.Equal(t, "VeryWeakNetwork", networks[3].SSID)
+	assert.Equal(t, -95, networks[3].Signal)
+}
+
+func TestGenerateWPAConfig(t *testing.T) {
+	manager := &Manager{}
+
+	t.Run("with password", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "")
+		assert.Contains(t, config, `ssid="TestSSID"`)
+		assert.Contains(t, config, `psk="password"`)
+	})
+
+	t.Run("open network", func(t *testing.T) {
+		config := manager.generateWPAConfig("OpenSSID", "", "")
+		assert.Contains(t, config, `ssid="OpenSSID"`)
+		assert.Contains(t, config, `key_mgmt=NONE`)
+	})
+
+	t.Run("with BSSID pinning", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "00:11:22:33:44:55")
+		assert.Contains(t, config, `ssid="TestSSID"`)
+		assert.Contains(t, config, `psk="password"`)
+		assert.Contains(t, config, `bssid=00:11:22:33:44:55`)
+	})
+
+	t.Run("escapes special characters in SSID", func(t *testing.T) {
+		// Test SSID with quotes and backslashes
+		config := manager.generateWPAConfig(`Test"SSID\with\special`, "password", "")
+		assert.Contains(t, config, `ssid="Test\"SSID\\with\\special"`)
+		assert.Contains(t, config, `psk="password"`)
+	})
+
+	t.Run("escapes special characters in password", func(t *testing.T) {
+		// Test password with quotes and backslashes
+		config := manager.generateWPAConfig("TestSSID", `pass"word\with\quotes`, "")
+		assert.Contains(t, config, `ssid="TestSSID"`)
+		assert.Contains(t, config, `psk="pass\"word\\with\\quotes"`)
+	})
+
+	t.Run("escapes special characters in open network", func(t *testing.T) {
+		// Test open network with special characters in SSID
+		config := manager.generateWPAConfig(`Evil"Network`, "", "")
+		assert.Contains(t, config, `ssid="Evil\"Network"`)
+		assert.Contains(t, config, `key_mgmt=NONE`)
+	})
+}
+
+func TestObtainDHCP(t *testing.T) {
+	t.Run("uses dhclient when udhcpc not available", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				// New streamlined DHCP flow
+				"pkill -9 -f dhclient.*wlan0":     "",
+				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /tmp/dhclient.wlan0.leases": "",
+				"timeout 15 dhclient -v wlan0":   "",
+				"ip addr show wlan0":             "inet 192.168.1.100/24",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		err := manager.obtainDHCP("")
+		assert.NoError(t, err)
+	})
+
+	t.Run("uses udhcpc when available", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			hasCommands: map[string]bool{"udhcpc": true},
+			commands: map[string]string{
+				"pkill -9 -f udhcpc.*wlan0":      "",
+				"pkill -9 -f dhclient.*wlan0":    "",
+				"udhcpc -i wlan0 -n -q":          "",
+				"ip addr show wlan0":             "inet 192.168.1.100/24",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		err := manager.obtainDHCP("")
+		assert.NoError(t, err)
+	})
+}
+
+func TestParseIPAddress(t *testing.T) {
+	manager := &Manager{}
+
+	output := `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0
+       valid_lft forever preferred_lft forever`
+
+	ip := manager.parseIPAddress(output)
+	assert.Equal(t, net.ParseIP("192.168.1.100"), ip)
+}
+
+func TestParseGateway(t *testing.T) {
+	manager := &Manager{}
+
+	output := `default via 192.168.1.1 dev wlan0`
+
+	gateway := manager.parseGateway(output)
+	assert.Equal(t, net.ParseIP("192.168.1.1"), gateway)
+}
+
+func TestGetCurrentSSID(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
+SSID: TestNetwork`,
+		},
+	}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+	ssid, err := manager.getCurrentSSID()
+	assert.NoError(t, err)
+	assert.Equal(t, "TestNetwork", ssid)
+}
+
+func TestGetDNSServers(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"cat /etc/resolv.conf": `nameserver 8.8.8.8
+nameserver 1.1.1.1`,
+		},
+	}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+	dns, err := manager.getDNSServers()
+	assert.NoError(t, err)
+	assert.Len(t, dns, 2)
+	assert.Equal(t, net.ParseIP("8.8.8.8"), dns[0])
+	assert.Equal(t, net.ParseIP("1.1.1.1"), dns[1])
+}
+
+func TestWriteFile(t *testing.T) {
+	executor := &mockSystemExecutor{}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+	err := manager.writeFile("/tmp/test", "content")
+	assert.NoError(t, err)
+}
+
+func TestReadFile(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"cat /etc/resolv.conf": "nameserver 8.8.8.8",
+		},
+	}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+	content, err := manager.readFile("/etc/resolv.conf")
+	assert.NoError(t, err)
+	assert.Equal(t, "nameserver 8.8.8.8", content)
+}
+
+func TestDecodeSSID(t *testing.T) {
+	manager := &Manager{}
+
+	t.Run("ASCII SSID", func(t *testing.T) {
+		ssid := manager.decodeSSID("TestNetwork")
+		assert.Equal(t, "TestNetwork", ssid)
+	})
+
+	t.Run("Invalid escape", func(t *testing.T) {
+		// Invalid hex should be left as is
+		ssid := manager.decodeSSID("Test\\xZZ")
+		assert.Equal(t, "Test\\xZZ", ssid)
+	})
+
+	t.Run("Hex encoded SSID", func(t *testing.T) {
+		// Test with actual hex encoded chars
+		ssid := manager.decodeSSID("Test\\x20Network") // \x20 is space
+		assert.Equal(t, "Test Network", ssid)
+	})
+
+	t.Run("Multiple hex escapes", func(t *testing.T) {
+		ssid := manager.decodeSSID("\\x48\\x65\\x6c\\x6c\\x6f") // "Hello"
+		assert.Equal(t, "Hello", ssid)
+	})
+}
+
+func TestHasValidIP(t *testing.T) {
+	t.Run("valid IP", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>
+    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0`,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.hasValidIP()
+		assert.True(t, result)
+	})
+
+	t.Run("link-local IP", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>
+    inet 169.254.1.1/16 brd 169.254.255.255 scope link wlan0`,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.hasValidIP()
+		assert.False(t, result)
+	})
+
+	t.Run("loopback IP", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip addr show wlan0": `1: lo: <LOOPBACK,UP,LOWER_UP>
+    inet 127.0.0.1/8 scope host lo`,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.hasValidIP()
+		assert.False(t, result)
+	})
+
+	t.Run("no IP", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>`,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.hasValidIP()
+		assert.False(t, result)
+	})
+
+	t.Run("error executing command", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{},
+			errors: map[string]error{
+				"ip addr show wlan0": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.hasValidIP()
+		assert.False(t, result)
+	})
+}
+
+func TestCheckCaptivePortal(t *testing.T) {
+	t.Run("no captive portal - ping works", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ping -c 1 -W 2 8.8.8.8": "PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.checkCaptivePortal()
+		assert.False(t, result)
+	})
+
+	t.Run("no captive portal - getent works", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"getent hosts google.com": "142.250.185.78 google.com",
+			},
+			errors: map[string]error{
+				"ping -c 1 -W 2 8.8.8.8": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.checkCaptivePortal()
+		assert.False(t, result)
+	})
+
+	t.Run("no captive portal - dig works", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"dig +short google.com": "142.250.185.78",
+			},
+			errors: map[string]error{
+				"ping -c 1 -W 2 8.8.8.8": assert.AnError,
+				"getent hosts google.com": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.checkCaptivePortal()
+		assert.False(t, result)
+	})
+
+	t.Run("captive portal detected", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{},
+			errors: map[string]error{
+				"ping -c 1 -W 2 8.8.8.8":  assert.AnError,
+				"getent hosts google.com": assert.AnError,
+				"dig +short google.com":   assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		result := manager.checkCaptivePortal()
+		assert.True(t, result)
+	})
+}
+
+func TestDisconnect_AdditionalCases(t *testing.T) {
+	t.Run("successful disconnect with cleanup", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pkill -f wpa_supplicant": "",
+				"ip link set wlan0 down":  "",
+				"ip addr flush dev wlan0": "",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		err := manager.Disconnect()
+		assert.NoError(t, err)
+	})
+
+	t.Run("partial failure handling", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pkill -f wpa_supplicant": "",
+			},
+			errors: map[string]error{
+				"ip link set wlan0 down": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		err := manager.Disconnect()
+		// Should return error if interface down fails
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to bring interface down")
+	})
+}
+
+func TestListConnections_AdditionalCases(t *testing.T) {
+	t.Run("connection without DNS", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 link":          "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
+				"ip addr show wlan0":     "inet 192.168.1.100/24",
+				"ip route show dev wlan0": "default via 192.168.1.1",
+				"cat /etc/resolv.conf":   "", // No DNS
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		connections, err := manager.ListConnections()
+		assert.NoError(t, err)
+		assert.Len(t, connections, 1)
+		assert.Equal(t, "TestNetwork", connections[0].SSID)
+		assert.Len(t, connections[0].DNS, 0)
+	})
+
+	t.Run("connection without gateway", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 link":          "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
+				"ip addr show wlan0":     "inet 192.168.1.100/24",
+				"ip route show dev wlan0": "", // No gateway
+				"cat /etc/resolv.conf":   "nameserver 8.8.8.8",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		connections, err := manager.ListConnections()
+		assert.NoError(t, err)
+		assert.Len(t, connections, 1)
+		assert.Nil(t, connections[0].Gateway)
+	})
+}
+
+func TestScan_AdditionalCases(t *testing.T) {
+	t.Run("scan with interface up failure", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 scan":      "",
+				"iw wlan0 scan dump": "BSS 00:11:22:33:44:55\nSSID: TestNetwork\nsignal: -50.00 dBm",
+			},
+			errors: map[string]error{
+				"ip link set wlan0 up": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		networks, err := manager.Scan()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, networks)
+	})
+}

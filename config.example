@@ -38,17 +38,16 @@ vpn:
       verb 3
   myvpn2:
     type: wireguard
-    address: 10.0.0.1/8
+    address: 10.0.0.2/32
     interface: wg0
-    gateway: True
+    gateway: true
     config: |
       [Interface]
-      ListenPort = 51820
-      PrivateKey = QLa1x8ttCEl23cCIGpndDv9CIZ7Al7G7Kuj9yG0PIVk=
+      PrivateKey = YOUR_PRIVATE_KEY_HERE
 
       [Peer]
-      Endpoint = 198.51.100.1:51820
-      PublicKey = cPybMYBdfrj0wp+FlvWoFfL2fI1kc7dhtKB+cqvNPCA=
+      Endpoint = vpn.example.com:51820
+      PublicKey = SERVER_PUBLIC_KEY_HERE
       AllowedIPs = 0.0.0.0/0
 
 office:
