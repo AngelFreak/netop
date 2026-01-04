@@ -1,18 +1,58 @@
-# netop
+<div align="center">
 
-A lightweight network manager for Linux. Manage WiFi connections, VPNs (WireGuard/OpenVPN), DNS, MAC addresses, and more through a simple CLI and YAML configuration.
+# 🌐 netop
 
-## Features
+**A lightweight network manager for Linux**
 
+[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-Unlicense-blue.svg)](UNLICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)](https://www.linux.org/)
+
+Manage WiFi connections, VPNs (WireGuard/OpenVPN), DNS, MAC addresses, and more through a simple CLI and YAML configuration.
+
+[Features](#-features) •
+[Installation](#-installation) •
+[Quick Start](#-quick-start) •
+[Documentation](#-documentation)
+
+</div>
+
+---
+
+## ✨ Features
+
+<table>
+<tr>
+<td width="50%">
+
+### 📡 Network Management
 - **WiFi Management** - Connect to networks, scan for available networks
+- **BSSID Pinning** - Lock to specific access points
+- **Interface Control** - Automatic interface detection
+
+</td>
+<td width="50%">
+
+### 🔒 Security & Privacy
 - **VPN Support** - WireGuard and OpenVPN with automatic connection
 - **MAC Randomization** - Randomize or set custom MAC addresses
-- **DNS Configuration** - Custom DNS servers or DHCP
 - **Hostname Spoofing** - Configurable hostname per network
-- **BSSID Pinning** - Lock to specific access points
-- **Configuration Inheritance** - Common settings applied to all networks
+- **DNS Configuration** - Custom DNS servers or DHCP
 
-## Installation
+</td>
+</tr>
+</table>
+
+### 🎯 Additional Features
+- **Configuration Inheritance** - Common settings applied to all networks
+- **YAML Configuration** - Simple, readable configuration format
+- **Network Profiles** - Save and manage multiple network configurations
+
+[↑ Back to Top](#-netop)
+
+---
+
+## 📦 Installation
 
 ### From GitHub Releases (Recommended)
 
@@ -25,8 +65,10 @@ chmod +x netop
 sudo mv netop /usr/local/bin/
 ```
 
-### Using Install Script
-Clone the repository and run the install script: (requires Go 1.21+)
+<details>
+<summary><b>Using Install Script</b></summary>
+
+Clone the repository and run the install script (requires Go 1.21+):
 
 ```bash
 git clone https://github.com/angelfreak/netop.git
@@ -34,7 +76,10 @@ cd netop
 ./install.sh
 ```
 
-### From Source
+</details>
+
+<details>
+<summary><b>From Source</b></summary>
 
 Requires Go 1.21+:
 
@@ -45,25 +90,33 @@ go build -o netop ./cmd/net
 sudo mv netop /usr/local/bin/
 ```
 
-## Dependencies
+</details>
+
+### 📚 Dependencies
 
 The following system utilities are required:
 
 | Utility | Package | Purpose |
 |---------|---------|---------|
-| `ip` | iproute2 | Interface/routing management |
-| `iw` | iw | WiFi operations |
-| `wpa_supplicant` | wpasupplicant | WiFi authentication |
-| `dhclient` or `udhcpc` | isc-dhcp-client / busybox | DHCP client |
-| `openvpn` | openvpn | OpenVPN support (optional) |
-| `wg` | wireguard-tools | WireGuard support (optional) |
+| `ip` | `iproute2` | Interface/routing management |
+| `iw` | `iw` | WiFi operations |
+| `wpa_supplicant` | `wpasupplicant` | WiFi authentication |
+| `dhclient` or `udhcpc` | `isc-dhcp-client` / `busybox` | DHCP client |
+| `openvpn` | `openvpn` | OpenVPN support (optional) |
+| `wg` | `wireguard-tools` | WireGuard support (optional) |
 
-Install on Debian/Ubuntu:
+**Install on Debian/Ubuntu:**
 ```bash
 sudo apt install iproute2 iw wpasupplicant isc-dhcp-client wireguard-tools
 ```
 
-## Configuration
+[↑ Back to Top](#-netop)
+
+---
+
+## 🚀 Quick Start
+
+### 1. Create Configuration
 
 Create `~/.net/config.yaml`:
 
@@ -106,9 +159,7 @@ coffee-shop:
   # Uses common VPN for security
 ```
 
-## Usage
-
-### Connect to a Network
+### 2. Connect to a Network
 
 ```bash
 # Connect to configured network
@@ -121,13 +172,45 @@ sudo netop connect
 sudo netop connect work --no-vpn
 ```
 
-### Scan for Networks
+### 3. Scan for Networks
 
 ```bash
 sudo netop scan
 ```
 
-### VPN Management
+[↑ Back to Top](#-netop)
+
+---
+
+## 📖 Documentation
+
+<details>
+<summary><b>📡 WiFi Commands</b></summary>
+
+```bash
+# Connect to configured network
+sudo netop connect home
+
+# Connect to any network (prompted for password)
+sudo netop connect
+
+# Connect without VPN
+sudo netop connect work --no-vpn
+
+# Scan for networks
+sudo netop scan
+
+# Show connection status
+sudo netop list
+
+# Disconnect everything
+sudo netop stop
+```
+
+</details>
+
+<details>
+<summary><b>🔒 VPN Commands</b></summary>
 
 ```bash
 # Connect to VPN
@@ -140,7 +223,10 @@ sudo netop vpn stop
 sudo netop list
 ```
 
-### DNS Management
+</details>
+
+<details>
+<summary><b>🌐 DNS Commands</b></summary>
 
 ```bash
 # Set custom DNS
@@ -150,7 +236,10 @@ sudo netop dns 8.8.8.8 1.1.1.1
 sudo netop dns dhcp
 ```
 
-### MAC Address
+</details>
+
+<details>
+<summary><b>🎭 MAC Address Commands</b></summary>
 
 ```bash
 # Set random MAC
@@ -163,29 +252,32 @@ sudo netop mac 00:11:22:33:44:55
 sudo netop mac default
 ```
 
-### Generate WireGuard Keys
+</details>
+
+<details>
+<summary><b>🔧 Utility Commands</b></summary>
 
 ```bash
+# Generate WireGuard keys
 sudo netop genkey
-```
 
-### Show Configuration
-
-```bash
 # Show network config (with inherited settings)
 sudo netop show home
 
 # Show current connection status
 sudo netop list
-```
 
-### Stop All Connections
-
-```bash
+# Stop all connections
 sudo netop stop
 ```
 
-## Command Reference
+</details>
+
+[↑ Back to Top](#-netop)
+
+---
+
+## 📋 Command Reference
 
 | Command | Description |
 |---------|-------------|
@@ -203,17 +295,22 @@ sudo netop stop
 | `genkey` | Generate WireGuard keypair |
 | `show <name>` | Show network config |
 
-### Global Flags
+### 🚩 Global Flags
 
 | Flag | Description |
 |------|-------------|
-| `--config, -c` | Config file path (default: ~/.net/config.yaml) |
+| `--config, -c` | Config file path (default: `~/.net/config.yaml`) |
 | `--debug` | Enable debug logging |
 | `--no-vpn` | Skip VPN connection |
 
-## Configuration Reference
+[↑ Back to Top](#-netop)
 
-### Common Settings
+---
+
+## ⚙️ Configuration Reference
+
+<details>
+<summary><b>Common Settings</b></summary>
 
 ```yaml
 common:
@@ -223,7 +320,10 @@ common:
   vpn: myvpn               # Default VPN name
 ```
 
-### Network Settings
+</details>
+
+<details>
+<summary><b>Network Settings</b></summary>
 
 ```yaml
 network-name:
@@ -243,7 +343,10 @@ network-name:
   vpn: myvpn               # Override VPN (empty to disable)
 ```
 
-### VPN Settings
+</details>
+
+<details>
+<summary><b>VPN Settings</b></summary>
 
 ```yaml
 vpn:
@@ -257,7 +360,10 @@ vpn:
       PrivateKey = ...
 ```
 
-### Ignored Interfaces
+</details>
+
+<details>
+<summary><b>Ignored Interfaces</b></summary>
 
 ```yaml
 ignored:
@@ -267,7 +373,37 @@ ignored:
     - br[0-9]+
 ```
 
-## Building
+</details>
+
+[↑ Back to Top](#-netop)
+
+---
+
+## 🛠️ Development
+
+<details>
+<summary><b>Project Structure</b></summary>
+
+```
+netop/
+├── cmd/net/           # Main application
+├── pkg/
+│   ├── config/        # Configuration handling
+│   ├── dhcp/          # DHCP client management
+│   ├── hotspot/       # Hotspot functionality
+│   ├── network/       # Network operations
+│   ├── system/        # System utilities
+│   ├── types/         # Type definitions
+│   ├── vpn/           # VPN management
+│   └── wifi/          # WiFi operations
+├── config.example     # Example configuration
+└── install.sh         # Installation script
+```
+
+</details>
+
+<details>
+<summary><b>Building</b></summary>
 
 ```bash
 # Build for current platform
@@ -282,6 +418,23 @@ GOOS=linux GOARCH=arm64 go build -o netop-linux-arm64 ./cmd/net
 GOOS=darwin GOARCH=arm64 go build -o netop-darwin-arm64 ./cmd/net
 ```
 
-## License
+</details>
+
+[↑ Back to Top](#-netop)
+
+---
+
+## 📄 License
 
 This project is released into the public domain. See [UNLICENSE](UNLICENSE) for details.
+
+---
+
+<div align="center">
+
+**Made with ❤️ for the Linux community**
+
+[Report Bug](https://github.com/angelfreak/netop/issues) •
+[Request Feature](https://github.com/angelfreak/netop/issues)
+
+</div>
