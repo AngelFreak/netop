@@ -290,7 +290,7 @@ func TestMergeWithCommon(t *testing.T) {
 	os.Setenv("HOSTNAME", "test-host")
 	defer os.Setenv("HOSTNAME", oldHostname)
 
-	result := manager.MergeWithCommon(networkConfig)
+	result := manager.MergeWithCommon("testnet", networkConfig)
 
 	assert.Equal(t, "wlan0", result.Interface)
 	assert.Equal(t, "test", result.SSID)
@@ -312,7 +312,7 @@ func TestMergeWithCommon_HostnameTemplate(t *testing.T) {
 
 	networkConfig := &types.NetworkConfig{}
 
-	result := manager.MergeWithCommon(networkConfig)
+	result := manager.MergeWithCommon("testnet", networkConfig)
 
 	// Verify the template was replaced (no longer contains <name>)
 	assert.NotContains(t, result.Hostname, "<name>")
@@ -333,7 +333,7 @@ func TestMergeWithCommon_HostnameTemplate(t *testing.T) {
 func TestMergeWithCommon_NoConfig(t *testing.T) {
 	manager := NewManager(&mockLogger{})
 	networkConfig := &types.NetworkConfig{SSID: "test"}
-	result := manager.MergeWithCommon(networkConfig)
+	result := manager.MergeWithCommon("testnet", networkConfig)
 	assert.Equal(t, networkConfig, result)
 }
 

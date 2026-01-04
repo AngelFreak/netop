@@ -209,7 +209,7 @@ type ConfigManager interface {
 	LoadConfig(path string) (*Config, error)
 	GetNetworkConfig(name string) (*NetworkConfig, error)
 	GetVPNConfig(name string) (*VPNConfig, error)
-	MergeWithCommon(config *NetworkConfig) *NetworkConfig
+	MergeWithCommon(networkName string, config *NetworkConfig) *NetworkConfig
 	GetConfig() *Config
 }
 

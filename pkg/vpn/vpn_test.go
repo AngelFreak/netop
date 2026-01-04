@@ -100,7 +100,7 @@ func (m *mockConfigManager) GetVPNConfig(name string) (*types.VPNConfig, error) 
 	return nil, fmt.Errorf("VPN config '%s' not found", name)
 }
 
-func (m *mockConfigManager) MergeWithCommon(config *types.NetworkConfig) *types.NetworkConfig {
+func (m *mockConfigManager) MergeWithCommon(networkName string, config *types.NetworkConfig) *types.NetworkConfig {
 	return config
 }
 

@@ -394,7 +394,7 @@ Examples:
 			connectedIface = wifiMgr.GetInterface()
 		} else {
 			// Use configured network - merge with common settings first
-			networkConfig = cfgManager.MergeWithCommon(networkConfig)
+			networkConfig = cfgManager.MergeWithCommon(name, networkConfig)
 			logger.Debug("Found network config", "name", name, "ssid", networkConfig.SSID, "mac", networkConfig.MAC)
 			logger.Info("Connecting to configured network", "name", name)
 			// If password provided via command line, use it; otherwise use config
@@ -730,7 +730,7 @@ Examples:
 			}
 
 			// Merge with common settings to show effective config
-			merged := cfgManager.MergeWithCommon(config)
+			merged := cfgManager.MergeWithCommon(name, config)
 
 			fmt.Printf("Network: %s\n", name)
 			if merged.Interface != "" {
@@ -1188,7 +1188,7 @@ func connectVPN(networkName string) {
 	}
 
 	// Merge with common settings to get default VPN if not specified
-	merged := cfgManager.MergeWithCommon(config)
+	merged := cfgManager.MergeWithCommon(networkName, config)
 
 	if merged.VPN == "" {
 		logger.Debug("No VPN configured for network", "network", networkName)

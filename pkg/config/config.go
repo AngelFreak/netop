@@ -487,7 +487,7 @@ func (m *Manager) GetVPNConfig(name string) (*types.VPNConfig, error) {
 }
 
 // MergeWithCommon merges network config with common settings
-func (m *Manager) MergeWithCommon(config *types.NetworkConfig) *types.NetworkConfig {
+func (m *Manager) MergeWithCommon(networkName string, config *types.NetworkConfig) *types.NetworkConfig {
 	if m.config == nil {
 		return config
 	}
@@ -510,8 +510,13 @@ func (m *Manager) MergeWithCommon(config *types.NetworkConfig) *types.NetworkCon
 	if merged.Hostname == "" {
 		merged.Hostname = m.config.Common.Hostname
 	}
+	// Only inherit VPN from common if not explicitly set in network config
+	// This allows networks to disable VPN by setting vpn: (empty)
 	if merged.VPN == "" {
-		merged.VPN = m.config.Common.VPN
+		// Check if vpn was explicitly set to empty (disabled) vs not set at all
+		if m.viper == nil || !m.viper.IsSet(networkName+".vpn") {
+			merged.VPN = m.config.Common.VPN
+		}
 	}
 
 	// Handle hostname template replacement
