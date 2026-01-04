@@ -120,10 +120,12 @@ Network operations require elevated privileges. Instead of typing `sudo` every t
 Grant only the specific capabilities needed:
 
 ```bash
-sudo setcap 'cap_net_admin,cap_net_raw+ep' /usr/local/bin/net
+sudo setcap 'cap_net_admin+ep' /usr/local/bin/net
 ```
 
 Now you can run `net` directly without sudo.
+
+**⚠️ Limitations:** The current implementation internally uses `sudo` for certain operations and spawns subprocesses (`wpa_supplicant`, `dhclient`, etc.) that may require additional permissions. While capabilities eliminate the need for `sudo net` in many cases, some operations may still prompt for elevated privileges.
 
 </details>
 
@@ -140,6 +142,13 @@ Then add an alias to your shell rc file (`~/.bashrc` or `~/.zshrc`):
 
 ```bash
 alias net='sudo /usr/local/bin/net'
+```
+
+**🔒 Security Note:** When using passwordless sudo, protect the binary from unauthorized modification:
+
+```bash
+sudo chown root:root /usr/local/bin/net
+sudo chmod 755 /usr/local/bin/net
 ```
 
 </details>
