@@ -38,7 +38,11 @@ sudo mv netop /usr/local/bin/
 
 ### Using Install Script
 
+Clone the repository and run the install script (requires Go 1.21+):
+
 ```bash
+git clone https://github.com/angelfreak/netop.git
+cd netop
 ./install.sh
 ```
 
