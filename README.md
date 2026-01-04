@@ -14,7 +14,7 @@ A lightweight network manager for Linux. Manage WiFi connections, VPNs (WireGuar
 
 ## Installation
 
-### From Binary
+### From GitHub Releases (Recommended)
 
 Download the latest binary from [Releases](https://github.com/angelfreak/netop/releases):
 
@@ -23,6 +23,16 @@ Download the latest binary from [Releases](https://github.com/angelfreak/netop/r
 curl -L https://github.com/angelfreak/netop/releases/latest/download/netop-linux-amd64 -o netop
 chmod +x netop
 sudo mv netop /usr/local/bin/
+```
+
+### Using Install Script
+
+First clone the repository, then run the install script:
+
+```bash
+git clone https://github.com/angelfreak/netop.git
+cd netop
+./install.sh
 ```
 
 ### From Source
@@ -34,12 +44,6 @@ git clone https://github.com/angelfreak/netop.git
 cd netop
 go build -o netop ./cmd/net
 sudo mv netop /usr/local/bin/
-```
-
-### Using Install Script
-
-```bash
-./install.sh
 ```
 
 ## Dependencies
