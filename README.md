@@ -1,8 +1,10 @@
 <div align="center">
 
-# 🌐 netop
+# 🌐 net
 
 **A lightweight network manager for Linux**
+
+*Part of the [netop](https://github.com/angelfreak/netop) project*
 
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Unlicense-blue.svg)](UNLICENSE)
@@ -48,7 +50,7 @@ Manage WiFi connections, VPNs (WireGuard/OpenVPN), DNS, MAC addresses, and more 
 - **YAML Configuration** - Simple, readable configuration format
 - **Network Profiles** - Save and manage multiple network configurations
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 
@@ -60,9 +62,9 @@ Download the latest binary from [Releases](https://github.com/angelfreak/netop/r
 
 ```bash
 # Linux AMD64
-curl -L https://github.com/angelfreak/netop/releases/latest/download/netop-linux-amd64 -o netop
-chmod +x netop
-sudo mv netop /usr/local/bin/
+curl -L https://github.com/angelfreak/netop/releases/latest/download/net-linux-amd64 -o net
+chmod +x net
+sudo mv net /usr/local/bin/
 ```
 
 <details>
@@ -86,8 +88,8 @@ Requires Go 1.21+:
 ```bash
 git clone https://github.com/angelfreak/netop.git
 cd netop
-go build -o netop ./cmd/net
-sudo mv netop /usr/local/bin/
+go build -o net ./cmd/net
+sudo mv net /usr/local/bin/
 ```
 
 </details>
@@ -110,7 +112,7 @@ The following system utilities are required:
 sudo apt install iproute2 iw wpasupplicant isc-dhcp-client wireguard-tools
 ```
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 
@@ -163,22 +165,22 @@ coffee-shop:
 
 ```bash
 # Connect to configured network
-sudo netop connect home
+sudo net connect home
 
 # Connect to any network (prompted for password)
-sudo netop connect
+sudo net connect
 
 # Connect without VPN
-sudo netop connect work --no-vpn
+sudo net connect work --no-vpn
 ```
 
 ### 3. Scan for Networks
 
 ```bash
-sudo netop scan
+sudo net scan
 ```
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 
@@ -189,22 +191,22 @@ sudo netop scan
 
 ```bash
 # Connect to configured network
-sudo netop connect home
+sudo net connect home
 
 # Connect to any network (prompted for password)
-sudo netop connect
+sudo net connect
 
 # Connect without VPN
-sudo netop connect work --no-vpn
+sudo net connect work --no-vpn
 
 # Scan for networks
-sudo netop scan
+sudo net scan
 
 # Show connection status
-sudo netop list
+sudo net list
 
 # Disconnect everything
-sudo netop stop
+sudo net stop
 ```
 
 </details>
@@ -214,13 +216,13 @@ sudo netop stop
 
 ```bash
 # Connect to VPN
-sudo netop vpn myvpn
+sudo net vpn myvpn
 
 # Disconnect all VPNs
-sudo netop vpn stop
+sudo net vpn stop
 
 # List VPN status
-sudo netop list
+sudo net list
 ```
 
 </details>
@@ -230,10 +232,10 @@ sudo netop list
 
 ```bash
 # Set custom DNS
-sudo netop dns 8.8.8.8 1.1.1.1
+sudo net dns 8.8.8.8 1.1.1.1
 
 # Restore DHCP DNS
-sudo netop dns dhcp
+sudo net dns dhcp
 ```
 
 </details>
@@ -243,13 +245,13 @@ sudo netop dns dhcp
 
 ```bash
 # Set random MAC
-sudo netop mac random
+sudo net mac random
 
 # Set specific MAC
-sudo netop mac 00:11:22:33:44:55
+sudo net mac 00:11:22:33:44:55
 
 # Restore original MAC
-sudo netop mac default
+sudo net mac default
 ```
 
 </details>
@@ -259,21 +261,21 @@ sudo netop mac default
 
 ```bash
 # Generate WireGuard keys
-sudo netop genkey
+sudo net genkey
 
 # Show network config (with inherited settings)
-sudo netop show home
+sudo net show home
 
 # Show current connection status
-sudo netop list
+sudo net list
 
 # Stop all connections
-sudo netop stop
+sudo net stop
 ```
 
 </details>
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 
@@ -303,7 +305,7 @@ sudo netop stop
 | `--debug` | Enable debug logging |
 | `--no-vpn` | Skip VPN connection |
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 
@@ -375,7 +377,7 @@ ignored:
 
 </details>
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 
@@ -407,20 +409,20 @@ netop/
 
 ```bash
 # Build for current platform
-go build -o netop ./cmd/net
+go build -o net ./cmd/net
 
 # Run tests
 go test ./...
 
 # Build for all platforms
-GOOS=linux GOARCH=amd64 go build -o netop-linux-amd64 ./cmd/net
-GOOS=linux GOARCH=arm64 go build -o netop-linux-arm64 ./cmd/net
-GOOS=darwin GOARCH=arm64 go build -o netop-darwin-arm64 ./cmd/net
+GOOS=linux GOARCH=amd64 go build -o net-linux-amd64 ./cmd/net
+GOOS=linux GOARCH=arm64 go build -o net-linux-arm64 ./cmd/net
+GOOS=darwin GOARCH=arm64 go build -o net-darwin-arm64 ./cmd/net
 ```
 
 </details>
 
-[↑ Back to Top](#-netop)
+[↑ Back to Top](#-net)
 
 ---
 

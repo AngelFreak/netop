@@ -458,7 +458,7 @@ func (m *Manager) obtainDHCPdhclient(hostname string) error {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
 		// Create temporary dhclient.conf with hostname using atomic write with secure permissions
 		confContent := fmt.Sprintf("send host-name \"%s\";\n", hostname)
-		dhclientConf := types.RuntimeDir + "/dhclient-netop.conf"
+		dhclientConf := types.RuntimeDir + "/dhclient.conf"
 		if _, err := m.executor.ExecuteWithInput("install", confContent, "-m", "0600", "/dev/stdin", dhclientConf); err != nil {
 			m.logger.Warn("Failed to create dhclient config", "error", err)
 		} else {

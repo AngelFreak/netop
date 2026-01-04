@@ -774,7 +774,7 @@ Features:
 
 Examples:
   net hotspot                           Show status
-  net hotspot start                     Start with defaults (SSID: netop-hotspot)
+  net hotspot start                     Start with defaults (SSID: net-hotspot)
   net hotspot start --ssid MyHotspot    Start with custom SSID
   net hotspot start --password secret   Start with WPA2 password
   net hotspot start --channel 36        Start on 5GHz channel 36
@@ -816,7 +816,7 @@ Examples:
 
 			// Set defaults if not provided
 			if ssid == "" {
-				ssid = "netop-hotspot"
+				ssid = "net-hotspot"
 			}
 			if channel == 0 {
 				channel = 6
@@ -894,7 +894,7 @@ Examples:
 }
 
 func init() {
-	hotspotCmd.Flags().String("ssid", "", "Hotspot SSID (default: netop-hotspot)")
+	hotspotCmd.Flags().String("ssid", "", "Hotspot SSID (default: net-hotspot)")
 	hotspotCmd.Flags().String("password", "", "Hotspot password (min 8 chars, empty for open network)")
 	hotspotCmd.Flags().Int("channel", 6, "WiFi channel (2.4GHz: 1-14, 5GHz: 36,40,44,48,149,153,157,161,165)")
 	hotspotCmd.Flags().String("gateway", "192.168.50.1", "Gateway IP address")

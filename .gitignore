@@ -5,8 +5,7 @@
 *.so
 *.dylib
 net
-netop
-netop-*
+net-*
 
 # Build artifacts
 dist/

@@ -21,23 +21,23 @@ if [[ "$(printf '%s\n' "$GO_VERSION" "1.21" | sort -V | head -n1)" != "1.21" ]];
     echo "Warning: Go version $GO_VERSION detected. This project requires Go 1.21 or later."
 fi
 
-echo "Building netop binary..."
-go build -o netop ./cmd/net
+echo "Building net binary..."
+go build -o net ./cmd/net
 
-if [ ! -f netop ]; then
+if [ ! -f net ]; then
     echo "Error: Build failed - binary not created."
     exit 1
 fi
 
-echo "Installing to /usr/local/bin/netop..."
+echo "Installing to /usr/local/bin/net..."
 if command -v sudo &> /dev/null; then
-    sudo cp netop /usr/local/bin/netop
+    sudo cp net /usr/local/bin/net
 else
-    cp netop /usr/local/bin/netop
+    cp net /usr/local/bin/net
 fi
 
 # Clean up
-rm netop
+rm net
 
 # Install default config file
 echo "Setting up configuration..."
@@ -77,7 +77,7 @@ fi
 
 echo ""
 echo "Installation successful!"
-echo "You can now use the 'netop' command from anywhere."
+echo "You can now use the 'net' command from anywhere."
 echo "(The command will automatically request root privileges when needed)"
 echo ""
 echo "Configuration:"
@@ -85,7 +85,7 @@ echo "  Config file: $CONFIG_FILE"
 echo "  Edit the config file to customize network settings, VPN, and DNS preferences."
 echo ""
 echo "Usage examples:"
-echo "  netop connect home  # Connect to a network"
-echo "  netop scan          # Scan for WiFi networks"
-echo "  netop list          # Show connection status"
-echo "  netop --help        # Show all available commands"
+echo "  net connect home  # Connect to a network"
+echo "  net scan          # Scan for WiFi networks"
+echo "  net list          # Show connection status"
+echo "  net --help        # Show all available commands"

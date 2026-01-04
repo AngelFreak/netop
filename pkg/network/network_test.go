@@ -178,9 +178,9 @@ func TestSetDNS(t *testing.T) {
 		executor := newStrictMockExecutor()
 		// Actual implementation: chattr -i, rm temp, tee temp, mv temp to dest, chattr +i
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -190,19 +190,19 @@ func TestSetDNS(t *testing.T) {
 
 		// Verify the correct content was written to temp file
 		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
-		executor.assertCommandExecuted(t, "tee /run/netop/staging.conf")
-		executor.assertCommandExecuted(t, "mv /run/netop/staging.conf /etc/resolv.conf")
+		executor.assertCommandExecuted(t, "tee /run/net/staging.conf")
+		executor.assertCommandExecuted(t, "mv /run/net/staging.conf /etc/resolv.conf")
 		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
-		executor.assertInputContains(t, "tee /run/netop/staging.conf", "nameserver 8.8.8.8")
-		executor.assertInputContains(t, "tee /run/netop/staging.conf", "nameserver 1.1.1.1")
+		executor.assertInputContains(t, "tee /run/net/staging.conf", "nameserver 8.8.8.8")
+		executor.assertInputContains(t, "tee /run/net/staging.conf", "nameserver 1.1.1.1")
 	})
 
 	t.Run("invalid IP addresses are filtered out", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -211,7 +211,7 @@ func TestSetDNS(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Only valid IP should be in output
-		input := executor.inputsReceived["tee /run/netop/staging.conf"]
+		input := executor.inputsReceived["tee /run/net/staging.conf"]
 		assert.Contains(t, input, "nameserver 8.8.8.8")
 		assert.NotContains(t, input, "invalid")
 		assert.NotContains(t, input, "not-an-ip")
@@ -220,9 +220,9 @@ func TestSetDNS(t *testing.T) {
 	t.Run("all invalid IPs results in empty file", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -231,15 +231,15 @@ func TestSetDNS(t *testing.T) {
 		assert.NoError(t, err)
 
 		// File should be written but empty (no valid nameservers)
-		input := executor.inputsReceived["tee /run/netop/staging.conf"]
+		input := executor.inputsReceived["tee /run/net/staging.conf"]
 		assert.NotContains(t, input, "nameserver")
 	})
 
 	t.Run("tee failure returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.errors["tee /run/netop/staging.conf"] = fmt.Errorf("permission denied")
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.errors["tee /run/net/staging.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -251,9 +251,9 @@ func TestSetDNS(t *testing.T) {
 	t.Run("mv failure returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.errors["mv /run/netop/staging.conf /etc/resolv.conf"] = fmt.Errorf("permission denied")
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.errors["mv /run/net/staging.conf /etc/resolv.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -435,7 +435,7 @@ func TestStartDHCP(t *testing.T) {
 		executor := newMockExecutor()
 		// New streamlined DHCP flow: force kill + lease file removal
 		executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/netop/dhclient.wlan0.leases"] = ""
+		executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 		executor.commands["timeout 15 dhclient -v wlan0"] = ""
 		executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 		logger := &mockLogger{}
@@ -468,7 +468,7 @@ func TestDHCPRenew(t *testing.T) {
 		executor := newMockExecutor()
 		// New streamlined DHCP flow
 		executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/netop/dhclient.wlan0.leases"] = ""
+		executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 		executor.commands["timeout 15 dhclient -v wlan0"] = ""
 		executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 		logger := &mockLogger{}
@@ -557,9 +557,9 @@ func TestExpandMACTemplate(t *testing.T) {
 func TestWriteFile(t *testing.T) {
 	t.Run("success - removes temp, writes, and moves", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/test.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/test.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -567,17 +567,17 @@ func TestWriteFile(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Verify the correct sequence of operations
-		executor.assertCommandExecuted(t, "rm -f /run/netop/staging.conf")
-		executor.assertCommandExecuted(t, "tee /run/netop/staging.conf")
-		executor.assertCommandExecuted(t, "mv /run/netop/staging.conf /etc/test.conf")
-		executor.assertInputContains(t, "tee /run/netop/staging.conf", "test content")
+		executor.assertCommandExecuted(t, "rm -f /run/net/staging.conf")
+		executor.assertCommandExecuted(t, "tee /run/net/staging.conf")
+		executor.assertCommandExecuted(t, "mv /run/net/staging.conf /etc/test.conf")
+		executor.assertInputContains(t, "tee /run/net/staging.conf", "test content")
 	})
 
 	t.Run("rm temp fails - continues anyway", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.errors["rm -f /run/netop/staging.conf"] = fmt.Errorf("file not found")
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/test.conf"] = ""
+		executor.errors["rm -f /run/net/staging.conf"] = fmt.Errorf("file not found")
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/test.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -587,8 +587,8 @@ func TestWriteFile(t *testing.T) {
 
 	t.Run("tee fails - returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.errors["tee /run/netop/staging.conf"] = fmt.Errorf("permission denied")
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.errors["tee /run/net/staging.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -599,9 +599,9 @@ func TestWriteFile(t *testing.T) {
 
 	t.Run("mv fails - returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.errors["mv /run/netop/staging.conf /etc/test.conf"] = fmt.Errorf("permission denied")
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.errors["mv /run/net/staging.conf /etc/test.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -799,7 +799,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip link set eth0 up"] = ""
 		// New streamlined DHCP flow
 		executor.commands["pkill -9 -f dhclient.*eth0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/netop/dhclient.eth0.leases"] = ""
+		executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
 		executor.commands["timeout 15 dhclient -v eth0"] = ""
 		executor.commands["ip addr show eth0"] = "inet 192.168.1.50/24"
 		logger := &mockLogger{}
@@ -867,9 +867,9 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -983,9 +983,9 @@ func TestClearDNS(t *testing.T) {
 	t.Run("success - removes immutable attribute", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -997,9 +997,9 @@ func TestClearDNS(t *testing.T) {
 	t.Run("chattr fails but continues - file not locked", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
-		executor.commands["rm -f /run/netop/staging.conf"] = ""
-		executor.commands["tee /run/netop/staging.conf"] = ""
-		executor.commands["mv /run/netop/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -1014,7 +1014,7 @@ func TestStartDHCP_ErrorPath(t *testing.T) {
 		executor := newMockExecutor()
 		// New streamlined DHCP flow
 		executor.commands["pkill -9 -f dhclient.*eth0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/netop/dhclient.eth0.leases"] = ""
+		executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
 		executor.errors["timeout 15 dhclient -v eth0"] = fmt.Errorf("dhclient failed")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -1211,7 +1211,7 @@ func TestDHCPRenew_ErrorPaths(t *testing.T) {
 			commands: map[string]string{
 				// New streamlined DHCP flow
 				"pkill -9 -f dhclient.*eth0": "",
-				"rm -f /var/lib/dhcp/dhclient.eth0.leases /run/netop/dhclient.eth0.leases": "",
+				"rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases": "",
 			},
 			errors: map[string]error{
 				"timeout 15 dhclient -v eth0": assert.AnError,

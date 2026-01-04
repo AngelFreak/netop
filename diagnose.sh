@@ -1,7 +1,7 @@
 #!/bin/bash
-# Network diagnostics script for netop
+# Network diagnostics script for net (netop project)
 
-echo "=== netop Network Diagnostics ==="
+echo "=== net Network Diagnostics ==="
 echo
 
 # Check hostname
@@ -87,8 +87,8 @@ for tool in $TOOLS; do
 done
 echo
 
-# Check netop configuration
-echo "7. netop Configuration"
+# Check net configuration
+echo "7. net Configuration"
 CONFIG_FILE="$HOME/.net/config.yaml"
 if [ -f "$CONFIG_FILE" ]; then
     echo "   ✓ Config file exists: $CONFIG_FILE"
@@ -96,7 +96,7 @@ if [ -f "$CONFIG_FILE" ]; then
     echo "   Networks configured: $NETWORKS"
 else
     echo "   ✗ Config file not found: $CONFIG_FILE"
-    echo "   Run: netop list --help"
+    echo "   Run: net list --help"
 fi
 echo
 

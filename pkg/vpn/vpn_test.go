@@ -149,14 +149,14 @@ func TestConnect(t *testing.T) {
 			executor := &mockSystemExecutor{
 				commands: map[string]string{
 					// OpenVPN commands
-					"install -m 0600 /dev/stdin /run/netop/openvpn.conf": "",
-					"openvpn --config /run/netop/openvpn.conf --daemon":  "",
+					"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
+					"openvpn --config /run/net/openvpn.conf --daemon":  "",
 					"ip link show tun0":                                  "", // tunnel verification
 					// WireGuard commands
-					"install -m 0600 /dev/stdin /run/netop/wg.conf": "",
-					"rm -f /run/netop/wg.conf":                      "",
+					"install -m 0600 /dev/stdin /run/net/wg.conf": "",
+					"rm -f /run/net/wg.conf":                      "",
 					"ip link add dev wg0 type wireguard":            "",
-					"wg setconf wg0 /run/netop/wg.conf":             "",
+					"wg setconf wg0 /run/net/wg.conf":             "",
 					"ip addr replace 10.0.0.1/24 dev wg0":        "",
 					"ip link set wg0 up":                     "",
 					"ip route replace default dev wg0":       "",
@@ -355,8 +355,8 @@ func TestGenerateWireGuardKey(t *testing.T) {
 func TestConnectOpenVPN(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"install -m 0600 /dev/stdin /run/netop/openvpn.conf": "",
-			"openvpn --config /run/netop/openvpn.conf --daemon":  "",
+			"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
+			"openvpn --config /run/net/openvpn.conf --daemon":  "",
 			"ip link show tun0":                                  "", // tunnel verification
 		},
 	}
@@ -374,10 +374,10 @@ func TestConnectOpenVPN(t *testing.T) {
 func TestConnectWireGuard(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"install -m 0600 /dev/stdin /run/netop/wg.conf": "",
+			"install -m 0600 /dev/stdin /run/net/wg.conf": "",
 			"ip link add dev wg0 type wireguard":            "",
-			"wg setconf wg0 /run/netop/wg.conf":             "",
-			"rm -f /run/netop/wg.conf":                      "",
+			"wg setconf wg0 /run/net/wg.conf":             "",
+			"rm -f /run/net/wg.conf":                      "",
 			"ip addr replace 10.0.0.1/24 dev wg0":           "",
 			"ip link set wg0 up":                            "",
 			"ip route replace default dev wg0":              "",
@@ -463,7 +463,7 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 	t.Run("write file error", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"openvpn --config /run/netop/openvpn.conf --daemon": "",
+				"openvpn --config /run/net/openvpn.conf --daemon": "",
 				"ip link show tun0":                           "",
 			},
 			errors: map[string]error{},
@@ -483,11 +483,11 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 	t.Run("openvpn execution error cleans up temp file", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/openvpn.conf": "",
-				"rm -f /run/netop/openvpn.conf":                      "", // cleanup should happen
+				"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
+				"rm -f /run/net/openvpn.conf":                      "", // cleanup should happen
 			},
 			errors: map[string]error{
-				"openvpn --config /run/netop/openvpn.conf --daemon": assert.AnError,
+				"openvpn --config /run/net/openvpn.conf --daemon": assert.AnError,
 			},
 		}
 		logger := &mockLogger{}
@@ -501,15 +501,15 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to start OpenVPN")
 		// Verify cleanup was called
-		executor.assertCommandExecuted(t, "rm -f /run/netop/openvpn.conf")
+		executor.assertCommandExecuted(t, "rm -f /run/net/openvpn.conf")
 	})
 
 	t.Run("tunnel verification timeout cleans up temp file", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/openvpn.conf": "",
-				"openvpn --config /run/netop/openvpn.conf --daemon":  "",
-				"rm -f /run/netop/openvpn.conf":                      "", // cleanup should happen
+				"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
+				"openvpn --config /run/net/openvpn.conf --daemon":  "",
+				"rm -f /run/net/openvpn.conf":                      "", // cleanup should happen
 			},
 			errors: map[string]error{
 				"ip link show tun0": assert.AnError, // tun0 never appears
@@ -526,7 +526,7 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to establish tunnel")
 		// Verify cleanup was called
-		executor.assertCommandExecuted(t, "rm -f /run/netop/openvpn.conf")
+		executor.assertCommandExecuted(t, "rm -f /run/net/openvpn.conf")
 	})
 }
 
@@ -535,7 +535,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"ip link add dev wg0 type wireguard": "",
-				"wg setconf wg0 /run/netop/wg.conf":        "",
+				"wg setconf wg0 /run/net/wg.conf":        "",
 				"ip addr replace 10.0.0.1/24 dev wg0":    "",
 				"ip link set wg0 up":                 "",
 			},
@@ -558,8 +558,8 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 	t.Run("interface creation error (warning only)", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/wg.conf":                "",
-				"wg setconf wg0 /run/netop/wg.conf":     "",
+				"install -m 0600 /dev/stdin /run/net/wg.conf":                "",
+				"wg setconf wg0 /run/net/wg.conf":     "",
 				"ip addr replace 10.0.0.1/24 dev wg0": "",
 				"ip link set wg0 up":              "",
 			},
@@ -584,11 +584,11 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 	t.Run("setconf error", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/wg.conf":                   "",
+				"install -m 0600 /dev/stdin /run/net/wg.conf":                   "",
 				"ip link add dev wg0 type wireguard": "",
 			},
 			errors: map[string]error{
-				"wg setconf wg0 /run/netop/wg.conf": assert.AnError,
+				"wg setconf wg0 /run/net/wg.conf": assert.AnError,
 			},
 		}
 		logger := &mockLogger{}
@@ -608,9 +608,9 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 	t.Run("ip address assignment error", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/wg.conf":                   "",
+				"install -m 0600 /dev/stdin /run/net/wg.conf":                   "",
 				"ip link add dev wg0 type wireguard": "",
-				"wg setconf wg0 /run/netop/wg.conf":        "",
+				"wg setconf wg0 /run/net/wg.conf":        "",
 			},
 			errors: map[string]error{
 				"ip addr replace 10.0.0.1/24 dev wg0": assert.AnError,
@@ -633,9 +633,9 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 	t.Run("interface up error", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/wg.conf":                   "",
+				"install -m 0600 /dev/stdin /run/net/wg.conf":                   "",
 				"ip link add dev wg0 type wireguard": "",
-				"wg setconf wg0 /run/netop/wg.conf":        "",
+				"wg setconf wg0 /run/net/wg.conf":        "",
 				"ip addr replace 10.0.0.1/24 dev wg0":    "",
 			},
 			errors: map[string]error{
@@ -659,9 +659,9 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 	t.Run("gateway route error (warning only)", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/netop/wg.conf":                   "",
+				"install -m 0600 /dev/stdin /run/net/wg.conf":                   "",
 				"ip link add dev wg0 type wireguard": "",
-				"wg setconf wg0 /run/netop/wg.conf":        "",
+				"wg setconf wg0 /run/net/wg.conf":        "",
 				"ip addr replace 10.0.0.1/24 dev wg0":    "",
 				"ip link set wg0 up":                 "",
 			},
