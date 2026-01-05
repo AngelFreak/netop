@@ -11,6 +11,21 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 )
 
+// Timeout constants for DHCP operations
+const (
+	// UdhcpcTimeout is the timeout for udhcpc (faster client, typically 1-2s)
+	UdhcpcTimeout = 10 * time.Second
+
+	// DhclientTimeout is the timeout for dhclient (slower, typically 3-5s)
+	DhclientTimeout = 15 * time.Second
+
+	// CleanupTimeout is the timeout for cleanup operations (pkill, rm)
+	CleanupTimeout = 500 * time.Millisecond
+
+	// IPCheckTimeout is the timeout for checking acquired IP address
+	IPCheckTimeout = 2 * time.Second
+)
+
 // Manager implements the DHCPClientManager interface
 type Manager struct {
 	executor types.SystemExecutor
@@ -28,6 +43,18 @@ func NewManager(executor types.SystemExecutor, logger types.Logger) *Manager {
 // Acquire obtains a DHCP lease for the interface.
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname.
 func (m *Manager) Acquire(iface string, hostname string) error {
+	// Validate interface name to prevent command injection
+	if err := types.ValidateInterfaceName(iface); err != nil {
+		return fmt.Errorf("invalid interface: %w", err)
+	}
+
+	// Validate hostname if provided
+	if hostname != "" {
+		if err := types.ValidateHostname(hostname); err != nil {
+			return fmt.Errorf("invalid hostname: %w", err)
+		}
+	}
+
 	m.logger.Info("Acquiring DHCP lease", "interface", iface)
 
 	// Try udhcpc first (faster, ~1s vs 3-5s for dhclient)
@@ -42,17 +69,46 @@ func (m *Manager) Acquire(iface string, hostname string) error {
 }
 
 // Release stops any running DHCP client for the interface and cleans up lease files.
+// This is a best-effort cleanup operation - errors are logged but not returned
+// since partial cleanup is acceptable for network operations.
 func (m *Manager) Release(iface string) error {
+	// Validate interface name
+	if err := types.ValidateInterfaceName(iface); err != nil {
+		return fmt.Errorf("invalid interface: %w", err)
+	}
+
 	m.logger.Debug("Releasing DHCP lease", "interface", iface)
 
+	var errs []string
+
 	// Kill both DHCP clients to ensure cleanup
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "udhcpc.*"+iface)
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "dhclient.*"+iface)
+	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "udhcpc.*"+iface); err != nil {
+		m.logger.Debug("No udhcpc process to kill", "interface", iface)
+	}
+	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "dhclient.*"+iface); err != nil {
+		m.logger.Debug("No dhclient process to kill", "interface", iface)
+	}
 
 	// Clean up lease files
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "rm", "-f",
-		"/var/lib/dhcp/dhclient."+iface+".leases",
-		types.RuntimeDir+"/dhclient."+iface+".leases")
+	leaseFiles := []string{
+		"/var/lib/dhcp/dhclient." + iface + ".leases",
+		types.RuntimeDir + "/dhclient." + iface + ".leases",
+	}
+	for _, f := range leaseFiles {
+		if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "rm", "-f", f); err != nil {
+			errs = append(errs, fmt.Sprintf("failed to remove %s: %v", f, err))
+		}
+	}
+
+	// Clean up interface-specific dhclient config
+	confFile := types.RuntimeDir + "/dhclient." + iface + ".conf"
+	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "rm", "-f", confFile); err != nil {
+		m.logger.Debug("Failed to remove dhclient config", "file", confFile, "error", err)
+	}
+
+	if len(errs) > 0 {
+		m.logger.Debug("Some cleanup operations failed", "errors", strings.Join(errs, "; "))
+	}
 
 	return nil
 }
@@ -77,8 +133,7 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 		args = append(args, "-x", "hostname:"+hostname)
 	}
 
-	// 10 second timeout is plenty - udhcpc typically completes in 1-2 seconds
-	_, err := m.executor.ExecuteWithTimeout(10*time.Second, "udhcpc", args...)
+	_, err := m.executor.ExecuteWithTimeout(UdhcpcTimeout, "udhcpc", args...)
 	if err != nil {
 		return fmt.Errorf("udhcpc failed: %w", err)
 	}
@@ -93,13 +148,13 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	m.Release(iface)
 
 	// Build dhclient command with optional hostname via config file
-	// 15s timeout is plenty - DHCP typically completes in 3-5s
-	args := []string{"15", "dhclient", "-v"}
+	args := []string{fmt.Sprintf("%d", int(DhclientTimeout.Seconds())), "dhclient", "-v"}
 	if hostname != "" {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
-		// Create temporary dhclient.conf with hostname using atomic write with secure permissions
+		// Create interface-specific dhclient.conf to avoid race conditions
+		// with concurrent DHCP operations on different interfaces
 		confContent := fmt.Sprintf("send host-name \"%s\";\n", hostname)
-		dhclientConf := types.RuntimeDir + "/dhclient.conf"
+		dhclientConf := types.RuntimeDir + "/dhclient." + iface + ".conf"
 		if _, err := m.executor.ExecuteWithInput("install", confContent, "-m", "0600", "/dev/stdin", dhclientConf); err != nil {
 			m.logger.Warn("Failed to create dhclient config", "error", err)
 		} else {
@@ -120,7 +175,7 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 
 // logAcquiredIP logs the IP address after successful DHCP
 func (m *Manager) logAcquiredIP(iface string) {
-	ipOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "addr", "show", iface)
+	ipOutput, err := m.executor.ExecuteWithTimeout(IPCheckTimeout, "ip", "addr", "show", iface)
 	if err == nil {
 		ip := m.parseIPAddress(ipOutput)
 		if ip != nil {
