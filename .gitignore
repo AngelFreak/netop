@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-net
-net-*
+/net
+/net-*
 
 # Build artifacts
 dist/

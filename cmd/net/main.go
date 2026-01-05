@@ -188,6 +188,25 @@ func initializeManagers() {
 	dhcpMgr = dhcp.NewDHCPManager(sysExecutor, logger)
 }
 
+// createApp creates an App instance from the global managers for testable execution.
+func createApp() *App {
+	return &App{
+		Logger:     logger,
+		Executor:   sysExecutor,
+		ConfigMgr:  cfgManager,
+		WiFiMgr:    wifiMgr,
+		VPNMgr:     vpnMgr,
+		NetworkMgr: netMgr,
+		HotspotMgr: hotspotMgr,
+		DHCPMgr:    dhcpMgr,
+		Interface:  iface,
+		NoVPN:      noVPN,
+		Debug:      debug,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+	}
+}
+
 func findDefaultInterface() string {
 	// Try to find first wireless interface
 	output, err := sysExecutor.Execute("iw", "dev")
@@ -302,32 +321,8 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List active connections with IP, gateway, and DNS info",
 	Run: func(cmd *cobra.Command, args []string) {
-		connections, err := wifiMgr.ListConnections()
-		if err != nil {
-			logger.Error("Failed to list connections", "error", err)
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return
-		}
-
-		if len(connections) == 0 {
-			fmt.Println("No active connections")
-			return
-		}
-
-		for _, conn := range connections {
-			fmt.Printf("Interface: %s\n", conn.Interface)
-			fmt.Printf("SSID: %s\n", conn.SSID)
-			fmt.Printf("State: %s\n", conn.State)
-			if conn.IP != nil {
-				fmt.Printf("IP: %s\n", conn.IP.String())
-			}
-			if conn.Gateway != nil {
-				fmt.Printf("Gateway: %s\n", conn.Gateway.String())
-			}
-			if len(conn.DNS) > 0 {
-				fmt.Printf("DNS: %v\n", conn.DNS)
-			}
-			fmt.Println()
+		if err := createApp().RunList(); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -337,20 +332,8 @@ var scanCmd = &cobra.Command{
 	Short: "Scan for WiFi networks (use 'scan open' to show only unprotected)",
 	Run: func(cmd *cobra.Command, args []string) {
 		showOpen := len(args) > 0 && args[0] == "open"
-
-		networks, err := wifiMgr.Scan()
-		if err != nil {
-			logger.Error("Failed to scan networks", "error", err)
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return
-		}
-
-		for _, network := range networks {
-			if showOpen && network.Security != "Open" {
-				continue
-			}
-			fmt.Printf("%s (%s) - Signal: %d dBm - Security: %s\n",
-				network.SSID, network.BSSID, network.Signal, network.Security)
+		if err := createApp().RunScan(showOpen); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -380,52 +363,8 @@ Examples:
 		if len(args) > 1 {
 			password = args[1]
 		}
-
-		logger.Debug("Connect command called", "name", name, "hasPassword", password != "")
-
-		// Check if it's a configured network
-		logger.Debug("Looking up network config", "name", name)
-		networkConfig, err := cfgManager.GetNetworkConfig(name)
-		var connectedIface string
-		if err != nil {
-			// Not configured, treat as SSID
-			logger.Debug("Network config not found, treating as direct SSID", "name", name, "error", err)
-			logger.Info("Connecting to SSID", "ssid", name)
-			err = wifiMgr.Connect(name, password, "") // No hostname for direct SSID connections
-			if err != nil {
-				logger.Error("Failed to connect to WiFi", "error", err)
-				return
-			}
-			connectedIface = wifiMgr.GetInterface()
-		} else {
-			// Use configured network - merge with common settings first
-			networkConfig = cfgManager.MergeWithCommon(name, networkConfig)
-			logger.Debug("Found network config", "name", name, "ssid", networkConfig.SSID, "mac", networkConfig.MAC)
-			logger.Info("Connecting to configured network", "name", name)
-			// If password provided via command line, use it; otherwise use config
-			if password == "" {
-				password = networkConfig.PSK
-			}
-			logger.Debug("Using network config", "configSSID", networkConfig.SSID, "hasPSK", networkConfig.PSK != "")
-			err = netMgr.ConnectToConfiguredNetwork(networkConfig, password, wifiMgr)
-			if err != nil {
-				logger.Error("Failed to connect to configured network", "error", err)
-				return
-			}
-			// Use configured interface if set, otherwise use WiFi interface
-			if networkConfig.Interface != "" {
-				connectedIface = networkConfig.Interface
-			} else {
-				connectedIface = wifiMgr.GetInterface()
-			}
-		}
-
-		// Display connection information
-		printConnectionInfo(connectedIface)
-
-		// Connect VPN if configured and not disabled
-		if !noVPN {
-			connectVPN(name)
+		if err := createApp().RunConnect(name, password); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -443,83 +382,8 @@ Examples:
   net stop wlan0        Bring down wlan0 only
   net stop eth0 wlan0   Bring down multiple interfaces`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 0 {
-			// Stop all services
-			logger.Debug("Stopping all network services")
-
-			var stoppedServices []string
-
-			// Stop hotspot
-			hotspotStatus, err := hotspotMgr.GetStatus()
-			if err == nil && hotspotStatus.Running {
-				logger.Debug("Stopping hotspot")
-				err = hotspotMgr.Stop()
-				if err != nil {
-					logger.Error("Failed to stop hotspot", "error", err)
-				} else {
-					stoppedServices = append(stoppedServices, "Hotspot")
-				}
-			}
-
-			// Stop DHCP server
-			if dhcpMgr.IsRunning() {
-				logger.Debug("Stopping DHCP server")
-				err = dhcpMgr.Stop()
-				if err != nil {
-					logger.Error("Failed to stop DHCP server", "error", err)
-				} else {
-					stoppedServices = append(stoppedServices, "DHCP server")
-				}
-			}
-
-			// Stop VPN
-			logger.Debug("Stopping VPN connections")
-			err = vpnMgr.Disconnect("")
-			if err != nil {
-				logger.Debug("No VPN to disconnect or failed", "error", err)
-			} else {
-				stoppedServices = append(stoppedServices, "VPN")
-			}
-
-			// Stop WiFi
-			logger.Debug("Stopping WiFi")
-			err = wifiMgr.Disconnect()
-			if err != nil {
-				logger.Error("Failed to disconnect WiFi", "error", err)
-			} else {
-				stoppedServices = append(stoppedServices, "WiFi")
-			}
-
-			// Clear DNS configuration
-			logger.Debug("Clearing DNS configuration")
-			err = netMgr.ClearDNS()
-			if err != nil {
-				logger.Debug("Failed to clear DNS", "error", err)
-			} else {
-				stoppedServices = append(stoppedServices, "DNS")
-			}
-
-			// Print summary
-			if len(stoppedServices) > 0 {
-				fmt.Println("✓ Stopped services:")
-				for _, service := range stoppedServices {
-					fmt.Printf("  • %s\n", service)
-				}
-			} else {
-				fmt.Println("No active services to stop")
-			}
-		} else {
-			// Stop specific interfaces
-			for _, iface := range args {
-				logger.Debug("Stopping interface", "interface", iface)
-				_, err := sysExecutor.Execute("ip", "link", "set", iface, "down")
-				if err != nil {
-					logger.Error("Failed to stop interface", "interface", iface, "error", err)
-					fmt.Printf("✗ Failed to stop %s\n", iface)
-				} else {
-					fmt.Printf("✓ Stopped interface %s\n", iface)
-				}
-			}
+		if err := createApp().RunStop(args); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -535,24 +399,8 @@ Examples:
   net dns 1.1.1.1 9.9.9.9      Cloudflare + Quad9
   net dns dhcp                 Restore DHCP-provided DNS`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 0 || (len(args) == 1 && args[0] == "dhcp") {
-			// Use DHCP for DNS
-			err := netMgr.DHCPRenew(iface, "") // No hostname for manual DHCP renewal
-			if err != nil {
-				logger.Error("Failed to renew DHCP", "error", err)
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			} else {
-				fmt.Println("✓ DNS restored via DHCP")
-			}
-		} else {
-			// Set custom DNS
-			err := netMgr.SetDNS(args)
-			if err != nil {
-				logger.Error("Failed to set DNS", "error", err)
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			} else {
-				fmt.Printf("✓ DNS set to %s\n", strings.Join(args, ", "))
-			}
+		if err := createApp().RunDNS(args); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -575,19 +423,8 @@ Examples:
 		if len(args) > 0 {
 			mac = args[0]
 		}
-
-		err := netMgr.SetMAC(iface, mac)
-		if err != nil {
-			logger.Error("Failed to set MAC address", "error", err)
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		} else {
-			// Get the actual MAC that was set
-			actualMAC, _ := netMgr.GetMAC(iface)
-			if actualMAC != "" {
-				fmt.Printf("✓ MAC address set to %s\n", actualMAC)
-			} else {
-				fmt.Println("✓ MAC address changed")
-			}
+		if err := createApp().RunMAC(mac); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -606,46 +443,12 @@ Examples:
   net vpn work            Connect to VPN "work"
   net vpn stop            Disconnect all VPNs`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 0 {
-			// List VPNs
-			vpns, err := vpnMgr.ListVPNs()
-			if err != nil {
-				logger.Error("Failed to list VPNs", "error", err)
-				return
-			}
-
-			if len(vpns) == 0 {
-				fmt.Println("No active VPNs")
-				return
-			}
-
-			for _, v := range vpns {
-				status := "disconnected"
-				if v.Connected {
-					status = "connected"
-				}
-				fmt.Printf("%s (%s) - %s\n", v.Name, v.Type, status)
-			}
-			return
+		arg := ""
+		if len(args) > 0 {
+			arg = args[0]
 		}
-
-		name := args[0]
-		if name == "stop" {
-			// Disconnect all VPNs
-			err := vpnMgr.Disconnect("")
-			if err != nil {
-				logger.Error("Failed to disconnect VPNs", "error", err)
-			} else {
-				fmt.Println("✓ VPN disconnected")
-			}
-		} else {
-			// Connect to VPN
-			err := vpnMgr.Connect(name)
-			if err != nil {
-				logger.Error("Failed to connect to VPN", "name", name, "error", err)
-			} else {
-				fmt.Printf("✓ VPN connected (%s)\n", name)
-			}
+		if err := createApp().RunVPN(arg); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -654,16 +457,9 @@ var genkeyCmd = &cobra.Command{
 	Use:   "genkey",
 	Short: "Generate a WireGuard private/public key pair",
 	Run: func(cmd *cobra.Command, args []string) {
-		private, public, err := vpnMgr.GenerateWireGuardKey()
-		if err != nil {
-			logger.Error("Failed to generate WireGuard key", "error", err)
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return
+		if err := createApp().RunGenkey(); err != nil {
+			os.Exit(1)
 		}
-
-		fmt.Println("✓ WireGuard keys generated")
-		fmt.Printf("Private key: %s\n", private)
-		fmt.Printf("Public key: %s\n", public)
 	},
 }
 
@@ -679,83 +475,12 @@ Examples:
   net show                Show all configuration
   net show home           Show config for network "home"`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 0 {
-			// Show all configurations
-			config := cfgManager.GetConfig()
-			if config == nil {
-				fmt.Println("No configuration loaded")
-				return
-			}
-
-			fmt.Println("Common Configuration:")
-			if config.Common.DNS != nil {
-				fmt.Printf("  DNS: %v\n", config.Common.DNS)
-			}
-			if config.Common.MAC != "" {
-				fmt.Printf("  MAC: %s\n", config.Common.MAC)
-			}
-			if config.Common.Hostname != "" {
-				fmt.Printf("  Hostname: %s\n", config.Common.Hostname)
-			}
-			if config.Common.VPN != "" {
-				fmt.Printf("  VPN: %s\n", config.Common.VPN)
-			}
-
-			fmt.Println("\nNetworks:")
-			for name, netConfig := range config.Networks {
-				fmt.Printf("  %s:\n", name)
-				if netConfig.Interface != "" {
-					fmt.Printf("    Interface: %s\n", netConfig.Interface)
-				}
-				if netConfig.SSID != "" {
-					fmt.Printf("    SSID: %s\n", netConfig.SSID)
-				}
-				if netConfig.VPN != "" {
-					fmt.Printf("    VPN: %s\n", netConfig.VPN)
-				}
-			}
-
-			fmt.Println("\nVPNs:")
-			for name, vpnConfig := range config.VPN {
-				fmt.Printf("  %s: %s\n", name, vpnConfig.Type)
-			}
-
-			fmt.Println("\nIgnored Interfaces:")
-			for _, iface := range config.Ignored.Interfaces {
-				fmt.Printf("  %s\n", iface)
-			}
-		} else {
-			// Show specific connection with effective (merged) config
-			name := args[0]
-			config, err := cfgManager.GetNetworkConfig(name)
-			if err != nil {
-				logger.Error("Failed to get network config", "name", name, "error", err)
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return
-			}
-
-			// Merge with common settings to show effective config
-			merged := cfgManager.MergeWithCommon(name, config)
-
-			fmt.Printf("Network: %s\n", name)
-			if merged.Interface != "" {
-				fmt.Printf("Interface: %s\n", merged.Interface)
-			}
-			if merged.SSID != "" {
-				fmt.Printf("SSID: %s\n", merged.SSID)
-			}
-			if len(merged.DNS) > 0 {
-				fmt.Printf("DNS: %s\n", strings.Join(merged.DNS, ", "))
-			}
-			if merged.MAC != "" {
-				fmt.Printf("MAC: %s\n", merged.MAC)
-			}
-			if merged.Hostname != "" {
-				fmt.Printf("Hostname: %s\n", merged.Hostname)
-			}
-			if merged.VPN != "" {
-				fmt.Printf("VPN: %s\n", merged.VPN)
-			}
+		networkName := ""
+		if len(args) > 0 {
+			networkName = args[0]
+		}
+		if err := createApp().RunShow(networkName); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -780,32 +505,13 @@ Examples:
   net hotspot start --channel 36        Start on 5GHz channel 36
   net hotspot stop                      Stop the hotspot`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 0 {
-			// Show status by default
-			status, err := hotspotMgr.GetStatus()
-			if err != nil {
-				logger.Error("Failed to get hotspot status", "error", err)
-				return
-			}
-
-			if !status.Running {
-				fmt.Println("Hotspot is not running")
-				return
-			}
-
-			fmt.Println("Hotspot Status:")
-			fmt.Printf("  SSID:      %s\n", status.SSID)
-			fmt.Printf("  Interface: %s\n", status.Interface)
-			if status.Gateway != nil {
-				fmt.Printf("  Gateway:   %s\n", status.Gateway.String())
-			}
-			fmt.Printf("  Clients:   %d\n", status.Clients)
-			return
+		action := "status"
+		if len(args) > 0 {
+			action = args[0]
 		}
 
-		action := args[0]
-		switch action {
-		case "start":
+		var config *types.HotspotConfig
+		if action == "start" {
 			// Get configuration from flags or use defaults
 			ssid, _ := cmd.Flags().GetString("ssid")
 			password, _ := cmd.Flags().GetString("password")
@@ -831,7 +537,7 @@ Examples:
 				dnsServers = []string{"8.8.8.8", "8.8.4.4"}
 			}
 
-			config := &types.HotspotConfig{
+			config = &types.HotspotConfig{
 				Interface: iface,
 				SSID:      ssid,
 				Password:  password,
@@ -840,55 +546,10 @@ Examples:
 				IPRange:   ipRange,
 				DNS:       dnsServers,
 			}
+		}
 
-			err := hotspotMgr.Start(config)
-			if err != nil {
-				logger.Error("Failed to start hotspot", "error", err)
-				fmt.Printf("Failed to start hotspot: %v\n", err)
-				return
-			}
-
-			fmt.Printf("✓ Hotspot started successfully\n")
-			fmt.Printf("  SSID:     %s\n", ssid)
-			if password != "" {
-				fmt.Printf("  Password: %s\n", password)
-			} else {
-				fmt.Printf("  Security: Open\n")
-			}
-			fmt.Printf("  Gateway:  %s\n", gateway)
-
-		case "stop":
-			err := hotspotMgr.Stop()
-			if err != nil {
-				logger.Error("Failed to stop hotspot", "error", err)
-				fmt.Printf("Failed to stop hotspot: %v\n", err)
-				return
-			}
-			fmt.Println("✓ Hotspot stopped successfully")
-
-		case "status":
-			status, err := hotspotMgr.GetStatus()
-			if err != nil {
-				logger.Error("Failed to get hotspot status", "error", err)
-				return
-			}
-
-			if !status.Running {
-				fmt.Println("Hotspot is not running")
-				return
-			}
-
-			fmt.Println("Hotspot Status:")
-			fmt.Printf("  SSID:      %s\n", status.SSID)
-			fmt.Printf("  Interface: %s\n", status.Interface)
-			if status.Gateway != nil {
-				fmt.Printf("  Gateway:   %s\n", status.Gateway.String())
-			}
-			fmt.Printf("  Clients:   %d\n", status.Clients)
-
-		default:
-			fmt.Printf("Unknown action: %s\n", action)
-			cmd.Help()
+		if err := createApp().RunHotspot(action, config); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -911,128 +572,8 @@ var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show full network status (connection, VPN, hotspot, DHCP)",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Network Status")
-		fmt.Println("==============")
-
-		// Get current connection info
-		connections, err := wifiMgr.ListConnections()
-		if err != nil {
-			logger.Debug("Failed to get connection info", "error", err)
-		}
-
-		// Get hostname
-		hostname, err := sysExecutor.Execute("hostname")
-		if err != nil {
-			logger.Debug("Failed to get hostname", "error", err)
-		} else {
-			fmt.Printf("\nHostname:  %s\n", strings.TrimSpace(hostname))
-		}
-
-		// Interface info
-		fmt.Printf("Interface: %s\n", iface)
-
-		// Get current MAC address
-		mac, err := netMgr.GetMAC(iface)
-		if err != nil {
-			logger.Debug("Failed to get MAC address", "error", err)
-		} else {
-			macInfo := mac
-			// Check config to determine if MAC is randomized
-			config := cfgManager.GetConfig()
-			if config != nil {
-				commonMAC := config.Common.MAC
-				if commonMAC == "" || commonMAC == "random" {
-					macInfo = mac + " (random)"
-				} else if commonMAC == "default" {
-					macInfo = mac + " (randomized Apple OUI)"
-				} else if strings.Contains(commonMAC, "??") {
-					macInfo = mac + " (randomized from " + commonMAC + ")"
-				}
-				// Otherwise it's a static MAC from config, no label needed
-			}
-			fmt.Printf("MAC:       %s\n", macInfo)
-		}
-
-		if len(connections) > 0 {
-			conn := connections[0]
-
-			if conn.SSID != "" {
-				fmt.Printf("SSID:      %s\n", conn.SSID)
-			}
-
-			fmt.Printf("State:     %s\n", conn.State)
-
-			if conn.IP != nil {
-				fmt.Printf("IP:        %s\n", conn.IP.String())
-			} else {
-				fmt.Printf("IP:        (none)\n")
-			}
-
-			if conn.Gateway != nil {
-				fmt.Printf("Gateway:   %s\n", conn.Gateway.String())
-			}
-
-			if len(conn.DNS) > 0 {
-				fmt.Printf("DNS:       ")
-				for i, dns := range conn.DNS {
-					if i > 0 {
-						fmt.Printf(", ")
-					}
-					fmt.Printf("%s", dns.String())
-				}
-				fmt.Println()
-			}
-		} else {
-			fmt.Println("State:     disconnected")
-		}
-
-		// VPN status
-		fmt.Println("\nVPN")
-		fmt.Println("---")
-		vpns, err := vpnMgr.ListVPNs()
-		if err != nil {
-			logger.Debug("Failed to list VPNs", "error", err)
-			fmt.Println("(unable to query VPN status)")
-		} else if len(vpns) == 0 {
-			fmt.Println("(none active)")
-		} else {
-			for _, v := range vpns {
-				status := "disconnected"
-				if v.Connected {
-					status = "connected"
-				}
-				fmt.Printf("%s (%s): %s\n", v.Name, v.Type, status)
-				if v.Interface != "" {
-					fmt.Printf("  Interface: %s\n", v.Interface)
-				}
-			}
-		}
-
-		// Hotspot status
-		fmt.Println("\nHotspot")
-		fmt.Println("-------")
-		hotspotStatus, err := hotspotMgr.GetStatus()
-		if err != nil {
-			logger.Debug("Failed to get hotspot status", "error", err)
-			fmt.Println("(unable to query hotspot status)")
-		} else if !hotspotStatus.Running {
-			fmt.Println("(not running)")
-		} else {
-			fmt.Printf("SSID:      %s\n", hotspotStatus.SSID)
-			fmt.Printf("Interface: %s\n", hotspotStatus.Interface)
-			if hotspotStatus.Gateway != nil {
-				fmt.Printf("Gateway:   %s\n", hotspotStatus.Gateway.String())
-			}
-			fmt.Printf("Clients:   %d\n", hotspotStatus.Clients)
-		}
-
-		// DHCP server status
-		fmt.Println("\nDHCP Server")
-		fmt.Println("-----------")
-		if dhcpMgr.IsRunning() {
-			fmt.Println("running")
-		} else {
-			fmt.Println("(not running)")
+		if err := createApp().RunStatus(); err != nil {
+			os.Exit(1)
 		}
 	},
 }
@@ -1050,19 +591,13 @@ Examples:
   net dhcp start --gateway 10.0.0.1     Custom gateway
   net dhcp stop                         Stop the server`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 0 {
-			// Show status by default
-			if dhcpMgr.IsRunning() {
-				fmt.Println("DHCP server is running")
-			} else {
-				fmt.Println("DHCP server is not running")
-			}
-			return
+		action := "status"
+		if len(args) > 0 {
+			action = args[0]
 		}
 
-		action := args[0]
-		switch action {
-		case "start":
+		var config *types.DHCPServerConfig
+		if action == "start" {
 			// Get configuration from flags or use defaults
 			gateway, _ := cmd.Flags().GetString("gateway")
 			ipRange, _ := cmd.Flags().GetString("ip-range")
@@ -1083,46 +618,17 @@ Examples:
 				leaseTime = "12h"
 			}
 
-			config := &types.DHCPServerConfig{
+			config = &types.DHCPServerConfig{
 				Interface: iface,
 				Gateway:   gateway,
 				IPRange:   ipRange,
 				DNS:       dnsServers,
 				LeaseTime: leaseTime,
 			}
+		}
 
-			err := dhcpMgr.Start(config)
-			if err != nil {
-				logger.Error("Failed to start DHCP server", "error", err)
-				fmt.Printf("Failed to start DHCP server: %v\n", err)
-				return
-			}
-
-			fmt.Printf("✓ DHCP server started successfully\n")
-			fmt.Printf("  Interface: %s\n", iface)
-			fmt.Printf("  Gateway:   %s\n", gateway)
-			fmt.Printf("  IP Range:  %s\n", ipRange)
-			fmt.Printf("  Lease:     %s\n", leaseTime)
-
-		case "stop":
-			err := dhcpMgr.Stop()
-			if err != nil {
-				logger.Error("Failed to stop DHCP server", "error", err)
-				fmt.Printf("Failed to stop DHCP server: %v\n", err)
-				return
-			}
-			fmt.Println("✓ DHCP server stopped successfully")
-
-		case "status":
-			if dhcpMgr.IsRunning() {
-				fmt.Println("DHCP server is running")
-			} else {
-				fmt.Println("DHCP server is not running")
-			}
-
-		default:
-			fmt.Printf("Unknown action: %s\n", action)
-			cmd.Help()
+		if err := createApp().RunDHCPServer(action, config); err != nil {
+			os.Exit(1)
 		}
 	},
 }
