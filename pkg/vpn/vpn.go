@@ -40,6 +40,9 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, configMgr ty
 
 // Connect connects to a VPN
 func (m *Manager) Connect(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.logger.Info("Connecting to VPN", "name", name)
 
 	// Load VPN config from ConfigManager
@@ -73,6 +76,9 @@ func (m *Manager) Connect(name string) error {
 
 // Disconnect disconnects from a VPN
 func (m *Manager) Disconnect(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.logger.Info("Disconnecting from VPN", "name", name)
 
 	// Kill OpenVPN processes with SIGKILL fallback
@@ -126,11 +132,9 @@ func (m *Manager) Disconnect(name string) error {
 	}
 	wg.Wait()
 
-	// Remove the VPN endpoint route if we added one
-	m.mu.Lock()
+	// Remove the VPN endpoint route if we added one (no nested lock needed, already holding m.mu)
 	endpointRoute := m.endpointRoute
 	m.endpointRoute = ""
-	m.mu.Unlock()
 	if endpointRoute != "" {
 		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
 		_, _ = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "del", endpointRoute)
@@ -525,7 +529,8 @@ func (m *Manager) setActiveVPN(name string) error {
 		// Non-fatal: status will fall back to interface detection
 		return err
 	}
-	return os.WriteFile(activeVPNFile, []byte(name), 0644)
+	// Use 0600 for consistency with other runtime files (e.g., wg.conf, openvpn.conf)
+	return os.WriteFile(activeVPNFile, []byte(name), 0600)
 }
 
 // clearActiveVPN removes the active VPN state file
