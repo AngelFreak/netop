@@ -38,15 +38,17 @@ type Manager struct {
 	logger             types.Logger
 	iface              string
 	associationTimeout time.Duration // Configurable for testing, defaults to 30s
+	dhcpClient         types.DHCPClientManager
 }
 
 // NewManager creates a new WiFi manager
-func NewManager(executor types.SystemExecutor, logger types.Logger, iface string) *Manager {
+func NewManager(executor types.SystemExecutor, logger types.Logger, iface string, dhcpClient types.DHCPClientManager) *Manager {
 	return &Manager{
 		executor:           executor,
 		logger:             logger,
 		iface:              iface,
 		associationTimeout: 30 * time.Second, // Default timeout
+		dhcpClient:         dhcpClient,
 	}
 }
 
@@ -405,88 +407,7 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 }
 
 func (m *Manager) obtainDHCP(hostname string) error {
-	// Try udhcpc first (faster, ~1s vs 3-5s for dhclient)
-	if m.executor.HasCommand("udhcpc") {
-		m.logger.Debug("Using udhcpc for DHCP (faster)")
-		return m.obtainDHCPudhcpc(hostname)
-	}
-
-	// Fall back to dhclient
-	m.logger.Debug("Using dhclient for DHCP")
-	return m.obtainDHCPdhclient(hostname)
-}
-
-// obtainDHCPudhcpc uses udhcpc (BusyBox) for faster DHCP acquisition
-func (m *Manager) obtainDHCPudhcpc(hostname string) error {
-	// Kill any existing DHCP clients
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "udhcpc.*"+m.iface)
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "dhclient.*"+m.iface)
-
-	// Build udhcpc command
-	// -i: interface, -n: fail if no lease (don't go to background), -q: quit after obtaining lease
-	args := []string{"-i", m.iface, "-n", "-q"}
-	if hostname != "" {
-		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
-		args = append(args, "-x", "hostname:"+hostname)
-	}
-
-	// 10 second timeout is plenty - udhcpc typically completes in 1-2 seconds
-	_, err := m.executor.ExecuteWithTimeout(10*time.Second, "udhcpc", args...)
-	if err != nil {
-		return fmt.Errorf("udhcpc failed: %w", err)
-	}
-
-	// Log acquired IP
-	m.logAcquiredIP()
-	return nil
-}
-
-// obtainDHCPdhclient uses dhclient (ISC) as fallback
-func (m *Manager) obtainDHCPdhclient(hostname string) error {
-	// Streamlined cleanup: just force-kill any existing dhclient
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "dhclient.*"+m.iface)
-
-	// Clear interface-specific lease files only (faster than checking all paths)
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "rm", "-f",
-		"/var/lib/dhcp/dhclient."+m.iface+".leases",
-		types.RuntimeDir+"/dhclient."+m.iface+".leases")
-
-	// Build dhclient command with optional hostname via config file
-	// 15 second timeout is plenty - normal DHCP completes in 3-5 seconds
-	args := []string{"15", "dhclient", "-v"}
-	if hostname != "" {
-		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
-		// Create temporary dhclient.conf with hostname using atomic write with secure permissions
-		confContent := fmt.Sprintf("send host-name \"%s\";\n", hostname)
-		dhclientConf := types.RuntimeDir + "/dhclient.conf"
-		if _, err := m.executor.ExecuteWithInput("install", confContent, "-m", "0600", "/dev/stdin", dhclientConf); err != nil {
-			m.logger.Warn("Failed to create dhclient config", "error", err)
-		} else {
-			args = append(args, "-cf", dhclientConf)
-		}
-	}
-	args = append(args, m.iface)
-
-	// Start dhclient with timeout
-	_, err := m.executor.Execute("timeout", args...)
-	if err != nil {
-		return fmt.Errorf("dhclient failed: %w", err)
-	}
-
-	// Log acquired IP
-	m.logAcquiredIP()
-	return nil
-}
-
-// logAcquiredIP logs the IP address after successful DHCP
-func (m *Manager) logAcquiredIP() {
-	ipOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "addr", "show", m.iface)
-	if err == nil {
-		ip := m.parseIPAddress(ipOutput)
-		if ip != nil {
-			m.logger.Info("Address acquired", "ip", ip.String())
-		}
-	}
+	return m.dhcpClient.Acquire(m.iface, hostname)
 }
 
 func (m *Manager) parseIPAddress(output string) net.IP {

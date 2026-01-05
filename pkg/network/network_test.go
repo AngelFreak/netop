@@ -143,13 +143,34 @@ func (m *mockLogger) Info(msg string, fields ...interface{})  {}
 func (m *mockLogger) Warn(msg string, fields ...interface{})  {}
 func (m *mockLogger) Error(msg string, fields ...interface{}) {}
 
+// mockDHCPClient implements types.DHCPClientManager for testing
+type mockDHCPClient struct {
+	acquireErr error
+	releaseErr error
+	renewErr   error
+}
+
+func (m *mockDHCPClient) Acquire(iface string, hostname string) error {
+	return m.acquireErr
+}
+
+func (m *mockDHCPClient) Release(iface string) error {
+	return m.releaseErr
+}
+
+func (m *mockDHCPClient) Renew(iface string, hostname string) error {
+	return m.renewErr
+}
+
 func TestNewManager(t *testing.T) {
 	executor := &mockSystemExecutor{}
 	logger := &mockLogger{}
-	manager := NewManager(executor, logger)
+	dhcpClient := &mockDHCPClient{}
+	manager := NewManager(executor, logger, dhcpClient)
 	assert.NotNil(t, manager)
 	assert.Equal(t, executor, manager.executor)
 	assert.Equal(t, logger, manager.logger)
+	assert.Equal(t, dhcpClient, manager.dhcpClient)
 }
 
 func TestSetDNS(t *testing.T) {
@@ -431,67 +452,40 @@ func TestFlushRoutes(t *testing.T) {
 }
 
 func TestStartDHCP(t *testing.T) {
-	t.Run("success with dhclient - kills old process and starts new", func(t *testing.T) {
-		executor := newMockExecutor()
-		// New streamlined DHCP flow: force kill + lease file removal
-		executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
-		executor.commands["timeout 15 dhclient -v wlan0"] = ""
-		executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+	t.Run("success - delegates to DHCPClientManager", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{dhcpClient: dhcpClient}
 
-		err := manager.StartDHCP("wlan0", "")
+		err := manager.StartDHCP("wlan0", "test-hostname")
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "pkill -9 -f dhclient.*wlan0")
-		executor.assertCommandExecuted(t, "timeout 15 dhclient -v wlan0")
 	})
 
-	t.Run("success with udhcpc - uses faster DHCP client when available", func(t *testing.T) {
-		executor := newMockExecutor()
-		executor.hasCommands = map[string]bool{"udhcpc": true}
-		executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
-		executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-		executor.commands["udhcpc -i wlan0 -n -q"] = ""
-		executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+	t.Run("failure - propagates error from DHCPClientManager", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhcp failed")}
+		manager := &Manager{dhcpClient: dhcpClient}
 
 		err := manager.StartDHCP("wlan0", "")
-		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -q")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "dhcp failed")
 	})
 }
 
 func TestDHCPRenew(t *testing.T) {
-	t.Run("success - renews DHCP lease with dhclient", func(t *testing.T) {
-		executor := newMockExecutor()
-		// New streamlined DHCP flow
-		executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
-		executor.commands["timeout 15 dhclient -v wlan0"] = ""
-		executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+	t.Run("success - delegates to DHCPClientManager", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{dhcpClient: dhcpClient}
 
-		err := manager.DHCPRenew("wlan0", "")
+		err := manager.DHCPRenew("wlan0", "test-hostname")
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "timeout 15 dhclient -v wlan0")
 	})
 
-	t.Run("success - renews DHCP lease with udhcpc", func(t *testing.T) {
-		executor := newMockExecutor()
-		executor.hasCommands = map[string]bool{"udhcpc": true}
-		executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
-		executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-		executor.commands["udhcpc -i wlan0 -n -q"] = ""
-		executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+	t.Run("failure - propagates error from DHCPClientManager", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{renewErr: fmt.Errorf("renew failed")}
+		manager := &Manager{dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("wlan0", "")
-		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -q")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "renew failed")
 	})
 }
 
@@ -797,24 +791,20 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 	t.Run("wired connection with DHCP", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["ip link set eth0 up"] = ""
-		// New streamlined DHCP flow
-		executor.commands["pkill -9 -f dhclient.*eth0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
-		executor.commands["timeout 15 dhclient -v eth0"] = ""
-		executor.commands["ip addr show eth0"] = "inet 192.168.1.50/24"
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{executor: executor, logger: logger, dhcpClient: dhcpClient}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
-			// No SSID means wired
+			// No SSID means wired, no Addr means DHCP
 		}
 
 		err := manager.ConnectToConfiguredNetwork(config, "", nil)
 		assert.NoError(t, err)
-		// Verify interface was brought up and DHCP was started
+		// Verify interface was brought up
 		executor.assertCommandExecuted(t, "ip link set eth0 up")
-		executor.assertCommandExecuted(t, "timeout 15 dhclient -v eth0")
+		// DHCP is now handled by the mock DHCPClientManager
 	})
 
 	t.Run("static IP configuration", func(t *testing.T) {
@@ -925,7 +915,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 	t.Run("auto-detect interface falls back when detection finds nothing", func(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{executor: executor, logger: logger, dhcpClient: dhcpClient}
 
 		// Test wired connection with no interface - system may or may not have eth* interfaces
 		config := &types.NetworkConfig{
@@ -1010,14 +1001,9 @@ func TestClearDNS(t *testing.T) {
 }
 
 func TestStartDHCP_ErrorPath(t *testing.T) {
-	t.Run("dhclient fails - returns error", func(t *testing.T) {
-		executor := newMockExecutor()
-		// New streamlined DHCP flow
-		executor.commands["pkill -9 -f dhclient.*eth0"] = ""
-		executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
-		executor.errors["timeout 15 dhclient -v eth0"] = fmt.Errorf("dhclient failed")
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+	t.Run("dhcp acquire fails - returns error", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed")}
+		manager := &Manager{dhcpClient: dhcpClient}
 
 		err := manager.StartDHCP("eth0", "")
 		assert.Error(t, err)
@@ -1206,19 +1192,9 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 }
 
 func TestDHCPRenew_ErrorPaths(t *testing.T) {
-	t.Run("dhclient fails", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				// New streamlined DHCP flow
-				"pkill -9 -f dhclient.*eth0": "",
-				"rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases": "",
-			},
-			errors: map[string]error{
-				"timeout 15 dhclient -v eth0": assert.AnError,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+	t.Run("dhcp renew fails", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{renewErr: assert.AnError}
+		manager := &Manager{dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("eth0", "")
 		assert.Error(t, err)

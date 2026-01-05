@@ -2,6 +2,7 @@ package wifi
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -79,12 +80,33 @@ func (m *mockLogger) Info(msg string, fields ...interface{})  {}
 func (m *mockLogger) Warn(msg string, fields ...interface{})  {}
 func (m *mockLogger) Error(msg string, fields ...interface{}) {}
 
+// mockDHCPClient implements types.DHCPClientManager for testing
+type mockDHCPClient struct {
+	acquireErr error
+	releaseErr error
+	renewErr   error
+}
+
+func (m *mockDHCPClient) Acquire(iface string, hostname string) error {
+	return m.acquireErr
+}
+
+func (m *mockDHCPClient) Release(iface string) error {
+	return m.releaseErr
+}
+
+func (m *mockDHCPClient) Renew(iface string, hostname string) error {
+	return m.renewErr
+}
+
 func TestNewManager(t *testing.T) {
 	executor := &mockSystemExecutor{}
 	logger := &mockLogger{}
-	manager := NewManager(executor, logger, "wlan0")
+	dhcpClient := &mockDHCPClient{}
+	manager := NewManager(executor, logger, "wlan0", dhcpClient)
 	assert.NotNil(t, manager)
 	assert.Equal(t, "wlan0", manager.iface)
+	assert.Equal(t, dhcpClient, manager.dhcpClient)
 }
 
 func TestScan(t *testing.T) {
@@ -106,7 +128,7 @@ freq: 2437
 			},
 		}
 		logger := &mockLogger{}
-		manager := NewManager(executor, logger, "wlan0")
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 		networks, err := manager.Scan()
 		assert.NoError(t, err)
@@ -136,7 +158,7 @@ freq: 2437
 			},
 		}
 		logger := &mockLogger{}
-		manager := NewManager(executor, logger, "wlan0")
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 		_, err := manager.Scan()
 		assert.Error(t, err)
@@ -170,7 +192,7 @@ SSID: OtherSSID`,
 			},
 		}
 		logger := &mockLogger{}
-		manager := NewManager(executor, logger, "wlan0")
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 		err := manager.Connect("TestSSID", "password", "")
 		assert.NoError(t, err)
@@ -194,7 +216,7 @@ SSID: OtherSSID`,
 			callCount: make(map[string]int),
 		}
 		logger := &mockLogger{}
-		manager := NewManager(executor, logger, "wlan0")
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 		err := manager.Connect("TestSSID", "password", "")
 		assert.NoError(t, err)
@@ -213,7 +235,7 @@ SSID: OtherSSID`,
 			},
 		}
 		logger := &mockLogger{}
-		manager := NewManager(executor, logger, "wlan0")
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.associationTimeout = 1 * time.Second // Short timeout for test
 
 		err := manager.Connect("UnavailableSSID", "password", "")
@@ -233,7 +255,7 @@ func TestDisconnect(t *testing.T) {
 		},
 	}
 	logger := &mockLogger{}
-	manager := NewManager(executor, logger, "wlan0")
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 	err := manager.Disconnect()
 	assert.NoError(t, err)
@@ -253,7 +275,7 @@ nameserver 1.1.1.1`,
 		},
 	}
 	logger := &mockLogger{}
-	manager := NewManager(executor, logger, "wlan0")
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 	connections, err := manager.ListConnections()
 	assert.NoError(t, err)
@@ -270,7 +292,7 @@ nameserver 1.1.1.1`,
 func TestGetInterface(t *testing.T) {
 	executor := &mockSystemExecutor{}
 	logger := &mockLogger{}
-	manager := NewManager(executor, logger, "wlan0")
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 
 	assert.Equal(t, "wlan0", manager.GetInterface())
 }
@@ -394,38 +416,21 @@ func TestGenerateWPAConfig(t *testing.T) {
 }
 
 func TestObtainDHCP(t *testing.T) {
-	t.Run("uses dhclient when udhcpc not available", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				// New streamlined DHCP flow
-				"pkill -9 -f dhclient.*wlan0":     "",
-				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
-				"timeout 15 dhclient -v wlan0":   "",
-				"ip addr show wlan0":             "inet 192.168.1.100/24",
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+	t.Run("delegates to DHCPClientManager", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{dhcpClient: dhcpClient, iface: "wlan0"}
 
 		err := manager.obtainDHCP("")
 		assert.NoError(t, err)
 	})
 
-	t.Run("uses udhcpc when available", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			hasCommands: map[string]bool{"udhcpc": true},
-			commands: map[string]string{
-				"pkill -9 -f udhcpc.*wlan0":      "",
-				"pkill -9 -f dhclient.*wlan0":    "",
-				"udhcpc -i wlan0 -n -q":          "",
-				"ip addr show wlan0":             "inet 192.168.1.100/24",
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+	t.Run("propagates error from DHCPClientManager", func(t *testing.T) {
+		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhcp failed")}
+		manager := &Manager{dhcpClient: dhcpClient, iface: "wlan0"}
 
 		err := manager.obtainDHCP("")
-		assert.NoError(t, err)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "dhcp failed")
 	})
 }
 
