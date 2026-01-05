@@ -81,6 +81,7 @@ func main() {
 	// Ensure runtime directory exists with secure permissions
 	if err := os.MkdirAll(types.RuntimeDir, 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to create runtime directory %s: %v\n", types.RuntimeDir, err)
+		fmt.Fprintf(os.Stderr, "Hint: try running with sudo\n")
 	}
 
 	var rootCmd = &cobra.Command{
