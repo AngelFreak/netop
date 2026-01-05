@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +13,9 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 	"golang.org/x/crypto/curve25519"
 )
+
+// activeVPNFile is the path to the file tracking the currently active VPN
+const activeVPNFile = types.RuntimeDir + "/active-vpn"
 
 // curve25519Basepoint is the standard basepoint for X25519 key derivation
 var curve25519Basepoint = [32]byte{9}
@@ -43,14 +48,27 @@ func (m *Manager) Connect(name string) error {
 		return fmt.Errorf("failed to load VPN config '%s': %w", name, err)
 	}
 
+	var connectErr error
 	switch config.Type {
 	case "openvpn":
-		return m.connectOpenVPN(config)
+		connectErr = m.connectOpenVPN(config)
 	case "wireguard":
-		return m.connectWireGuard(config)
+		connectErr = m.connectWireGuard(config)
 	default:
 		return fmt.Errorf("unsupported VPN type: %s", config.Type)
 	}
+
+	if connectErr != nil {
+		return connectErr
+	}
+
+	// Record the active VPN name for status tracking
+	if err := m.setActiveVPN(name); err != nil {
+		m.logger.Debug("Failed to record active VPN", "error", err)
+		// Non-fatal: connection succeeded, just status tracking won't work perfectly
+	}
+
+	return nil
 }
 
 // Disconnect disconnects from a VPN
@@ -120,6 +138,9 @@ func (m *Manager) Disconnect(name string) error {
 
 	// Restore default route via the physical interface
 	m.restoreDefaultRoute()
+
+	// Clear the active VPN state file
+	m.clearActiveVPN()
 
 	return nil
 }
@@ -205,7 +226,10 @@ func (m *Manager) killProcess(pattern string) {
 func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	m.logger.Debug("Listing VPNs")
 
-	// Track running VPNs
+	// Read the active VPN name from state file (authoritative source)
+	activeVPN := getActiveVPN()
+
+	// Track running VPN interfaces (used as fallback and for unnamed VPNs)
 	runningOpenVPN := false
 	runningWireGuard := make(map[string]bool) // interface name -> running
 
@@ -243,16 +267,30 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 				Interface: vpnConfig.Interface,
 			}
 
-			// Check if this VPN is running
-			switch vpnConfig.Type {
-			case "openvpn":
-				status.Connected = runningOpenVPN
-				if status.Interface == "" {
-					status.Interface = "tun0"
+			// Determine connection status:
+			// 1. If we have an active VPN recorded, use that as authoritative
+			// 2. Otherwise fall back to interface detection (for VPNs started outside net)
+			if activeVPN != "" {
+				// Use state file as authoritative source
+				status.Connected = (name == activeVPN)
+			} else {
+				// Fall back to interface detection
+				switch vpnConfig.Type {
+				case "openvpn":
+					status.Connected = runningOpenVPN
+				case "wireguard":
+					if vpnConfig.Interface != "" {
+						status.Connected = runningWireGuard[vpnConfig.Interface]
+					}
 				}
-			case "wireguard":
-				if vpnConfig.Interface != "" {
-					status.Connected = runningWireGuard[vpnConfig.Interface]
+			}
+
+			if status.Interface == "" {
+				switch vpnConfig.Type {
+				case "openvpn":
+					status.Interface = "tun0"
+				case "wireguard":
+					status.Interface = "wg0"
 				}
 			}
 
@@ -477,4 +515,31 @@ func (m *Manager) writeFile(path, content string) error {
 	// This avoids the TOCTOU race of write-then-chmod
 	_, err := m.executor.ExecuteWithInput("install", content, "-m", "0600", "/dev/stdin", path)
 	return err
+}
+
+// setActiveVPN records the currently active VPN name to the state file
+func (m *Manager) setActiveVPN(name string) error {
+	// Ensure runtime directory exists
+	if err := os.MkdirAll(filepath.Dir(activeVPNFile), 0755); err != nil {
+		m.logger.Debug("Failed to create runtime directory", "error", err)
+		// Non-fatal: status will fall back to interface detection
+		return err
+	}
+	return os.WriteFile(activeVPNFile, []byte(name), 0644)
+}
+
+// clearActiveVPN removes the active VPN state file
+func (m *Manager) clearActiveVPN() {
+	if err := os.Remove(activeVPNFile); err != nil && !os.IsNotExist(err) {
+		m.logger.Debug("Failed to remove active VPN file", "error", err)
+	}
+}
+
+// getActiveVPN reads the currently active VPN name from the state file
+func getActiveVPN() string {
+	data, err := os.ReadFile(activeVPNFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }

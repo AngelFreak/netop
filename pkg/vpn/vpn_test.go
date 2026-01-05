@@ -3,6 +3,8 @@ package vpn
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -700,4 +702,235 @@ func TestGenerateWireGuardKey_Coverage(t *testing.T) {
 		assert.Len(t, private, 44)
 		assert.Len(t, public, 44)
 	}
+}
+
+// setupTestActiveVPNFile creates a temp directory for testing the active VPN state file
+// Returns the original activeVPNFile path and a cleanup function
+func setupTestActiveVPNFile(t *testing.T) (originalFile string, cleanup func()) {
+	// Save the original file path - we can't change const, so we use a different approach
+	// Create a temp dir and test using direct file operations
+	tempDir := t.TempDir()
+	return tempDir, func() {
+		// Cleanup is automatic with t.TempDir()
+	}
+}
+
+func TestActiveVPNStateFile(t *testing.T) {
+	t.Run("getActiveVPN returns empty when file doesn't exist", func(t *testing.T) {
+		// getActiveVPN reads from the actual path, so if it doesn't exist it returns ""
+		// Remove the file if it exists for this test
+		os.Remove(activeVPNFile)
+
+		result := getActiveVPN()
+		assert.Equal(t, "", result)
+	})
+
+	t.Run("setActiveVPN and getActiveVPN roundtrip", func(t *testing.T) {
+		// This test requires the runtime directory to exist
+		// Skip if we can't create it (not running as root)
+		dir := filepath.Dir(activeVPNFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Skipf("Cannot create runtime directory %s: %v", dir, err)
+		}
+		defer os.Remove(activeVPNFile)
+
+		executor := &mockSystemExecutor{}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{}
+		manager := NewManager(executor, logger, configMgr)
+
+		// Set active VPN
+		err := manager.setActiveVPN("test-vpn")
+		assert.NoError(t, err)
+
+		// Read it back
+		result := getActiveVPN()
+		assert.Equal(t, "test-vpn", result)
+	})
+
+	t.Run("clearActiveVPN removes the file", func(t *testing.T) {
+		dir := filepath.Dir(activeVPNFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Skipf("Cannot create runtime directory %s: %v", dir, err)
+		}
+
+		// Create the file first
+		os.WriteFile(activeVPNFile, []byte("test-vpn"), 0644)
+		defer os.Remove(activeVPNFile)
+
+		executor := &mockSystemExecutor{}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{}
+		manager := NewManager(executor, logger, configMgr)
+
+		// Clear it
+		manager.clearActiveVPN()
+
+		// File should be gone
+		_, err := os.Stat(activeVPNFile)
+		assert.True(t, os.IsNotExist(err))
+	})
+}
+
+func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
+	t.Run("only active VPN shows as connected when state file exists", func(t *testing.T) {
+		dir := filepath.Dir(activeVPNFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Skipf("Cannot create runtime directory %s: %v", dir, err)
+		}
+
+		// Set proton-se as the active VPN
+		os.WriteFile(activeVPNFile, []byte("proton-se"), 0644)
+		defer os.Remove(activeVPNFile)
+
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pgrep -f openvpn":            "",
+				// wg0 interface exists (both VPNs share it)
+				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>",
+			},
+		}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{
+			vpnConfigs: map[string]*types.VPNConfig{
+				"proton-se": {
+					Type:      "wireguard",
+					Interface: "wg0",
+				},
+				"proton-dk": {
+					Type:      "wireguard",
+					Interface: "wg0", // Same interface!
+				},
+			},
+		}
+		manager := NewManager(executor, logger, configMgr)
+
+		vpns, err := manager.ListVPNs()
+		assert.NoError(t, err)
+		assert.Len(t, vpns, 2)
+
+		// Find each VPN by name
+		vpnMap := make(map[string]types.VPNStatus)
+		for _, v := range vpns {
+			vpnMap[v.Name] = v
+		}
+
+		// Only proton-se should be connected
+		assert.Contains(t, vpnMap, "proton-se")
+		assert.True(t, vpnMap["proton-se"].Connected, "proton-se should be connected")
+
+		assert.Contains(t, vpnMap, "proton-dk")
+		assert.False(t, vpnMap["proton-dk"].Connected, "proton-dk should NOT be connected")
+	})
+
+	t.Run("falls back to interface detection when no state file", func(t *testing.T) {
+		// Ensure state file doesn't exist
+		os.Remove(activeVPNFile)
+
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pgrep -f openvpn":            "",
+				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>",
+			},
+		}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{
+			vpnConfigs: map[string]*types.VPNConfig{
+				"proton-se": {
+					Type:      "wireguard",
+					Interface: "wg0",
+				},
+				"proton-dk": {
+					Type:      "wireguard",
+					Interface: "wg0",
+				},
+			},
+		}
+		manager := NewManager(executor, logger, configMgr)
+
+		vpns, err := manager.ListVPNs()
+		assert.NoError(t, err)
+		assert.Len(t, vpns, 2)
+
+		// Without state file, both will show as connected (the old buggy behavior)
+		// This is expected as a fallback for VPNs started outside of net
+		vpnMap := make(map[string]types.VPNStatus)
+		for _, v := range vpns {
+			vpnMap[v.Name] = v
+		}
+
+		// Both should show connected in fallback mode
+		assert.True(t, vpnMap["proton-se"].Connected)
+		assert.True(t, vpnMap["proton-dk"].Connected)
+	})
+}
+
+func TestConnect_SetsActiveVPNStateFile(t *testing.T) {
+	dir := filepath.Dir(activeVPNFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Skipf("Cannot create runtime directory %s: %v", dir, err)
+	}
+	defer os.Remove(activeVPNFile)
+
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"install -m 0600 /dev/stdin /run/net/wg.conf": "",
+			"ip link add dev wg0 type wireguard":          "",
+			"wg setconf wg0 /run/net/wg.conf":             "",
+			"rm -f /run/net/wg.conf":                      "",
+			"ip addr replace 10.0.0.1/24 dev wg0":         "",
+			"ip link set wg0 up":                          "",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"test-vpn": {
+				Type:      "wireguard",
+				Config:    "wireguard config",
+				Interface: "wg0",
+				Address:   "10.0.0.1/24",
+				Gateway:   false,
+			},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("test-vpn")
+	assert.NoError(t, err)
+
+	// Verify state file was written
+	result := getActiveVPN()
+	assert.Equal(t, "test-vpn", result)
+}
+
+func TestDisconnect_ClearsActiveVPNStateFile(t *testing.T) {
+	dir := filepath.Dir(activeVPNFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Skipf("Cannot create runtime directory %s: %v", dir, err)
+	}
+
+	// Create state file first
+	os.WriteFile(activeVPNFile, []byte("test-vpn"), 0644)
+	defer os.Remove(activeVPNFile)
+
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pkill -f openvpn":             "",
+			"ip link show type wireguard":  "",
+			"ip link delete wg0":           "",
+			"ip link set tun0 down":        "",
+			"ip route show":                "",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Disconnect("test-vpn")
+	assert.NoError(t, err)
+
+	// Verify state file was removed
+	_, err = os.Stat(activeVPNFile)
+	assert.True(t, os.IsNotExist(err), "active VPN state file should be removed after disconnect")
 }
