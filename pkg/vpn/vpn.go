@@ -231,7 +231,10 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	m.logger.Debug("Listing VPNs")
 
 	// Read the active VPN name from state file (authoritative source)
+	// Lock briefly to ensure consistent read with Connect/Disconnect
+	m.mu.Lock()
 	activeVPN := getActiveVPN()
+	m.mu.Unlock()
 
 	// Track running VPN interfaces (used as fallback and for unnamed VPNs)
 	runningOpenVPN := false
@@ -454,10 +457,8 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 				if err != nil {
 					m.logger.Warn("Failed to add route to VPN endpoint", "error", err)
 				} else {
-					// Store endpoint for cleanup on disconnect
-					m.mu.Lock()
+					// Store endpoint for cleanup on disconnect (already holding m.mu from Connect)
 					m.endpointRoute = endpoint
-					m.mu.Unlock()
 				}
 			}
 		}

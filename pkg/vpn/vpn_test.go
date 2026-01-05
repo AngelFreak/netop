@@ -755,7 +755,7 @@ func TestActiveVPNStateFile(t *testing.T) {
 		}
 
 		// Create the file first
-		os.WriteFile(activeVPNFile, []byte("test-vpn"), 0644)
+		os.WriteFile(activeVPNFile, []byte("test-vpn"), 0600)
 		defer os.Remove(activeVPNFile)
 
 		executor := &mockSystemExecutor{}
@@ -780,7 +780,7 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 		}
 
 		// Set proton-se as the active VPN
-		os.WriteFile(activeVPNFile, []byte("proton-se"), 0644)
+		os.WriteFile(activeVPNFile, []byte("proton-se"), 0600)
 		defer os.Remove(activeVPNFile)
 
 		executor := &mockSystemExecutor{
@@ -911,7 +911,7 @@ func TestDisconnect_ClearsActiveVPNStateFile(t *testing.T) {
 	}
 
 	// Create state file first
-	os.WriteFile(activeVPNFile, []byte("test-vpn"), 0644)
+	os.WriteFile(activeVPNFile, []byte("test-vpn"), 0600)
 	defer os.Remove(activeVPNFile)
 
 	executor := &mockSystemExecutor{
