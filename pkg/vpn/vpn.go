@@ -26,7 +26,7 @@ type Manager struct {
 	logger        types.Logger
 	configMgr     types.ConfigManager
 	endpointRoute string     // Stores the VPN endpoint IP for cleanup on disconnect
-	mu            sync.Mutex // Protects endpointRoute from concurrent access
+	mu            sync.Mutex // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 }
 
 // NewManager creates a new VPN manager
@@ -545,7 +545,9 @@ func (m *Manager) clearActiveVPN() {
 	}
 }
 
-// getActiveVPN reads the currently active VPN name from the state file
+// getActiveVPN reads the currently active VPN name from the state file.
+// Note: Production code in ListVPNs() inlines this read within a mutex lock.
+// This helper is kept for testing purposes.
 func getActiveVPN() string {
 	data, err := os.ReadFile(activeVPNFile)
 	if err != nil {
