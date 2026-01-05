@@ -224,9 +224,17 @@ type HotspotManager interface {
 	GetStatus() (*HotspotStatus, error)
 }
 
-// DHCPManager handles DHCP server operations
+// DHCPManager handles DHCP server operations (running dnsmasq for hotspot)
 type DHCPManager interface {
 	Start(config *DHCPServerConfig) error
 	Stop() error
 	IsRunning() bool
+}
+
+// DHCPClientManager handles DHCP client operations (obtaining leases from a server)
+// This is distinct from DHCPManager which handles DHCP server operations
+type DHCPClientManager interface {
+	Acquire(iface string, hostname string) error
+	Release(iface string) error
+	Renew(iface string, hostname string) error
 }

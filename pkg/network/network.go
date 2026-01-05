@@ -12,15 +12,17 @@ import (
 
 // Manager implements the NetworkManager interface
 type Manager struct {
-	executor types.SystemExecutor
-	logger   types.Logger
+	executor   types.SystemExecutor
+	logger     types.Logger
+	dhcpClient types.DHCPClientManager
 }
 
 // NewManager creates a new network manager
-func NewManager(executor types.SystemExecutor, logger types.Logger) *Manager {
+func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient types.DHCPClientManager) *Manager {
 	return &Manager{
-		executor: executor,
-		logger:   logger,
+		executor:   executor,
+		logger:     logger,
+		dhcpClient: dhcpClient,
 	}
 }
 
@@ -285,106 +287,13 @@ func (m *Manager) SetHostname(hostname string) error {
 // StartDHCP performs initial DHCP lease acquisition
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname
 func (m *Manager) StartDHCP(iface string, hostname string) error {
-	m.logger.Info("Starting DHCP lease acquisition", "interface", iface)
-
-	// Try udhcpc first (faster, ~1s vs 3-5s for dhclient)
-	if m.executor.HasCommand("udhcpc") {
-		m.logger.Debug("Using udhcpc for DHCP (faster)")
-		return m.startDHCPudhcpc(iface, hostname)
-	}
-
-	// Fall back to dhclient
-	m.logger.Debug("Using dhclient for DHCP")
-	return m.startDHCPdhclient(iface, hostname)
-}
-
-// startDHCPudhcpc uses udhcpc (BusyBox) for faster DHCP acquisition
-func (m *Manager) startDHCPudhcpc(iface string, hostname string) error {
-	// Kill any existing DHCP clients
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "udhcpc.*"+iface)
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "dhclient.*"+iface)
-
-	// Build udhcpc command
-	// -i: interface, -n: fail if no lease (don't go to background), -q: quit after obtaining lease
-	args := []string{"-i", iface, "-n", "-q"}
-	if hostname != "" {
-		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
-		args = append(args, "-x", "hostname:"+hostname)
-	}
-
-	// 10 second timeout is plenty - udhcpc typically completes in 1-2 seconds
-	_, err := m.executor.ExecuteWithTimeout(10*time.Second, "udhcpc", args...)
-	if err != nil {
-		return fmt.Errorf("udhcpc failed: %w", err)
-	}
-
-	// Log acquired IP
-	m.logAcquiredIP(iface)
-	return nil
-}
-
-// startDHCPdhclient uses dhclient (ISC) as fallback
-func (m *Manager) startDHCPdhclient(iface string, hostname string) error {
-	// Streamlined cleanup: just force-kill any existing dhclient
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", "dhclient.*"+iface)
-
-	// Clear interface-specific lease files only (faster than checking all paths)
-	m.executor.ExecuteWithTimeout(500*time.Millisecond, "rm", "-f",
-		"/var/lib/dhcp/dhclient."+iface+".leases",
-		types.RuntimeDir+"/dhclient."+iface+".leases")
-
-	// Build dhclient command with optional hostname via config file
-	// 15s timeout is plenty - DHCP typically completes in 3-5s
-	args := []string{"15", "dhclient", "-v"}
-	if hostname != "" {
-		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
-		// Create temporary dhclient.conf with hostname using atomic write with secure permissions
-		confContent := fmt.Sprintf("send host-name \"%s\";\n", hostname)
-		dhclientConf := types.RuntimeDir + "/dhclient.conf"
-		if _, err := m.executor.ExecuteWithInput("install", confContent, "-m", "0600", "/dev/stdin", dhclientConf); err != nil {
-			m.logger.Warn("Failed to create dhclient config", "error", err)
-		} else {
-			args = append(args, "-cf", dhclientConf)
-		}
-	}
-	args = append(args, iface)
-
-	// Start dhclient with timeout
-	_, err := m.executor.Execute("timeout", args...)
-	if err != nil {
-		return fmt.Errorf("dhclient failed: %w", err)
-	}
-
-	// Log acquired IP
-	m.logAcquiredIP(iface)
-	return nil
-}
-
-// logAcquiredIP logs the IP address after successful DHCP
-func (m *Manager) logAcquiredIP(iface string) {
-	ipOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "addr", "show", iface)
-	if err == nil {
-		ip := m.parseIPAddress(ipOutput)
-		if ip != nil {
-			m.logger.Info("Address acquired", "ip", ip.String())
-		}
-	}
+	return m.dhcpClient.Acquire(iface, hostname)
 }
 
 // DHCPRenew performs DHCP renewal
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname
 func (m *Manager) DHCPRenew(iface string, hostname string) error {
-	m.logger.Info("Performing DHCP renewal", "interface", iface)
-
-	// Try udhcpc first (faster)
-	if m.executor.HasCommand("udhcpc") {
-		m.logger.Debug("Using udhcpc for DHCP renewal (faster)")
-		return m.startDHCPudhcpc(iface, hostname)
-	}
-
-	// Fall back to dhclient
-	m.logger.Debug("Using dhclient for DHCP renewal")
-	return m.startDHCPdhclient(iface, hostname)
+	return m.dhcpClient.Renew(iface, hostname)
 }
 
 // detectInterface detects the appropriate network interface for the given configuration
