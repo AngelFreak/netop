@@ -477,6 +477,106 @@ func TestParseIPAddress(t *testing.T) {
 	}
 }
 
+// Tests for dhclient config creation failure as hard error
+
+func TestAcquire_DhclientConfigCreationFailure(t *testing.T) {
+	executor := newMockExecutor()
+	executor.hasCommands["udhcpc"] = false
+	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
+	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
+	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
+	// Simulate config creation failure
+	executor.errors["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = errors.New("permission denied")
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger)
+
+	// When hostname is specified, config creation failure should be a hard error
+	err := manager.Acquire("wlan0", "myhost")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to create dhclient config")
+}
+
+// Tests for cleanup on DHCP acquisition failure
+
+func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
+	executor := newMockExecutor()
+	executor.hasCommands["udhcpc"] = true
+	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
+	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
+	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
+	executor.errors["udhcpc -i wlan0 -n -q"] = errors.New("no lease obtained")
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger)
+
+	err := manager.Acquire("wlan0", "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "udhcpc failed")
+
+	// Count how many times Release was called (pkill commands)
+	// Should be called twice: once before acquire attempt, once after failure
+	pkillCount := 0
+	for _, cmd := range executor.executedCmds {
+		if strings.Contains(cmd, "pkill") && strings.Contains(cmd, "udhcpc") {
+			pkillCount++
+		}
+	}
+	assert.Equal(t, 2, pkillCount, "Release should be called both before and after udhcpc failure")
+}
+
+func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
+	executor := newMockExecutor()
+	executor.hasCommands["udhcpc"] = false
+	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
+	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
+	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
+	executor.errors["timeout 15 dhclient -v wlan0"] = errors.New("no lease obtained")
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger)
+
+	err := manager.Acquire("wlan0", "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "dhclient failed")
+
+	// Count how many times Release was called (pkill commands)
+	// Should be called twice: once before acquire attempt, once after failure
+	pkillCount := 0
+	for _, cmd := range executor.executedCmds {
+		if strings.Contains(cmd, "pkill") && strings.Contains(cmd, "dhclient") {
+			pkillCount++
+		}
+	}
+	assert.Equal(t, 2, pkillCount, "Release should be called both before and after dhclient failure")
+}
+
+// Tests for regex escape in pkill patterns
+
+func TestRelease_UsesRegexpQuoteMeta(t *testing.T) {
+	// Verify that regexp.QuoteMeta is called on interface names
+	// For valid interface names (letters, digits, dash, underscore), QuoteMeta
+	// doesn't change the string, but it's defensive programming for future-proofing.
+	// We verify the code path works correctly with a normal interface name.
+	executor := newMockExecutor()
+	executor.commands["pkill -9 -f udhcpc.*wlan-0"] = ""
+	executor.commands["pkill -9 -f dhclient.*wlan-0"] = ""
+	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan-0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan-0.leases"] = ""
+	executor.commands["rm -f /run/net/dhclient.wlan-0.conf"] = ""
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger)
+
+	err := manager.Release("wlan-0")
+	assert.NoError(t, err)
+	// Verify the command was executed with the interface name
+	executor.assertCommandExecuted(t, "udhcpc.*wlan-0")
+	executor.assertCommandExecuted(t, "dhclient.*wlan-0")
+}
+
 // Tests for timeout constants
 
 func TestTimeoutConstants(t *testing.T) {

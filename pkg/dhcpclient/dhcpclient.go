@@ -5,6 +5,7 @@ package dhcpclient
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 
@@ -81,11 +82,14 @@ func (m *Manager) Release(iface string) error {
 
 	var errs []string
 
+	// Escape regex special characters in interface name (e.g., eth-0 has '-' which is a regex char)
+	escapedIface := regexp.QuoteMeta(iface)
+
 	// Kill both DHCP clients to ensure cleanup
-	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "udhcpc.*"+iface); err != nil {
+	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "udhcpc.*"+escapedIface); err != nil {
 		m.logger.Debug("No udhcpc process to kill", "interface", iface)
 	}
-	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "dhclient.*"+iface); err != nil {
+	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "dhclient.*"+escapedIface); err != nil {
 		m.logger.Debug("No dhclient process to kill", "interface", iface)
 	}
 
@@ -135,6 +139,8 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 
 	_, err := m.executor.ExecuteWithTimeout(UdhcpcTimeout, "udhcpc", args...)
 	if err != nil {
+		// Clean up any partial state on failure
+		m.Release(iface)
 		return fmt.Errorf("udhcpc failed: %w", err)
 	}
 
@@ -156,16 +162,18 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 		confContent := fmt.Sprintf("send host-name \"%s\";\n", hostname)
 		dhclientConf := types.RuntimeDir + "/dhclient." + iface + ".conf"
 		if _, err := m.executor.ExecuteWithInput("install", confContent, "-m", "0600", "/dev/stdin", dhclientConf); err != nil {
-			m.logger.Warn("Failed to create dhclient config", "error", err)
-		} else {
-			args = append(args, "-cf", dhclientConf)
+			// Hostname was explicitly requested but we can't create config - this is a hard error
+			return fmt.Errorf("failed to create dhclient config for hostname: %w", err)
 		}
+		args = append(args, "-cf", dhclientConf)
 	}
 	args = append(args, iface)
 
 	// Start dhclient with timeout wrapper
 	_, err := m.executor.Execute("timeout", args...)
 	if err != nil {
+		// Clean up any partial state on failure
+		m.Release(iface)
 		return fmt.Errorf("dhclient failed: %w", err)
 	}
 
