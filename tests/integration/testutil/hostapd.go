@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -166,10 +167,9 @@ func (ap *TestAP) GetBSSID() (string, error) {
 
 	// Parse the addr field from iw output
 	// Format: "addr XX:XX:XX:XX:XX:XX"
-	lines := string(output)
-	for _, line := range splitLines(lines) {
-		if contains(line, "addr ") {
-			parts := splitFields(line)
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, "addr ") {
+			parts := strings.Fields(line)
 			for i, part := range parts {
 				if part == "addr" && i+1 < len(parts) {
 					return parts[i+1], nil
@@ -190,48 +190,3 @@ func (ap *TestAP) IsRunning() bool {
 	return ap.cmd.ProcessState == nil || !ap.cmd.ProcessState.Exited()
 }
 
-// helper functions to avoid importing strings package
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
-}
-
-func splitFields(s string) []string {
-	var fields []string
-	start := -1
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' {
-			if start >= 0 {
-				fields = append(fields, s[start:i])
-				start = -1
-			}
-		} else {
-			if start < 0 {
-				start = i
-			}
-		}
-	}
-	if start >= 0 {
-		fields = append(fields, s[start:])
-	}
-	return fields
-}
-
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}

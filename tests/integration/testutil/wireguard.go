@@ -180,12 +180,14 @@ func generateWireGuardKeyPair() (privateKey, publicKey string, err error) {
 	private[31] &= 127
 	private[31] |= 64
 
-	// Derive public key
-	var public [32]byte
-	curve25519.ScalarBaseMult(&public, &private)
+	// Derive public key using X25519 with the basepoint
+	public, err := curve25519.X25519(private[:], curve25519.Basepoint)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to derive public key: %v", err)
+	}
 
 	privateKey = base64.StdEncoding.EncodeToString(private[:])
-	publicKey = base64.StdEncoding.EncodeToString(public[:])
+	publicKey = base64.StdEncoding.EncodeToString(public)
 
 	return privateKey, publicKey, nil
 }

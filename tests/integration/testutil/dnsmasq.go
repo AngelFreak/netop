@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -279,8 +280,8 @@ func (c *DHCPClient) GetIP() (string, error) {
 
 	// Parse inet line for IP
 	// Simple parsing - look for "inet X.X.X.X"
-	for _, line := range splitLines(output) {
-		fields := splitFields(line)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
 		for i, f := range fields {
 			if f == "inet" && i+1 < len(fields) {
 				return fields[i+1], nil

@@ -152,28 +152,9 @@ func TestHotspotStatus_Integration(t *testing.T) {
 	assert.Contains(t, info, "type AP", "Interface should be in AP mode")
 }
 
-// Helper to set IP on interface
+// setInterfaceIP sets an IP address on a network interface.
 func setInterfaceIP(iface, ip string) error {
-	return runCmd("ip", "addr", "add", ip, "dev", iface)
-}
-
-func runCmd(name string, args ...string) error {
-	return runCmdExec(name, args...).Run()
-}
-
-func runCmdExec(name string, args ...string) *cmdRunner {
-	return &cmdRunner{name: name, args: args}
-}
-
-type cmdRunner struct {
-	name string
-	args []string
-}
-
-func (c *cmdRunner) Run() error {
-	// This is a simplified implementation
-	// In practice, we'd use os/exec
-	return nil
+	return exec.Command("ip", "addr", "add", ip, "dev", iface).Run()
 }
 
 // testLogger implements types.Logger
