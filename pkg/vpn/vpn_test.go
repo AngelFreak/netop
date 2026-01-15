@@ -227,6 +227,7 @@ func TestListVPNs(t *testing.T) {
 			commands: map[string]string{
 				"pgrep -f openvpn":            "",
 				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n    link/none",
+				"wg show wg0":                 "interface: wg0\n  public key: abc123\n  peer: xyz789\n    endpoint: 1.2.3.4:51820",
 			},
 		}
 		logger := &mockLogger{}
@@ -304,6 +305,7 @@ func TestListVPNs(t *testing.T) {
 			commands: map[string]string{
 				"pgrep -f openvpn":            "1234",
 				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>",
+				"wg show wg0":                 "interface: wg0\n  peer: abc123\n    endpoint: 1.2.3.4:51820",
 			},
 		}
 		logger := &mockLogger{}
@@ -785,9 +787,10 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pgrep -f openvpn":            "",
+				"pgrep -f openvpn": "",
 				// wg0 interface exists (both VPNs share it)
 				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>",
+				"wg show wg0":                 "interface: wg0\n  peer: abc123\n    endpoint: 1.2.3.4:51820",
 			},
 		}
 		logger := &mockLogger{}
@@ -831,6 +834,7 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 			commands: map[string]string{
 				"pgrep -f openvpn":            "",
 				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>",
+				"wg show wg0":                 "interface: wg0\n  peer: abc123\n    endpoint: 1.2.3.4:51820",
 			},
 		}
 		logger := &mockLogger{}
@@ -862,6 +866,38 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 		// Both should show connected in fallback mode
 		assert.True(t, vpnMap["proton-se"].Connected)
 		assert.True(t, vpnMap["proton-dk"].Connected)
+	})
+
+	t.Run("stale interface without peers shows as not connected", func(t *testing.T) {
+		// Ensure state file doesn't exist
+		os.Remove(activeVPNFile)
+
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pgrep -f openvpn": "",
+				// wg0 interface exists but...
+				"ip link show type wireguard": "3: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>",
+				// ...has no peers configured (stale interface)
+				"wg show wg0": "interface: wg0\n  public key: abc123\n  private key: (hidden)",
+			},
+		}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{
+			vpnConfigs: map[string]*types.VPNConfig{
+				"proton-se": {
+					Type:      "wireguard",
+					Interface: "wg0",
+				},
+			},
+		}
+		manager := NewManager(executor, logger, configMgr)
+
+		vpns, err := manager.ListVPNs()
+		assert.NoError(t, err)
+		assert.Len(t, vpns, 1)
+
+		// Stale interface (no peers) should not show as connected
+		assert.False(t, vpns[0].Connected, "VPN with stale interface (no peers) should not be connected")
 	})
 }
 

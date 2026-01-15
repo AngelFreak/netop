@@ -54,11 +54,12 @@ func (e *testExecutor) HasCommand(cmd string) bool {
 
 // testConfigManager implements types.ConfigManager for testing
 type testConfigManager struct {
-	config           *types.Config
-	networkConfig    *types.NetworkConfig
-	networkErr       error
+	config                *types.Config
+	networkConfig         *types.NetworkConfig
+	networkErr            error
 	mergeWithCommonCalled bool
 	lastMergedNetwork     string
+	vpnExplicitlyDisabled map[string]bool // networks where vpn: is explicitly empty
 }
 
 func (c *testConfigManager) LoadConfig(path string) (*types.Config, error) {
@@ -91,8 +92,11 @@ func (c *testConfigManager) MergeWithCommon(name string, config *types.NetworkCo
 		if merged.Hostname == "" && c.config.Common.Hostname != "" {
 			merged.Hostname = c.config.Common.Hostname
 		}
+		// Only inherit VPN from common if not explicitly disabled for this network
 		if merged.VPN == "" && c.config.Common.VPN != "" {
-			merged.VPN = c.config.Common.VPN
+			if c.vpnExplicitlyDisabled == nil || !c.vpnExplicitlyDisabled[name] {
+				merged.VPN = c.config.Common.VPN
+			}
 		}
 		return &merged
 	}
@@ -737,6 +741,27 @@ func TestApp_connectVPN_NoVPNConfigured(t *testing.T) {
 
 	app.connectVPN("home")
 	// Should not output anything when no VPN configured
+	assert.Empty(t, stdout.String())
+}
+
+func TestApp_connectVPN_VPNExplicitlyDisabled(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Common: types.CommonConfig{
+				VPN: "default-vpn", // Common VPN is set
+			},
+			Networks: map[string]types.NetworkConfig{
+				"home": {SSID: "HomeWiFi"}, // VPN field empty, but explicitly disabled
+			},
+		},
+		vpnExplicitlyDisabled: map[string]bool{
+			"home": true, // Simulate vpn: (empty) in YAML
+		},
+	}
+
+	app.connectVPN("home")
+	// Should NOT connect to common VPN because vpn: was explicitly set to empty
 	assert.Empty(t, stdout.String())
 }
 
