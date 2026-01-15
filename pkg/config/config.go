@@ -308,8 +308,11 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 		var home string
 		var err error
 
-		// Handle sudo execution: use SUDO_USER's home directory instead of root
-		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		// First check if HOME is explicitly set (for testing and explicit overrides)
+		if envHome := os.Getenv("HOME"); envHome != "" {
+			home = envHome
+		} else if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			// Handle sudo execution: use SUDO_USER's home directory instead of root
 			if m.logger != nil {
 				m.logger.Debug("Running with sudo", "sudoUser", sudoUser)
 			}
