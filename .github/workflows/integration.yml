@@ -1,0 +1,97 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            hostapd \
+            dnsmasq \
+            iw \
+            wireless-tools \
+            wireguard-tools \
+            iproute2
+
+      - name: Load kernel modules
+        run: |
+          # Load WireGuard module
+          sudo modprobe wireguard || echo "WireGuard module not available"
+
+          # Load mac80211_hwsim for virtual WiFi
+          sudo modprobe mac80211_hwsim radios=4 || echo "mac80211_hwsim not available"
+
+          # Verify modules
+          lsmod | grep -E "(wireguard|mac80211_hwsim)" || true
+
+      - name: Run unit tests
+        run: go test -v ./...
+
+      - name: Run integration tests
+        run: |
+          # Run integration tests with sudo
+          # Tests will skip gracefully if capabilities are missing
+          sudo go test -tags=integration -v -timeout=10m ./...
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unload hwsim module
+          sudo modprobe -r mac80211_hwsim || true
+
+          # Kill any lingering processes
+          sudo pkill -f hostapd || true
+          sudo pkill -f dnsmasq || true
+          sudo pkill -f wpa_supplicant || true
+
+  # Separate job for tests that don't need special capabilities
+  integration-basic:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install basic dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wireguard-tools \
+            iproute2
+
+      - name: Load WireGuard module
+        run: sudo modprobe wireguard || echo "WireGuard not available"
+
+      - name: Run VPN integration tests
+        run: |
+          # Run only VPN tests which are more likely to work in CI
+          sudo go test -tags=integration -v -timeout=5m ./pkg/vpn/...
+
+      - name: Run network integration tests
+        run: |
+          # Run network namespace tests
+          sudo go test -tags=integration -v -timeout=5m ./pkg/network/...
