@@ -251,6 +251,7 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	}
 
 	// Check WireGuard interfaces (with timeout)
+	// First find all WireGuard interfaces
 	wgOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "show", "type", "wireguard")
 	if err == nil && strings.TrimSpace(wgOutput) != "" {
 		lines := strings.Split(wgOutput, "\n")
@@ -259,7 +260,12 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 				parts := strings.Fields(line)
 				if len(parts) >= 2 {
 					iface := strings.Trim(parts[1], ":")
-					runningWireGuard[iface] = true
+					// Verify the interface is actually configured (has peers)
+					// A stale interface will have no peers
+					wgShowOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "wg", "show", iface)
+					if err == nil && strings.Contains(wgShowOutput, "peer:") {
+						runningWireGuard[iface] = true
+					}
 				}
 			}
 		}

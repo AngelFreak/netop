@@ -71,7 +71,10 @@ func (a *App) attemptVPNConnect(vpnName string) {
 }
 
 // connectVPN connects to VPN if configured for the network.
-// It checks for a network-specific VPN first, then falls back to the common VPN.
+// Uses MergeWithCommon to properly handle VPN inheritance:
+// - If network has vpn: set to a value, use that VPN
+// - If network has vpn: empty/null, don't connect to any VPN
+// - If network has no vpn key, inherit from common.vpn
 // Does nothing if no VPN is configured or if the config is nil.
 func (a *App) connectVPN(networkName string) {
 	config := a.ConfigMgr.GetConfig()
@@ -79,13 +82,20 @@ func (a *App) connectVPN(networkName string) {
 		return
 	}
 
-	// Check if network has a specific VPN configured
-	if netConfig, ok := config.Networks[networkName]; ok && netConfig.VPN != "" {
-		a.attemptVPNConnect(netConfig.VPN)
+	// Get network config and merge with common settings
+	// MergeWithCommon handles the vpn inheritance logic:
+	// - explicit vpn: (empty) -> VPN stays empty (disabled)
+	// - no vpn key -> inherits common.vpn
+	// - vpn: some-vpn -> uses that VPN
+	if netConfig, ok := config.Networks[networkName]; ok {
+		merged := a.ConfigMgr.MergeWithCommon(networkName, &netConfig)
+		if merged.VPN != "" {
+			a.attemptVPNConnect(merged.VPN)
+		}
 		return
 	}
 
-	// Check if common VPN is configured
+	// Network not in config, check if common VPN is configured
 	if config.Common.VPN != "" {
 		a.attemptVPNConnect(config.Common.VPN)
 	}
