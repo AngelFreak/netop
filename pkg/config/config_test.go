@@ -47,7 +47,15 @@ func TestLoadConfig(t *testing.T) {
 			name: "default path",
 			path: "",
 			setup: func() (cleanup func()) {
-				home := "/tmp/test_home"
+				// Create unique temp dir to avoid conflicts
+				home, err := os.MkdirTemp("", "test_home_default_*")
+				if err != nil {
+					panic(err)
+				}
+				// Set HOME BEFORE creating the config dir structure
+				oldHome := os.Getenv("HOME")
+				os.Setenv("HOME", home)
+
 				os.MkdirAll(filepath.Join(home, ".net"), 0755)
 				configPath := filepath.Join(home, ".net", "config.yaml")
 				configContent := `common:
@@ -57,8 +65,6 @@ testnet:
   ssid: test
 `
 				os.WriteFile(configPath, []byte(configContent), 0644)
-				oldHome := os.Getenv("HOME")
-				os.Setenv("HOME", home)
 				return func() {
 					os.Setenv("HOME", oldHome)
 					os.RemoveAll(home)
@@ -73,15 +79,20 @@ testnet:
 			name: "tilde expansion",
 			path: "~/test_config.yaml",
 			setup: func() (cleanup func()) {
-				home := "/tmp/test_home"
-				os.MkdirAll(home, 0755)
+				// Create unique temp dir to avoid conflicts
+				home, err := os.MkdirTemp("", "test_home_tilde_*")
+				if err != nil {
+					panic(err)
+				}
+				// Set HOME BEFORE creating the config file
+				oldHome := os.Getenv("HOME")
+				os.Setenv("HOME", home)
+
 				configPath := filepath.Join(home, "test_config.yaml")
 				configContent := `tilde_net:
   ssid: tilde
 `
 				os.WriteFile(configPath, []byte(configContent), 0644)
-				oldHome := os.Getenv("HOME")
-				os.Setenv("HOME", home)
 				return func() {
 					os.Setenv("HOME", oldHome)
 					os.RemoveAll(home)
@@ -136,7 +147,17 @@ testnet:
 
 func TestLoadConfig_NetworkLoading(t *testing.T) {
 	// Test that networks are loaded during config load
-	home := "/tmp/test_home_netload"
+	// Create unique temp dir to avoid conflicts
+	home, err := os.MkdirTemp("", "test_home_netload_*")
+	require.NoError(t, err)
+	// Set HOME BEFORE creating the config dir structure
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.RemoveAll(home)
+	}()
+
 	os.MkdirAll(filepath.Join(home, ".net"), 0755)
 	configPath := filepath.Join(home, ".net", "config.yaml")
 	configContent := `common:
@@ -148,13 +169,8 @@ testnet2:
   ssid: test2
   psk: password123
 `
-	os.WriteFile(configPath, []byte(configContent), 0644)
-	oldHome := os.Getenv("HOME")
-	os.Setenv("HOME", home)
-	defer func() {
-		os.Setenv("HOME", oldHome)
-		os.RemoveAll(home)
-	}()
+	err = os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
 
 	manager := NewManager(&mockLogger{})
 	config, err := manager.LoadConfig("")
@@ -176,15 +192,10 @@ func TestGetNetworkConfig(t *testing.T) {
 	hostname, _ := os.Hostname()
 
 	// Create a temp config file to test with
-	home := "/tmp/test_home_get_network"
-	os.MkdirAll(filepath.Join(home, ".net"), 0755)
-	configPath := filepath.Join(home, ".net", "config.yaml")
-	configContent := fmt.Sprintf(`testnet:
-  ssid: test
-%s:
-  ssid: host
-`, hostname)
-	os.WriteFile(configPath, []byte(configContent), 0644)
+	// Create unique temp dir to avoid conflicts
+	home, err := os.MkdirTemp("", "test_home_get_network_*")
+	require.NoError(t, err)
+	// Set HOME BEFORE creating the config dir structure
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", home)
 	defer func() {
@@ -192,8 +203,18 @@ func TestGetNetworkConfig(t *testing.T) {
 		os.RemoveAll(home)
 	}()
 
+	os.MkdirAll(filepath.Join(home, ".net"), 0755)
+	configPath := filepath.Join(home, ".net", "config.yaml")
+	configContent := fmt.Sprintf(`testnet:
+  ssid: test
+%s:
+  ssid: host
+`, hostname)
+	err = os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
+
 	manager := NewManager(&mockLogger{})
-	_, err := manager.LoadConfig("")
+	_, err = manager.LoadConfig("")
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -549,7 +570,17 @@ home-network:
 
 func TestLoadConfig_WithValidationErrors(t *testing.T) {
 	// Create a config with typos
-	home := "/tmp/test_home_validation"
+	// Create unique temp dir to avoid conflicts
+	home, err := os.MkdirTemp("", "test_home_validation_*")
+	require.NoError(t, err)
+	// Set HOME BEFORE creating the config dir structure
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.RemoveAll(home)
+	}()
+
 	os.MkdirAll(filepath.Join(home, ".net"), 0755)
 	configPath := filepath.Join(home, ".net", "config.yaml")
 	configContent := `common:
@@ -558,16 +589,11 @@ func TestLoadConfig_WithValidationErrors(t *testing.T) {
 testnet:
   ssd: test
 `
-	os.WriteFile(configPath, []byte(configContent), 0644)
-	oldHome := os.Getenv("HOME")
-	os.Setenv("HOME", home)
-	defer func() {
-		os.Setenv("HOME", oldHome)
-		os.RemoveAll(home)
-	}()
+	err = os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
 
 	manager := NewManager(&mockLogger{})
-	_, err := manager.LoadConfig("")
+	_, err = manager.LoadConfig("")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dhs")
