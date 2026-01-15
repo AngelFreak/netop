@@ -168,9 +168,10 @@ func TestVPNManagerConnect_Integration(t *testing.T) {
 	err = manager.Disconnect("test-vpn")
 	require.NoError(t, err)
 
-	// Verify interface was removed
-	output, _ = exec.Command("ip", "link", "show", "wg-mgr-test").CombinedOutput()
-	assert.NotContains(t, string(output), "wg-mgr-test")
+	// Verify interface was removed (command should fail or show "does not exist")
+	output, err = exec.Command("ip", "link", "show", "wg-mgr-test").CombinedOutput()
+	assert.Error(t, err, "ip link show should fail for removed interface")
+	assert.Contains(t, string(output), "does not exist")
 
 	// Verify state file was removed
 	_, err = os.Stat(stateFile)
