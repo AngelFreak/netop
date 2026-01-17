@@ -308,11 +308,9 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 		var home string
 		var err error
 
-		// First check if HOME is explicitly set (for testing and explicit overrides)
-		if envHome := os.Getenv("HOME"); envHome != "" {
-			home = envHome
-		} else if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-			// Handle sudo execution: use SUDO_USER's home directory instead of root
+		// Handle sudo execution: use SUDO_USER's home directory instead of root
+		// This must come BEFORE checking HOME, because sudo sets HOME=/root
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
 			if m.logger != nil {
 				m.logger.Debug("Running with sudo", "sudoUser", sudoUser)
 			}
@@ -322,8 +320,11 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 			} else {
 				home = filepath.Join("/home", sudoUser)
 			}
+		} else if envHome := os.Getenv("HOME"); envHome != "" {
+			// Use HOME if not running with sudo (for testing and normal execution)
+			home = envHome
 		} else {
-			// Normal execution
+			// Fallback to os.UserHomeDir()
 			home, err = os.UserHomeDir()
 			if err != nil {
 				return nil, fmt.Errorf("failed to get home directory: %w", err)
