@@ -35,6 +35,18 @@ var (
 	dhcpMgr     types.DHCPManager
 )
 
+// commandNeedsRoot returns false for commands that can run without root privileges
+func commandNeedsRoot() bool {
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "--help" || arg == "help" ||
+			arg == "completion" || arg == "--version" || arg == "-v" ||
+			arg == "status" || arg == "show" || arg == "list" {
+			return false
+		}
+	}
+	return true
+}
+
 // ensureRoot re-executes the program with sudo if not running as root.
 func ensureRoot() {
 	if os.Geteuid() == 0 {
@@ -42,12 +54,8 @@ func ensureRoot() {
 	}
 
 	// Skip sudo for commands that don't need root
-	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" || arg == "help" ||
-			arg == "completion" || arg == "--version" || arg == "-v" ||
-			arg == "status" || arg == "show" || arg == "list" {
-			return
-		}
+	if !commandNeedsRoot() {
+		return
 	}
 
 	// Get the executable path
@@ -79,17 +87,19 @@ func main() {
 	// Ensure we're running as root for network operations
 	ensureRoot()
 
-	// Ensure runtime directory exists with secure permissions
-	if err := os.MkdirAll(types.RuntimeDir, 0700); err != nil {
-		// This should not happen if ensureRoot() worked correctly
-		fmt.Fprintf(os.Stderr, "Error: failed to create runtime directory %s: %v\n", types.RuntimeDir, err)
-		if os.Geteuid() != 0 {
-			fmt.Fprintf(os.Stderr, "Error: not running as root (euid=%d). The auto-sudo mechanism failed.\n", os.Geteuid())
-			fmt.Fprintf(os.Stderr, "Hint: run with sudo, or configure passwordless sudo for this binary\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "Hint: check filesystem permissions and SELinux/AppArmor policies for %s\n", types.RuntimeDir)
+	// Ensure runtime directory exists with secure permissions (only for commands that need root)
+	if commandNeedsRoot() {
+		if err := os.MkdirAll(types.RuntimeDir, 0700); err != nil {
+			// This should not happen if ensureRoot() worked correctly
+			fmt.Fprintf(os.Stderr, "Error: failed to create runtime directory %s: %v\n", types.RuntimeDir, err)
+			if os.Geteuid() != 0 {
+				fmt.Fprintf(os.Stderr, "Error: not running as root (euid=%d). The auto-sudo mechanism failed.\n", os.Geteuid())
+				fmt.Fprintf(os.Stderr, "Hint: run with sudo, or configure passwordless sudo for this binary\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "Hint: check filesystem permissions and SELinux/AppArmor policies for %s\n", types.RuntimeDir)
+			}
+			os.Exit(1)
 		}
-		os.Exit(1)
 	}
 
 	var rootCmd = &cobra.Command{
