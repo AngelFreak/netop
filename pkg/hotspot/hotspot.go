@@ -352,13 +352,27 @@ func isValidChannel(channel int) bool {
 	return false
 }
 
+// escapeHostapdString escapes special characters for hostapd config values
+// This prevents injection attacks via specially crafted SSIDs/passwords
+func escapeHostapdString(s string) string {
+	// Escape backslashes first (must be done before escaping other characters)
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	// Escape newlines to prevent config injection
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	return s
+}
+
 // generateHostapdConfig generates hostapd configuration file
 func (h *hotspotManagerImpl) generateHostapdConfig(config *types.HotspotConfig) error {
 	var sb strings.Builder
 
+	// Escape SSID and password to prevent injection
+	escapedSSID := escapeHostapdString(config.SSID)
+
 	sb.WriteString(fmt.Sprintf("interface=%s\n", config.Interface))
 	sb.WriteString("driver=nl80211\n")
-	sb.WriteString(fmt.Sprintf("ssid=%s\n", config.SSID))
+	sb.WriteString(fmt.Sprintf("ssid=%s\n", escapedSSID))
 
 	// Set hw_mode based on channel (g for 2.4GHz, a for 5GHz)
 	if config.Channel >= 36 {
@@ -372,9 +386,10 @@ func (h *hotspotManagerImpl) generateHostapdConfig(config *types.HotspotConfig) 
 	sb.WriteString("ignore_broadcast_ssid=0\n")
 
 	if config.Password != "" {
+		escapedPassword := escapeHostapdString(config.Password)
 		sb.WriteString("auth_algs=1\n")
 		sb.WriteString("wpa=2\n")
-		sb.WriteString(fmt.Sprintf("wpa_passphrase=%s\n", config.Password))
+		sb.WriteString(fmt.Sprintf("wpa_passphrase=%s\n", escapedPassword))
 		sb.WriteString("wpa_key_mgmt=WPA-PSK\n")
 		sb.WriteString("rsn_pairwise=CCMP\n")
 	}

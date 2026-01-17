@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -421,6 +422,41 @@ func TestGenerateWPAConfig(t *testing.T) {
 		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="Evil\"Network"`)
 		assert.Contains(t, config, `key_mgmt=NONE`)
+	})
+
+	t.Run("escapes newlines in SSID to prevent injection", func(t *testing.T) {
+		// Test SSID with newline that could inject additional config
+		config := manager.generateWPAConfig("Evil\nnetwork={\nssid=\"injected\"", "password", "")
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant")
+		// Newlines should be escaped as literal \n (backslash followed by 'n'), not actual newlines
+		assert.Contains(t, config, `ssid="Evil\nnetwork={\nssid=\"injected\""`)
+		// The config should only have actual newlines in expected places (after header, inside network block structure)
+		// NOT from the injected SSID - verify by checking that the SSID value doesn't create separate lines
+		lines := strings.Split(config, "\n")
+		var ssidLine string
+		for _, line := range lines {
+			if strings.Contains(line, "ssid=") {
+				ssidLine = line
+				break
+			}
+		}
+		// The entire SSID with escaped newlines should be on a single line
+		assert.Contains(t, ssidLine, `Evil\nnetwork=`)
+	})
+
+	t.Run("escapes newlines in password to prevent injection", func(t *testing.T) {
+		// Test password with newline that could inject additional config
+		config := manager.generateWPAConfig("TestSSID", "pass\nnetwork={\nssid=\"injected\"", "")
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant")
+		assert.Contains(t, config, `ssid="TestSSID"`)
+		// Newlines should be escaped as literal \n
+		assert.Contains(t, config, `psk="pass\nnetwork={\nssid=\"injected\""`)
+	})
+
+	t.Run("escapes carriage returns in SSID", func(t *testing.T) {
+		// Test SSID with carriage return
+		config := manager.generateWPAConfig("Evil\rNetwork", "password", "")
+		assert.Contains(t, config, `ssid="Evil\rNetwork"`)
 	})
 }
 

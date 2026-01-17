@@ -589,3 +589,93 @@ func TestParseDnsmasqLease_Invalid(t *testing.T) {
 	_, _, _, _, err := ParseDnsmasqLease(lease)
 	assert.Error(t, err)
 }
+
+func TestEscapeHostapdString(t *testing.T) {
+	t.Run("escapes backslashes", func(t *testing.T) {
+		result := escapeHostapdString(`test\path`)
+		assert.Equal(t, `test\\path`, result)
+	})
+
+	t.Run("escapes newlines", func(t *testing.T) {
+		result := escapeHostapdString("test\nvalue")
+		assert.Equal(t, `test\nvalue`, result)
+	})
+
+	t.Run("escapes carriage returns", func(t *testing.T) {
+		result := escapeHostapdString("test\rvalue")
+		assert.Equal(t, `test\rvalue`, result)
+	})
+
+	t.Run("escapes combined special characters", func(t *testing.T) {
+		result := escapeHostapdString("test\\\n\rvalue")
+		assert.Equal(t, `test\\\n\rvalue`, result)
+	})
+
+	t.Run("leaves normal strings unchanged", func(t *testing.T) {
+		result := escapeHostapdString("normal-ssid-123")
+		assert.Equal(t, "normal-ssid-123", result)
+	})
+}
+
+func TestGenerateHostapdConfig_EscapesSpecialCharacters(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	t.Run("escapes newlines in SSID to prevent injection", func(t *testing.T) {
+		config := &types.HotspotConfig{
+			Interface: "wlan0",
+			SSID:      "Evil\nwpa=0",
+			Password:  "testpass123",
+			Channel:   6,
+		}
+
+		err := mgr.generateHostapdConfig(config)
+		assert.NoError(t, err)
+
+		data, err := os.ReadFile(mgr.hostapdConfFile)
+		assert.NoError(t, err)
+
+		content := string(data)
+		// The newline should be escaped, not creating a new line
+		assert.Contains(t, content, `ssid=Evil\nwpa=0`)
+		// Should NOT have wpa=0 as a separate config line from injection
+		assert.NotContains(t, content, "\nwpa=0\n")
+	})
+
+	t.Run("escapes newlines in password to prevent injection", func(t *testing.T) {
+		config := &types.HotspotConfig{
+			Interface: "wlan0",
+			SSID:      "TestAP",
+			Password:  "pass123\nwpa=0",
+			Channel:   6,
+		}
+
+		err := mgr.generateHostapdConfig(config)
+		assert.NoError(t, err)
+
+		data, err := os.ReadFile(mgr.hostapdConfFile)
+		assert.NoError(t, err)
+
+		content := string(data)
+		// The newline should be escaped in the password
+		assert.Contains(t, content, `wpa_passphrase=pass123\nwpa=0`)
+	})
+
+	t.Run("escapes backslashes in SSID", func(t *testing.T) {
+		config := &types.HotspotConfig{
+			Interface: "wlan0",
+			SSID:      `Test\AP`,
+			Password:  "testpass123",
+			Channel:   6,
+		}
+
+		err := mgr.generateHostapdConfig(config)
+		assert.NoError(t, err)
+
+		data, err := os.ReadFile(mgr.hostapdConfFile)
+		assert.NoError(t, err)
+
+		content := string(data)
+		assert.Contains(t, content, `ssid=Test\\AP`)
+	})
+}
