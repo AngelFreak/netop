@@ -10,12 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 	"golang.org/x/crypto/curve25519"
 )
-
-// activeVPNFile is the path to the file tracking the currently active VPN
-const activeVPNFile = types.RuntimeDir + "/active-vpn"
 
 // curve25519Basepoint is the standard basepoint for X25519 key derivation
 var curve25519Basepoint = [32]byte{9}
@@ -26,15 +24,22 @@ type Manager struct {
 	logger        types.Logger
 	configMgr     types.ConfigManager
 	endpointRoute string     // Stores the VPN endpoint IP for cleanup on disconnect
+	runtimeDir    string     // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 }
 
-// NewManager creates a new VPN manager
+// NewManager creates a new VPN manager with the default runtime directory
 func NewManager(executor types.SystemExecutor, logger types.Logger, configMgr types.ConfigManager) *Manager {
+	return NewManagerWithDir(executor, logger, configMgr, types.RuntimeDir)
+}
+
+// NewManagerWithDir creates a new VPN manager with a custom runtime directory
+func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, configMgr types.ConfigManager, runtimeDir string) *Manager {
 	return &Manager{
-		executor:  executor,
-		logger:    logger,
-		configMgr: configMgr,
+		executor:   executor,
+		logger:     logger,
+		configMgr:  configMgr,
+		runtimeDir: runtimeDir,
 	}
 }
 
@@ -207,23 +212,7 @@ func (m *Manager) restoreDefaultRoute() {
 
 // killProcess kills processes matching a pattern, with SIGKILL fallback if graceful shutdown fails
 func (m *Manager) killProcess(pattern string) {
-	// First try graceful shutdown (SIGTERM) with 1s timeout
-	_, err := m.executor.ExecuteWithTimeout(1*time.Second, "pkill", "-f", pattern)
-	if err != nil {
-		m.logger.Debug("No process to kill or pkill failed", "pattern", pattern)
-		return
-	}
-
-	// Wait briefly for graceful shutdown
-	time.Sleep(200 * time.Millisecond)
-
-	// Check if process is still running, if so force kill with SIGKILL
-	_, err = m.executor.ExecuteWithTimeout(1*time.Second, "pgrep", "-f", pattern)
-	if err == nil {
-		// Process still running, force kill
-		m.logger.Debug("Process still running, sending SIGKILL", "pattern", pattern)
-		_, _ = m.executor.ExecuteWithTimeout(1*time.Second, "pkill", "-9", "-f", pattern)
-	}
+	system.KillProcessGraceful(m.executor, m.logger, pattern)
 }
 
 // ListVPNs lists available VPNs and their status
@@ -233,7 +222,7 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	// Read the active VPN name from state file (authoritative source)
 	// Lock and read file directly to ensure consistent read with Connect/Disconnect
 	m.mu.Lock()
-	data, err := os.ReadFile(activeVPNFile)
+	data, err := os.ReadFile(m.activeVPNFilePath())
 	activeVPN := ""
 	if err == nil {
 		activeVPN = strings.TrimSpace(string(data))
@@ -526,14 +515,17 @@ func (m *Manager) getCurrentGateway() (gateway, iface string) {
 // Uses install command to atomically create file with correct permissions
 // avoiding TOCTOU race where file exists briefly with wrong permissions
 func (m *Manager) writeFile(path, content string) error {
-	// Use install -m 0600 /dev/stdin to atomically create file with correct permissions
-	// This avoids the TOCTOU race of write-then-chmod
-	_, err := m.executor.ExecuteWithInput("install", content, "-m", "0600", "/dev/stdin", path)
-	return err
+	return system.WriteSecureFile(m.executor, path, content)
+}
+
+// activeVPNFilePath returns the path to the active VPN state file
+func (m *Manager) activeVPNFilePath() string {
+	return filepath.Join(m.runtimeDir, "active-vpn")
 }
 
 // setActiveVPN records the currently active VPN name to the state file
 func (m *Manager) setActiveVPN(name string) error {
+	activeVPNFile := m.activeVPNFilePath()
 	// Ensure runtime directory exists
 	if err := os.MkdirAll(filepath.Dir(activeVPNFile), 0755); err != nil {
 		m.logger.Debug("Failed to create runtime directory", "error", err)
@@ -546,16 +538,15 @@ func (m *Manager) setActiveVPN(name string) error {
 
 // clearActiveVPN removes the active VPN state file
 func (m *Manager) clearActiveVPN() {
+	activeVPNFile := m.activeVPNFilePath()
 	if err := os.Remove(activeVPNFile); err != nil && !os.IsNotExist(err) {
 		m.logger.Debug("Failed to remove active VPN file", "error", err)
 	}
 }
 
-// getActiveVPN reads the currently active VPN name from the state file.
-// Note: Production code in ListVPNs() inlines this read within a mutex lock.
-// This helper is kept for testing purposes.
-func getActiveVPN() string {
-	data, err := os.ReadFile(activeVPNFile)
+// getActiveVPN reads the currently active VPN name from the state file
+func (m *Manager) getActiveVPN() string {
+	data, err := os.ReadFile(m.activeVPNFilePath())
 	if err != nil {
 		return ""
 	}

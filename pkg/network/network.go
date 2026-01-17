@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 )
 
@@ -28,12 +29,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 
 // killProcess kills processes matching a pattern with SIGKILL (fast, no graceful shutdown)
 func (m *Manager) killProcess(pattern string) {
-	// For network daemons, just force kill - graceful shutdown isn't critical
-	// This saves ~200-500ms compared to SIGTERM + wait + check + SIGKILL
-	_, err := m.executor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-9", "-f", pattern)
-	if err != nil {
-		m.logger.Debug("No process to kill or pkill failed", "pattern", pattern)
-	}
+	system.KillProcessFast(m.executor, m.logger, pattern)
 }
 
 // SetDNS configures DNS servers
@@ -487,20 +483,7 @@ func (m *Manager) waitForCarrier(iface string, timeout time.Duration) bool {
 }
 
 func (m *Manager) parseIPAddress(output string) net.IP {
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "inet ") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				ip, _, err := net.ParseCIDR(parts[1])
-				if err == nil {
-					return ip
-				}
-			}
-		}
-	}
-	return nil
+	return system.ParseIPFromOutput(output)
 }
 
 // ConnectToConfiguredNetwork connects to a network based on the provided configuration
@@ -676,17 +659,7 @@ func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 
 // parseGateway extracts the default gateway from ip route output
 func (m *Manager) parseGateway(output string) net.IP {
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "default via ") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				return net.ParseIP(parts[2])
-			}
-		}
-	}
-	return nil
+	return system.ParseGatewayFromOutput(output)
 }
 
 // getDNSServers reads DNS servers from /etc/resolv.conf
@@ -695,17 +668,5 @@ func (m *Manager) getDNSServers() ([]net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var dns []net.IP
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "nameserver ") {
-			ipStr := strings.TrimPrefix(line, "nameserver ")
-			if ip := net.ParseIP(ipStr); ip != nil {
-				dns = append(dns, ip)
-			}
-		}
-	}
-	return dns, nil
+	return system.ParseDNSFromResolvConf(output), nil
 }
