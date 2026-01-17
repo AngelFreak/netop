@@ -376,18 +376,24 @@ func TestGenerateWPAConfig(t *testing.T) {
 
 	t.Run("with password", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "")
+		// ctrl_interface is REQUIRED for wpa_cli to communicate with wpa_supplicant
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="password"`)
 	})
 
 	t.Run("open network", func(t *testing.T) {
 		config := manager.generateWPAConfig("OpenSSID", "", "")
+		// ctrl_interface is REQUIRED for wpa_cli to communicate with wpa_supplicant
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="OpenSSID"`)
 		assert.Contains(t, config, `key_mgmt=NONE`)
 	})
 
 	t.Run("with BSSID pinning", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "00:11:22:33:44:55")
+		// ctrl_interface is REQUIRED for wpa_cli to communicate with wpa_supplicant
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="password"`)
 		assert.Contains(t, config, `bssid=00:11:22:33:44:55`)
@@ -396,6 +402,7 @@ func TestGenerateWPAConfig(t *testing.T) {
 	t.Run("escapes special characters in SSID", func(t *testing.T) {
 		// Test SSID with quotes and backslashes
 		config := manager.generateWPAConfig(`Test"SSID\with\special`, "password", "")
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="Test\"SSID\\with\\special"`)
 		assert.Contains(t, config, `psk="password"`)
 	})
@@ -403,6 +410,7 @@ func TestGenerateWPAConfig(t *testing.T) {
 	t.Run("escapes special characters in password", func(t *testing.T) {
 		// Test password with quotes and backslashes
 		config := manager.generateWPAConfig("TestSSID", `pass"word\with\quotes`, "")
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="pass\"word\\with\\quotes"`)
 	})
@@ -410,6 +418,7 @@ func TestGenerateWPAConfig(t *testing.T) {
 	t.Run("escapes special characters in open network", func(t *testing.T) {
 		// Test open network with special characters in SSID
 		config := manager.generateWPAConfig(`Evil"Network`, "", "")
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="Evil\"Network"`)
 		assert.Contains(t, config, `key_mgmt=NONE`)
 	})
