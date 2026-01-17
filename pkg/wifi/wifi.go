@@ -382,9 +382,12 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 	// Escape SSID and password to prevent injection
 	escapedSSID := escapeWPAString(ssid)
 
+	// ctrl_interface is required for wpa_cli communication
+	header := "ctrl_interface=/run/wpa_supplicant\n\n"
+
 	if password == "" {
 		// Open network
-		config := fmt.Sprintf(`network={
+		config := header + fmt.Sprintf(`network={
 	ssid="%s"
 	key_mgmt=NONE`, escapedSSID)
 		if bssid != "" {
@@ -396,7 +399,7 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 
 	// WPA2 network
 	escapedPassword := escapeWPAString(password)
-	config := fmt.Sprintf(`network={
+	config := header + fmt.Sprintf(`network={
 	ssid="%s"
 	psk="%s"`, escapedSSID, escapedPassword)
 	if bssid != "" {
