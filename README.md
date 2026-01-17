@@ -418,6 +418,47 @@ ignored:
 
 </details>
 
+<details>
+<summary><b>Security Considerations</b></summary>
+
+**Plain Text Credentials Warning**
+
+When loading configuration, `net` will warn if it detects plain text credentials:
+- WiFi passwords stored in `psk` fields
+- VPN private keys embedded in inline `config` blocks
+
+**Recommended Security Practices:**
+
+1. **Restrict config file permissions:**
+   ```bash
+   chmod 600 ~/.net/config.yaml
+   ```
+
+2. **Use separate key files for VPNs** instead of inline configs:
+   ```yaml
+   vpn:
+     myvpn:
+       type: wireguard
+       config: /path/to/wg0.conf  # Reference file instead of inline
+   ```
+
+3. **Store VPN key files with restricted permissions:**
+   ```bash
+   chmod 600 /etc/wireguard/wg0.conf
+   ```
+
+4. **For OpenVPN**, use separate key/cert files:
+   ```yaml
+   vpn:
+     work:
+       type: openvpn
+       config: /etc/openvpn/client/work.ovpn
+   ```
+
+**Why this matters:** Config files may be backed up, synced, or accidentally committed to version control. Storing credentials in plain text increases the risk of exposure.
+
+</details>
+
 [↑ Back to Top](#-net)
 
 ---

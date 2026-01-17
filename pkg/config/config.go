@@ -430,6 +430,9 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 		}
 	}
 
+	// Warn about plain text credentials after successful load
+	m.WarnAboutPlainTextCredentials()
+
 	return &config, nil
 }
 
@@ -550,4 +553,62 @@ func (m *Manager) GetIgnoredInterfaces() []string {
 // GetConfig returns the loaded configuration
 func (m *Manager) GetConfig() *types.Config {
 	return m.config
+}
+
+// WarnAboutPlainTextCredentials checks the loaded config for plain text
+// credentials and logs warnings about security implications.
+//
+// Security note: Storing passwords and private keys in plain text config files
+// poses security risks. Consider:
+//   - Using file permissions (chmod 600) to restrict access to config files
+//   - Storing sensitive credentials in separate files referenced by path
+//   - Using environment variables for sensitive values
+//   - For VPNs, use separate key files rather than inline config
+func (m *Manager) WarnAboutPlainTextCredentials() {
+	if m.config == nil || m.logger == nil {
+		return
+	}
+
+	// Check for plain text WiFi passwords (PSK fields)
+	for name, network := range m.config.Networks {
+		if network.PSK != "" {
+			m.logger.Warn("WiFi password for network is stored in plain text",
+				"network", name,
+				"suggestion", "Consider using file permissions (chmod 600) to protect your config file")
+		}
+	}
+
+	// Check for plain text VPN private keys in inline config
+	for name, vpn := range m.config.VPN {
+		if containsPrivateKey(vpn.Config) {
+			m.logger.Warn("VPN contains private key in plain text config",
+				"vpn", name,
+				"suggestion", "Consider storing keys in separate files with restricted permissions")
+		}
+	}
+}
+
+// containsPrivateKey checks if a VPN config string contains inline private keys
+func containsPrivateKey(config string) bool {
+	if config == "" {
+		return false
+	}
+
+	// Check for common private key indicators in WireGuard and OpenVPN configs
+	privateKeyIndicators := []string{
+		"PrivateKey",     // WireGuard
+		"<key>",          // OpenVPN inline key
+		"-----BEGIN",     // PEM format keys (OpenVPN)
+		"BEGIN PRIVATE",  // Various private key formats
+		"BEGIN RSA PRIV", // RSA private key
+		"BEGIN EC PRIV",  // EC private key
+	}
+
+	for _, indicator := range privateKeyIndicators {
+		if strings.Contains(config, indicator) {
+			return true
+		}
+	}
+
+	return false
 }
