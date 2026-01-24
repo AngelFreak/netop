@@ -147,6 +147,58 @@ func TestKillProcessGraceful(t *testing.T) {
 	})
 }
 
+// Tests for KillProcessByPID
+
+func TestKillProcessByPID(t *testing.T) {
+	t.Run("PID file not found returns nil", func(t *testing.T) {
+		executor := newTestExecutor()
+		executor.mockResponses["cat"] = mockResponse{err: assert.AnError}
+		logger := &testLogger{}
+
+		err := KillProcessByPID(executor, logger, "/run/net/nonexistent.pid")
+
+		assert.NoError(t, err)
+		assert.Len(t, logger.debugMsgs, 1)
+		assert.Contains(t, logger.debugMsgs[0], "PID file not found")
+	})
+
+	t.Run("empty PID file returns nil", func(t *testing.T) {
+		executor := newTestExecutor()
+		executor.mockResponses["cat"] = mockResponse{output: "  \n"}
+		logger := &testLogger{}
+
+		err := KillProcessByPID(executor, logger, "/run/net/empty.pid")
+
+		assert.NoError(t, err)
+		assert.Len(t, logger.debugMsgs, 1)
+		assert.Contains(t, logger.debugMsgs[0], "PID file is empty")
+	})
+
+	t.Run("successfully kills process and cleans up PID file", func(t *testing.T) {
+		executor := newTestExecutor()
+		executor.mockResponses["cat"] = mockResponse{output: "12345"}
+		executor.mockResponses["kill"] = mockResponse{} // kill -0 (still running check) returns success
+		logger := &testLogger{}
+
+		err := KillProcessByPID(executor, logger, "/run/net/test.pid")
+
+		assert.NoError(t, err)
+		// Should have: cat, kill, kill -0, kill -9, rm
+		assert.GreaterOrEqual(t, len(executor.executedCommands), 3)
+	})
+
+	t.Run("process already dead returns nil", func(t *testing.T) {
+		executor := newTestExecutor()
+		executor.mockResponses["cat"] = mockResponse{output: "12345"}
+		executor.mockResponses["kill"] = mockResponse{err: assert.AnError} // Process already dead
+		logger := &testLogger{}
+
+		err := KillProcessByPID(executor, logger, "/run/net/dead.pid")
+
+		assert.NoError(t, err)
+	})
+}
+
 // Tests for WriteSecureFile
 
 func TestWriteSecureFile(t *testing.T) {

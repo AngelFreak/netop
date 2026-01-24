@@ -172,18 +172,20 @@ func TestConnect(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			executor := &mockSystemExecutor{
 				commands: map[string]string{
+					// Common - getting current gateway for state file
+					"ip route show default": "default via 192.168.1.1 dev eth0",
 					// OpenVPN commands
-					"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
-					"openvpn --config /run/net/openvpn.conf --daemon":  "",
-					"ip link show tun0":                                  "", // tunnel verification
+					"install -m 0600 /dev/stdin /run/net/openvpn.conf":                              "",
+					"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
+					"ip link show tun0": "", // tunnel verification
 					// WireGuard commands
 					"install -m 0600 /dev/stdin /run/net/wg.conf": "",
 					"rm -f /run/net/wg.conf":                      "",
-					"ip link add dev wg0 type wireguard":            "",
+					"ip link add dev wg0 type wireguard":          "",
 					"wg setconf wg0 /run/net/wg.conf":             "",
-					"ip addr replace 10.0.0.1/24 dev wg0":        "",
-					"ip link set wg0 up":                     "",
-					"ip route replace default dev wg0":       "",
+					"ip addr replace 10.0.0.1/24 dev wg0":         "",
+					"ip link set wg0 up":                          "",
+					"ip route replace default dev wg0":            "",
 				},
 			}
 			logger := &mockLogger{}
@@ -381,9 +383,9 @@ func TestGenerateWireGuardKey(t *testing.T) {
 func TestConnectOpenVPN(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
-			"openvpn --config /run/net/openvpn.conf --daemon": "",
-			"ip link show tun0":                               "", // tunnel verification
+			"install -m 0600 /dev/stdin /run/net/openvpn.conf":                              "",
+			"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
+			"ip link show tun0": "", // tunnel verification
 		},
 	}
 	logger := &mockLogger{}
@@ -489,8 +491,8 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 	t.Run("write file error", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"openvpn --config /run/net/openvpn.conf --daemon": "",
-				"ip link show tun0":                               "",
+				"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
+				"ip link show tun0": "",
 			},
 			errors: map[string]error{},
 		}
@@ -511,9 +513,11 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 			commands: map[string]string{
 				"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
 				"rm -f /run/net/openvpn.conf":                      "", // cleanup should happen
+				// KillProcessByPID will try to read PID file - mock it failing (file doesn't exist)
 			},
 			errors: map[string]error{
-				"openvpn --config /run/net/openvpn.conf --daemon": assert.AnError,
+				"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": assert.AnError,
+				"cat /run/net/openvpn.pid": assert.AnError, // PID file doesn't exist
 			},
 		}
 		logger := &mockLogger{}
@@ -533,9 +537,14 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 	t.Run("tunnel verification timeout cleans up temp file", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/net/openvpn.conf": "",
-				"openvpn --config /run/net/openvpn.conf --daemon":  "",
-				"rm -f /run/net/openvpn.conf":                      "", // cleanup should happen
+				"install -m 0600 /dev/stdin /run/net/openvpn.conf":                              "",
+				"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
+				"rm -f /run/net/openvpn.conf": "",                      // cleanup should happen
+				"cat /run/net/openvpn.pid":    "12345",                 // PID file exists
+				"kill 12345":                  "",                      // graceful kill
+				"kill -0 12345":               "",                      // check if running
+				"kill -9 12345":               "",                      // force kill
+				"rm -f /run/net/openvpn.pid":  "",                      // PID file cleanup
 			},
 			errors: map[string]error{
 				"ip link show tun0": assert.AnError, // tun0 never appears
@@ -905,6 +914,9 @@ func TestConnect_SetsActiveVPNStateFile(t *testing.T) {
 
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
+			// Getting current gateway for state file - getCurrentGateway first tries "ip route show default"
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			// WireGuard commands
 			"install -m 0600 /dev/stdin " + tempDir + "/wg.conf": "",
 			"ip link add dev wg0 type wireguard":                 "",
 			"wg setconf wg0 " + tempDir + "/wg.conf":             "",
@@ -930,9 +942,151 @@ func TestConnect_SetsActiveVPNStateFile(t *testing.T) {
 	err := manager.Connect("test-vpn")
 	assert.NoError(t, err)
 
-	// Verify state file was written
-	result := manager.getActiveVPN()
-	assert.Equal(t, "test-vpn", result)
+	// Verify state file was written with enhanced format
+	state := manager.getActiveVPNState()
+	assert.NotNil(t, state)
+	assert.Equal(t, "test-vpn", state.Name)
+	assert.Equal(t, "wg0", state.Interface)
+	assert.Equal(t, "wireguard", state.Type)
+	assert.Equal(t, "192.168.1.1", state.OriginalGateway)
+	assert.Equal(t, "eth0", state.OriginalInterface)
+}
+
+func TestExtractEndpoint(t *testing.T) {
+	manager := &Manager{}
+
+	tests := []struct {
+		name     string
+		config   string
+		expected string
+	}{
+		{
+			name:     "IPv4 with port",
+			config:   "Endpoint = 1.2.3.4:51820",
+			expected: "1.2.3.4",
+		},
+		{
+			name:     "IPv6 with port (bracketed)",
+			config:   "Endpoint = [2001:db8::1]:51820",
+			expected: "2001:db8::1",
+		},
+		{
+			name:     "IPv6 without port (bracketed)",
+			config:   "Endpoint = [2001:db8::1]",
+			expected: "2001:db8::1",
+		},
+		{
+			name:     "hostname with port",
+			config:   "Endpoint = vpn.example.com:51820",
+			expected: "vpn.example.com",
+		},
+		{
+			name:     "hostname without port",
+			config:   "Endpoint = vpn.example.com",
+			expected: "vpn.example.com",
+		},
+		{
+			name:     "lowercase endpoint",
+			config:   "endpoint = 10.0.0.1:51820",
+			expected: "10.0.0.1",
+		},
+		{
+			name:     "endpoint in multiline config",
+			config:   "[Peer]\nPublicKey = abc\nEndpoint = 192.168.1.1:51820\nAllowedIPs = 0.0.0.0/0",
+			expected: "192.168.1.1",
+		},
+		{
+			name:     "no endpoint",
+			config:   "[Interface]\nPrivateKey = abc",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := manager.extractEndpoint(tt.config)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestDisconnectTracked(t *testing.T) {
+	t.Run("openvpn uses PID file", func(t *testing.T) {
+		tempDir := t.TempDir()
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"cat " + tempDir + "/openvpn.pid": "12345",
+				"kill 12345":                      "",
+				"kill -0 12345":                   "",
+				"kill -9 12345":                   "",
+				"rm -f " + tempDir + "/openvpn.pid": "",
+				"ip link set tun0 down":          "",
+			},
+			errors: map[string]error{
+				"kill -0 12345": assert.AnError, // Process already dead
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, runtimeDir: tempDir}
+
+		state := &vpnState{
+			Type:      "openvpn",
+			Interface: "tun0",
+		}
+		manager.disconnectTracked(state)
+
+		executor.assertCommandExecuted(t, "cat "+tempDir+"/openvpn.pid")
+		executor.assertCommandExecuted(t, "kill 12345")
+	})
+
+	t.Run("wireguard deletes only tracked interface", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip link delete wg-mynet": "",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger}
+
+		state := &vpnState{
+			Type:      "wireguard",
+			Interface: "wg-mynet",
+		}
+		manager.disconnectTracked(state)
+
+		executor.assertCommandExecuted(t, "ip link delete wg-mynet")
+	})
+}
+
+func TestVPNStateFileFormat(t *testing.T) {
+	tempDir := t.TempDir()
+	executor := &mockSystemExecutor{}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, runtimeDir: tempDir}
+
+	// Test setting state
+	state := vpnState{
+		Name:              "test-vpn",
+		Interface:         "wg0",
+		Type:              "wireguard",
+		OriginalGateway:   "192.168.1.1",
+		OriginalInterface: "eth0",
+	}
+	err := manager.setActiveVPNState(state)
+	assert.NoError(t, err)
+
+	// Read state back
+	readState := manager.getActiveVPNState()
+	assert.NotNil(t, readState)
+	assert.Equal(t, "test-vpn", readState.Name)
+	assert.Equal(t, "wg0", readState.Interface)
+	assert.Equal(t, "wireguard", readState.Type)
+	assert.Equal(t, "192.168.1.1", readState.OriginalGateway)
+	assert.Equal(t, "eth0", readState.OriginalInterface)
+
+	// Test getActiveVPN returns just the name
+	name := manager.getActiveVPN()
+	assert.Equal(t, "test-vpn", name)
 }
 
 func TestDisconnect_ClearsActiveVPNStateFile(t *testing.T) {

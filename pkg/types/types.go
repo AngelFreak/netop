@@ -151,6 +151,7 @@ type DHCPServerConfig struct {
 	Interface string   `yaml:"interface" mapstructure:"interface"`
 	IPRange   string   `yaml:"ip_range" mapstructure:"ip_range"`     // e.g., "192.168.100.50,192.168.100.150"
 	Gateway   string   `yaml:"gateway" mapstructure:"gateway"`       // e.g., "192.168.100.1"
+	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`       // CIDR bits, e.g., "24" for /24. Defaults to "24"
 	DNS       []string `yaml:"dns" mapstructure:"dns"`
 	LeaseTime string   `yaml:"lease_time" mapstructure:"lease_time"` // e.g., "12h"
 }

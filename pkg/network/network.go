@@ -35,7 +35,11 @@ func (m *Manager) killProcess(pattern string) {
 // SetDNS configures DNS servers
 func (m *Manager) SetDNS(servers []string) error {
 	if len(servers) == 0 || (len(servers) == 1 && servers[0] == "dhcp") {
-		// Use DHCP for DNS
+		// Remove immutable flag to allow DHCP to update DNS
+		_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
+		if err != nil {
+			m.logger.Debug("Failed to remove immutable flag (may not be set)", "error", err)
+		}
 		m.logger.Info("Using DHCP for DNS configuration")
 		return nil
 	}
@@ -106,6 +110,15 @@ func (m *Manager) SetMAC(iface, mac string) error {
 	if mac == "default" {
 		// Use a default MAC (random MacBook Pro style)
 		mac = m.generateMacBookProMAC()
+	}
+
+	if mac == "permanent" {
+		// Restore the factory/permanent MAC address
+		permMAC, err := m.getPermanentMAC(iface)
+		if err != nil {
+			return fmt.Errorf("failed to get permanent MAC: %w", err)
+		}
+		mac = permMAC
 	}
 
 	// Handle MAC templates like "00:??:??:??:??:??"
@@ -440,6 +453,26 @@ func (m *Manager) expandMACTemplate(template string) string {
 		result = strings.Replace(result, "??", fmt.Sprintf("%02x", randomByte[0]), 1)
 	}
 	return result
+}
+
+// getPermanentMAC retrieves the factory/permanent MAC address using ethtool
+func (m *Manager) getPermanentMAC(iface string) (string, error) {
+	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ethtool", "-P", iface)
+	if err != nil {
+		return "", fmt.Errorf("ethtool not available or failed: %w", err)
+	}
+	// Parse "Permanent address: aa:bb:cc:dd:ee:ff"
+	output = strings.TrimSpace(output)
+	parts := strings.Split(output, ": ")
+	if len(parts) == 2 {
+		mac := strings.TrimSpace(parts[1])
+		// Validate the MAC format
+		if err := types.ValidateMAC(mac); err != nil {
+			return "", fmt.Errorf("invalid MAC from ethtool: %s", mac)
+		}
+		return mac, nil
+	}
+	return "", fmt.Errorf("could not parse permanent MAC from: %s", output)
 }
 
 func (m *Manager) writeFile(path, content string) error {

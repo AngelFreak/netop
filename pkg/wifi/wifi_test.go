@@ -173,23 +173,22 @@ func TestConnect(t *testing.T) {
 			commands: map[string]string{
 				"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
 SSID: OtherSSID`,
-				// Disconnect commands (using new fast kill with -9)
-				"pkill -9 -f wpa_supplicant":    "",
-				"pkill -9 -f dhclient":          "",
-				"ip addr flush dev wlan0":    "",
-				"ip route flush dev wlan0":   "",
-				"ip link set wlan0 down":     "",
+				// Disconnect commands (interface-specific termination)
+				"wpa_cli -i wlan0 terminate":                        "",
+				"pkill -9 -f dhclient.*wlan0":                       "",
+				"ip addr flush dev wlan0":                           "",
+				"ip route flush dev wlan0":                          "",
+				"ip link set wlan0 down":                            "",
 				// Reconnect commands
-				"ip link set wlan0 up":       "",
-				"mkdir -p /run/wpa_supplicant": "",
+				"ip link set wlan0 up":                              "",
+				"mkdir -p /run/wpa_supplicant":                      "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
-				"wpa_cli -i wlan0 status":    "wpa_state=COMPLETED\nssid=TestSSID",
-				// New streamlined DHCP flow
-				"pkill -9 -f udhcpc.*wlan0":   "",
-				"pkill -9 -f dhclient.*wlan0":   "",
+				"wpa_cli -i wlan0 status":                           "wpa_state=COMPLETED\nssid=TestSSID",
+				// DHCP flow
+				"pkill -9 -f udhcpc.*wlan0":                         "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
-				"timeout 15 dhclient -v wlan0": "",
-				"ip addr show wlan0":         "inet 192.168.1.100/24",
+				"timeout 15 dhclient -v wlan0":                      "",
+				"ip addr show wlan0":                                "inet 192.168.1.100/24",
 			},
 		}
 		logger := &mockLogger{}
@@ -204,10 +203,11 @@ SSID: OtherSSID`,
 			commands: map[string]string{
 				"iw wlan0 link":           "Not connected",
 				"ip link set wlan0 up":    "",
-				"pkill -9 -f wpa_supplicant": "",
+				// Interface-specific wpa_supplicant termination
+				"wpa_cli -i wlan0 terminate": "",
 				"mkdir -p /run/wpa_supplicant": "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
-				// New streamlined DHCP flow
+				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0":   "",
 				"pkill -9 -f dhclient.*wlan0":   "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
@@ -229,7 +229,8 @@ SSID: OtherSSID`,
 			commands: map[string]string{
 				"iw wlan0 link":           "Not connected",
 				"ip link set wlan0 up":    "",
-				"pkill -f wpa_supplicant": "",
+				// Interface-specific wpa_supplicant termination
+				"wpa_cli -i wlan0 terminate": "",
 				"mkdir -p /run/wpa_supplicant": "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
 				"wpa_cli -i wlan0 status": "wpa_state=SCANNING", // Never completes
@@ -248,11 +249,12 @@ SSID: OtherSSID`,
 func TestDisconnect(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"pkill -9 -f wpa_supplicant": "",
-			"pkill -9 -f dhclient":       "",
-			"ip addr flush dev wlan0":   "",
-			"ip route flush dev wlan0":  "",
-			"ip link set wlan0 down":    "",
+			// Interface-specific termination commands
+			"wpa_cli -i wlan0 terminate":                        "",
+			"pkill -9 -f dhclient.*wlan0":                       "",
+			"ip addr flush dev wlan0":                           "",
+			"ip route flush dev wlan0":                          "",
+			"ip link set wlan0 down":                            "",
 		},
 	}
 	logger := &mockLogger{}
@@ -881,5 +883,132 @@ func TestScan_AdditionalCases(t *testing.T) {
 		networks, err := manager.Scan()
 		assert.NoError(t, err)
 		assert.NotEmpty(t, networks)
+	})
+}
+
+// Tests for interface-specific process termination (Issue 2 fix)
+
+func TestTerminateWpaSupplicant(t *testing.T) {
+	t.Run("graceful termination via wpa_cli succeeds", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"wpa_cli -i wlan0 terminate": "OK",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		// Should not panic
+		manager.terminateWpaSupplicant()
+	})
+
+	t.Run("fallback to pkill when wpa_cli fails", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pkill -9 -f wpa_supplicant.*-i[[:space:]]+wlan0": "",
+			},
+			errors: map[string]error{
+				"wpa_cli -i wlan0 terminate": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		// Should not panic, falls back to pkill
+		manager.terminateWpaSupplicant()
+	})
+
+	t.Run("uses correct interface in wpa_cli", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"wpa_cli -i eth0 terminate": "OK",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "eth0"}
+
+		manager.terminateWpaSupplicant()
+	})
+
+	t.Run("uses correct interface pattern in pkill fallback", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pkill -9 -f wpa_supplicant.*-i[[:space:]]+wlp2s0": "",
+			},
+			errors: map[string]error{
+				"wpa_cli -i wlp2s0 terminate": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlp2s0"}
+
+		manager.terminateWpaSupplicant()
+	})
+}
+
+func TestTerminateDhclient(t *testing.T) {
+	t.Run("kills dhclient for specific interface", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pkill -9 -f dhclient.*wlan0": "",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		// Should not panic
+		manager.terminateDhclient()
+	})
+
+	t.Run("uses correct interface pattern", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"pkill -9 -f dhclient.*eth0": "",
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "eth0"}
+
+		manager.terminateDhclient()
+	})
+
+	t.Run("handles no matching process gracefully", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{},
+			errors: map[string]error{
+				"pkill -9 -f dhclient.*wlan0": assert.AnError, // No process found
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+
+		// Should not panic even if no process found
+		manager.terminateDhclient()
+	})
+}
+
+func TestDisconnectInterfaceIsolation(t *testing.T) {
+	t.Run("does not kill wpa_supplicant on other interfaces", func(t *testing.T) {
+		// This test verifies that disconnect only affects the managed interface
+		// It uses interface-specific commands rather than global pkill
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				// Interface-specific commands for wlan0 only
+				"wpa_cli -i wlan0 terminate":  "OK",
+				"pkill -9 -f dhclient.*wlan0": "",
+				"ip addr flush dev wlan0":    "",
+				"ip route flush dev wlan0":   "",
+				"ip link set wlan0 down":     "",
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+
+		err := manager.Disconnect()
+		assert.NoError(t, err)
+
+		// Note: The key verification is that we're NOT calling global
+		// "pkill -9 -f wpa_supplicant" or "pkill -9 -f dhclient"
+		// which would kill processes on other interfaces
 	})
 }

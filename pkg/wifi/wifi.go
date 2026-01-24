@@ -143,8 +143,8 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 		return fmt.Errorf("failed to write WPA config: %w", err)
 	}
 
-	// Kill existing wpa_supplicant with SIGKILL fallback for hung processes
-	m.killProcess("wpa_supplicant")
+	// Terminate existing wpa_supplicant for this interface only
+	m.terminateWpaSupplicant()
 
 	// Bring interface up before starting wpa_supplicant
 	_, err = m.executor.Execute("ip", "link", "set", m.iface, "up")
@@ -169,16 +169,16 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// Wait for association with the access point
 	err = m.waitForAssociation(ssid)
 	if err != nil {
-		// Clean up wpa_supplicant on failure
-		m.killProcess("wpa_supplicant")
+		// Clean up wpa_supplicant on failure (interface-specific)
+		m.terminateWpaSupplicant()
 		return fmt.Errorf("failed to associate with access point: %w", err)
 	}
 
 	// Get DHCP lease with optional hostname
 	err = m.obtainDHCP(hostname)
 	if err != nil {
-		// Clean up wpa_supplicant on failure
-		m.killProcess("wpa_supplicant")
+		// Clean up wpa_supplicant on failure (interface-specific)
+		m.terminateWpaSupplicant()
 		return fmt.Errorf("failed to obtain DHCP lease: %w", err)
 	}
 
@@ -193,11 +193,11 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 func (m *Manager) Disconnect() error {
 	m.logger.Info("Disconnecting from WiFi network", "interface", m.iface)
 
-	// Kill wpa_supplicant with SIGKILL fallback for hung processes
-	m.killProcess("wpa_supplicant")
+	// Terminate wpa_supplicant for this interface only (not global)
+	m.terminateWpaSupplicant()
 
-	// Kill dhclient with SIGKILL fallback for hung processes
-	m.killProcess("dhclient")
+	// Terminate dhclient for this interface only (not global)
+	m.terminateDhclient()
 
 	// Flush all IP addresses from interface
 	if _, err := m.executor.Execute("ip", "addr", "flush", "dev", m.iface); err != nil {
@@ -494,8 +494,30 @@ func (m *Manager) readFile(path string) (string, error) {
 }
 
 // killProcess kills processes matching a pattern with SIGKILL (fast, no graceful shutdown)
+// DEPRECATED: Use terminateWpaSupplicant or terminateDhclient for interface-specific termination
 func (m *Manager) killProcess(pattern string) {
 	system.KillProcessFast(m.executor, m.logger, pattern)
+}
+
+// terminateWpaSupplicant terminates wpa_supplicant for this interface only
+// Uses wpa_cli terminate for graceful shutdown, with pkill fallback
+func (m *Manager) terminateWpaSupplicant() {
+	// Try graceful termination via wpa_cli (interface-specific)
+	_, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "terminate")
+	if err != nil {
+		// Fallback to interface-specific pkill
+		// Pattern matches: wpa_supplicant ... -i <interface> ...
+		m.executor.ExecuteWithTimeout(500*time.Millisecond,
+			"pkill", "-9", "-f", fmt.Sprintf("wpa_supplicant.*-i[[:space:]]+%s", m.iface))
+	}
+}
+
+// terminateDhclient terminates dhclient for this interface only
+func (m *Manager) terminateDhclient() {
+	// Interface-specific pkill
+	// Pattern matches: dhclient ... <interface> (interface is typically last arg)
+	m.executor.ExecuteWithTimeout(500*time.Millisecond,
+		"pkill", "-9", "-f", fmt.Sprintf("dhclient.*%s", m.iface))
 }
 
 // waitForWpaSupplicantReady polls until wpa_supplicant responds to wpa_cli

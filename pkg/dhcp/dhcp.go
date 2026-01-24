@@ -52,8 +52,12 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
 
-	// Set IP address on interface
-	if _, err := d.executor.Execute("ip", "addr", "add", config.Gateway+"/24", "dev", config.Interface); err != nil {
+	// Set IP address on interface with configurable netmask
+	netmask := config.Netmask
+	if netmask == "" {
+		netmask = "24" // Default for backwards compatibility
+	}
+	if _, err := d.executor.Execute("ip", "addr", "add", config.Gateway+"/"+netmask, "dev", config.Interface); err != nil {
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
 

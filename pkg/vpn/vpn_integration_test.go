@@ -159,10 +159,13 @@ func TestVPNManagerConnect_Integration(t *testing.T) {
 	t.Logf("Created interface:\n%s", output)
 
 	// Verify active VPN state file was created
+	// Format is: vpn-name|interface|type|originalGateway|originalInterface
 	stateFile := filepath.Join(runtimeDir, "active-vpn")
 	content, err := os.ReadFile(stateFile)
 	require.NoError(t, err)
-	assert.Equal(t, "test-vpn", strings.TrimSpace(string(content)))
+	stateContent := strings.TrimSpace(string(content))
+	stateParts := strings.Split(stateContent, "|")
+	assert.Equal(t, "test-vpn", stateParts[0], "VPN name should be first part of state file")
 
 	// Disconnect
 	err = manager.Disconnect("test-vpn")

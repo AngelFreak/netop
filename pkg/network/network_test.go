@@ -174,25 +174,28 @@ func TestNewManager(t *testing.T) {
 }
 
 func TestSetDNS(t *testing.T) {
-	t.Run("empty servers does nothing", func(t *testing.T) {
+	t.Run("empty servers unlocks resolv.conf for DHCP", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		// No commands should be executed for empty servers
+		// Should unlock resolv.conf so DHCP can write DNS servers
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{})
 		assert.NoError(t, err)
-		assert.Empty(t, executor.executedCmds, "no commands should be executed for empty servers")
+		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
 	})
 
-	t.Run("dhcp keyword does nothing", func(t *testing.T) {
+	t.Run("dhcp keyword unlocks resolv.conf for DHCP", func(t *testing.T) {
 		executor := newStrictMockExecutor()
+		// Should unlock resolv.conf so DHCP can write DNS servers
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"dhcp"})
 		assert.NoError(t, err)
-		assert.Empty(t, executor.executedCmds, "no commands should be executed for dhcp")
+		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
 	})
 
 	t.Run("valid servers writes resolv.conf with correct content", func(t *testing.T) {
@@ -353,6 +356,46 @@ func TestSetMAC(t *testing.T) {
 				assert.NotContains(t, cmd, "??", "template wildcards should be expanded")
 			}
 		}
+	})
+
+	t.Run("permanent mac - uses ethtool to get factory MAC", func(t *testing.T) {
+		executor := newStrictMockExecutor()
+		// ethtool -P returns the permanent/factory MAC address
+		executor.commands["ethtool -P wlan0"] = "Permanent address: 00:11:22:33:44:55"
+		executor.commands["ip link set wlan0 down"] = ""
+		executor.commands["ip link set wlan0 address 00:11:22:33:44:55"] = ""
+		executor.commands["ip link set wlan0 up"] = ""
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger}
+
+		err := manager.SetMAC("wlan0", "permanent")
+		assert.NoError(t, err)
+
+		// Verify ethtool was called and the permanent MAC was used
+		executor.assertCommandExecuted(t, "ethtool -P wlan0")
+		executor.assertCommandExecuted(t, "ip link set wlan0 address 00:11:22:33:44:55")
+	})
+
+	t.Run("permanent mac - fails when ethtool unavailable", func(t *testing.T) {
+		executor := newStrictMockExecutor()
+		executor.errors["ethtool -P wlan0"] = assert.AnError
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger}
+
+		err := manager.SetMAC("wlan0", "permanent")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to get permanent MAC")
+	})
+
+	t.Run("permanent mac - fails on invalid ethtool output", func(t *testing.T) {
+		executor := newStrictMockExecutor()
+		executor.commands["ethtool -P wlan0"] = "Invalid output"
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger}
+
+		err := manager.SetMAC("wlan0", "permanent")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "could not parse permanent MAC")
 	})
 }
 

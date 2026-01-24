@@ -100,3 +100,44 @@ func ParseDNSFromResolvConf(content string) []net.IP {
 	}
 	return dns
 }
+
+// KillProcessByPID kills a process by reading its PID from a file.
+// Returns nil if successful or if the PID file doesn't exist.
+// Uses SIGTERM first, then SIGKILL after a short delay if still running.
+func KillProcessByPID(executor types.SystemExecutor, logger types.Logger, pidFile string) error {
+	// Read PID from file
+	pid, err := executor.ExecuteWithTimeout(1*time.Second, "cat", pidFile)
+	if err != nil {
+		logger.Debug("PID file not found or unreadable", "file", pidFile, "error", err)
+		return nil // Not an error - process may not be running
+	}
+
+	pid = strings.TrimSpace(pid)
+	if pid == "" {
+		logger.Debug("PID file is empty", "file", pidFile)
+		return nil
+	}
+
+	// Try graceful shutdown first (SIGTERM)
+	_, err = executor.ExecuteWithTimeout(1*time.Second, "kill", pid)
+	if err != nil {
+		logger.Debug("Process may already be dead", "pid", pid, "error", err)
+		return nil
+	}
+
+	// Wait briefly for graceful shutdown
+	time.Sleep(200 * time.Millisecond)
+
+	// Check if still running and force kill if necessary
+	_, err = executor.ExecuteWithTimeout(500*time.Millisecond, "kill", "-0", pid)
+	if err == nil {
+		// Process still running, send SIGKILL
+		logger.Debug("Process still running after SIGTERM, sending SIGKILL", "pid", pid)
+		_, _ = executor.ExecuteWithTimeout(1*time.Second, "kill", "-9", pid)
+	}
+
+	// Clean up PID file
+	_, _ = executor.ExecuteWithTimeout(500*time.Millisecond, "rm", "-f", pidFile)
+
+	return nil
+}

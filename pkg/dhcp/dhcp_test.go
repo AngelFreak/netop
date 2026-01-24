@@ -376,3 +376,87 @@ func TestDnsmasqRunning(t *testing.T) {
 	os.WriteFile(mgr.dnsmasqPidFile, []byte("1"), 0644)
 	assert.True(t, mgr.dnsmasqRunning())
 }
+
+// Tests for configurable netmask (Issue 6 fix)
+
+func TestStart_WithCustomNetmask(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "10.0.0.1",
+		IPRange:   "10.0.0.50,10.0.0.150",
+		Netmask:   "16", // Use /16 instead of default /24
+	}
+
+	// Mock successful commands with custom netmask
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 10.0.0.1/16 dev eth0"] = "" // Should use /16 not /24
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	err := mgr.Start(config)
+
+	assert.NoError(t, err)
+}
+
+func TestStart_WithDefaultNetmask(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+		// Netmask not specified - should default to /24
+	}
+
+	// Mock successful commands
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = "" // Should default to /24
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	err := mgr.Start(config)
+
+	assert.NoError(t, err)
+}
+
+func TestStart_WithDifferentNetmasks(t *testing.T) {
+	tests := []struct {
+		name     string
+		netmask  string
+		expected string
+	}{
+		{"classA", "8", "/8"},
+		{"classB", "16", "/16"},
+		{"classC", "24", "/24"},
+		{"slash25", "25", "/25"},
+		{"slash28", "28", "/28"},
+		{"slash30", "30", "/30"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, executor := setupTestManager()
+			defer cleanup(mgr)
+
+			config := &types.DHCPServerConfig{
+				Interface: "eth0",
+				Gateway:   "10.0.0.1",
+				IPRange:   "10.0.0.50,10.0.0.150",
+				Netmask:   tt.netmask,
+			}
+
+			// Mock successful commands
+			executor.commands["ip link set eth0 down"] = ""
+			executor.commands["ip link set eth0 up"] = ""
+			executor.commands["ip addr add 10.0.0.1"+tt.expected+" dev eth0"] = ""
+			executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+			err := mgr.Start(config)
+			assert.NoError(t, err)
+		})
+	}
+}

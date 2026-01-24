@@ -28,6 +28,16 @@ type Manager struct {
 	mu            sync.Mutex // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 }
 
+// vpnState holds the state information stored in the active-vpn file
+// Format: vpn-name|interface|type|originalGateway|originalInterface
+type vpnState struct {
+	Name              string
+	Interface         string
+	Type              string
+	OriginalGateway   string
+	OriginalInterface string
+}
+
 // NewManager creates a new VPN manager with the default runtime directory
 func NewManager(executor types.SystemExecutor, logger types.Logger, configMgr types.ConfigManager) *Manager {
 	return NewManagerWithDir(executor, logger, configMgr, types.RuntimeDir)
@@ -56,12 +66,22 @@ func (m *Manager) Connect(name string) error {
 		return fmt.Errorf("failed to load VPN config '%s': %w", name, err)
 	}
 
+	// Save current default gateway BEFORE connecting
+	// This will be used to restore the route after disconnect
+	origGW, origIface := m.getCurrentGateway()
+
 	var connectErr error
+	var vpnIface string
 	switch config.Type {
 	case "openvpn":
 		connectErr = m.connectOpenVPN(config)
+		vpnIface = "tun0"
 	case "wireguard":
 		connectErr = m.connectWireGuard(config)
+		vpnIface = config.Interface
+		if vpnIface == "" {
+			vpnIface = "wg0"
+		}
 	default:
 		return fmt.Errorf("unsupported VPN type: %s", config.Type)
 	}
@@ -70,9 +90,16 @@ func (m *Manager) Connect(name string) error {
 		return connectErr
 	}
 
-	// Record the active VPN name for status tracking
-	if err := m.setActiveVPN(name); err != nil {
-		m.logger.Debug("Failed to record active VPN", "error", err)
+	// Record the active VPN state for status tracking and proper disconnect
+	state := vpnState{
+		Name:              name,
+		Interface:         vpnIface,
+		Type:              config.Type,
+		OriginalGateway:   origGW,
+		OriginalInterface: origIface,
+	}
+	if err := m.setActiveVPNState(state); err != nil {
+		m.logger.Debug("Failed to record active VPN state", "error", err)
 		// Non-fatal: connection succeeded, just status tracking won't work perfectly
 	}
 
@@ -86,6 +113,65 @@ func (m *Manager) Disconnect(name string) error {
 
 	m.logger.Info("Disconnecting from VPN", "name", name)
 
+	// Read the VPN state to know exactly what to clean up
+	state := m.getActiveVPNState()
+
+	// Disconnect based on tracked state (process isolation)
+	if state != nil && state.Type != "" {
+		m.logger.Debug("Using tracked VPN state for disconnect", "type", state.Type, "interface", state.Interface)
+		m.disconnectTracked(state)
+	} else {
+		// Fallback to legacy behavior for backwards compatibility
+		// (e.g., VPNs started outside of net or old state files)
+		m.logger.Debug("No tracked VPN state, using legacy disconnect")
+		m.disconnectLegacy()
+	}
+
+	// Remove the VPN endpoint route if we added one (no nested lock needed, already holding m.mu)
+	endpointRoute := m.endpointRoute
+	m.endpointRoute = ""
+	if endpointRoute != "" {
+		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
+		_, _ = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "del", endpointRoute)
+	}
+
+	// Restore default route via the physical interface using saved original route
+	m.restoreDefaultRouteFromState(state)
+
+	// Clear the active VPN state file
+	m.clearActiveVPN()
+
+	return nil
+}
+
+// disconnectTracked disconnects using tracked state (process isolation)
+func (m *Manager) disconnectTracked(state *vpnState) {
+	switch state.Type {
+	case "openvpn":
+		// Kill only our OpenVPN process using PID file
+		pidFile := filepath.Join(m.runtimeDir, "openvpn.pid")
+		if err := system.KillProcessByPID(m.executor, m.logger, pidFile); err != nil {
+			m.logger.Debug("Failed to kill tracked OpenVPN", "error", err)
+		}
+		// Bring down the tun interface
+		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", "tun0", "down"); err != nil {
+			m.logger.Debug("Failed to bring down tun0", "error", err)
+		}
+	case "wireguard":
+		// Delete only our WireGuard interface
+		iface := state.Interface
+		if iface == "" {
+			iface = "wg0"
+		}
+		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface); err != nil {
+			m.logger.Debug("Failed to delete WireGuard interface", "interface", iface, "error", err)
+		}
+	}
+}
+
+// disconnectLegacy disconnects using legacy behavior (kills all VPN processes)
+// This is used for backwards compatibility when no state file exists
+func (m *Manager) disconnectLegacy() {
 	// Kill OpenVPN processes with SIGKILL fallback
 	m.killProcess("openvpn")
 
@@ -136,25 +222,30 @@ func (m *Manager) Disconnect(name string) error {
 		}(iface)
 	}
 	wg.Wait()
+}
 
-	// Remove the VPN endpoint route if we added one (no nested lock needed, already holding m.mu)
-	endpointRoute := m.endpointRoute
-	m.endpointRoute = ""
-	if endpointRoute != "" {
-		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
-		_, _ = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "del", endpointRoute)
+// restoreDefaultRouteFromState restores the default route using saved state
+func (m *Manager) restoreDefaultRouteFromState(state *vpnState) {
+	// Use saved original gateway from state if available
+	if state != nil && state.OriginalGateway != "" && state.OriginalInterface != "" {
+		m.logger.Debug("Restoring default route from saved state",
+			"gateway", state.OriginalGateway, "interface", state.OriginalInterface)
+		_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace",
+			"default", "via", state.OriginalGateway, "dev", state.OriginalInterface)
+		if err != nil {
+			m.logger.Debug("Failed to restore default route from state", "error", err)
+			// Fall back to heuristic detection
+			m.restoreDefaultRoute()
+		}
+		return
 	}
 
-	// Restore default route via the physical interface
+	// No saved state, use heuristic detection
 	m.restoreDefaultRoute()
-
-	// Clear the active VPN state file
-	m.clearActiveVPN()
-
-	return nil
 }
 
 // restoreDefaultRoute finds the physical network interface and restores the default route
+// This is the legacy/fallback method when no saved state is available
 func (m *Manager) restoreDefaultRoute() {
 	// Find the gateway from existing routes (VPN endpoint route points to original gateway)
 	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show")
@@ -220,12 +311,12 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	m.logger.Debug("Listing VPNs")
 
 	// Read the active VPN name from state file (authoritative source)
-	// Lock and read file directly to ensure consistent read with Connect/Disconnect
+	// Lock and use getActiveVPNState to parse the enhanced format
 	m.mu.Lock()
-	data, err := os.ReadFile(m.activeVPNFilePath())
+	state := m.getActiveVPNState()
 	activeVPN := ""
-	if err == nil {
-		activeVPN = strings.TrimSpace(string(data))
+	if state != nil {
+		activeVPN = state.Name
 	}
 	m.mu.Unlock()
 
@@ -371,8 +462,13 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 		return fmt.Errorf("failed to write OpenVPN config: %w", err)
 	}
 
+	// PID file for tracking this specific OpenVPN process
+	pidFile := filepath.Join(m.runtimeDir, "openvpn.pid")
+
 	// Start OpenVPN (10s timeout for daemon startup)
-	_, err = m.executor.ExecuteWithTimeout(10*time.Second, "openvpn", "--config", tempConfig, "--daemon")
+	// Use --writepid to track the specific process we started
+	_, err = m.executor.ExecuteWithTimeout(10*time.Second, "openvpn",
+		"--config", tempConfig, "--daemon", "--writepid", pidFile)
 	if err != nil {
 		m.removeFile(tempConfig) // Clean up on failure
 		return fmt.Errorf("failed to start OpenVPN: %w", err)
@@ -388,7 +484,7 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 		time.Sleep(time.Second)
 	}
 	// Clean up on failure
-	m.killProcess("openvpn")
+	system.KillProcessByPID(m.executor, m.logger, pidFile)
 	m.removeFile(tempConfig)
 	return fmt.Errorf("openvpn failed to establish tunnel within 30s")
 }
@@ -474,6 +570,7 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 }
 
 // extractEndpoint extracts the endpoint IP from a WireGuard config
+// Supports IPv4 (1.2.3.4:51820), IPv6 ([2001:db8::1]:51820), and hostnames
 func (m *Manager) extractEndpoint(config string) string {
 	for _, line := range strings.Split(config, "\n") {
 		line = strings.TrimSpace(line)
@@ -481,10 +578,32 @@ func (m *Manager) extractEndpoint(config string) string {
 			parts := strings.SplitN(line, "=", 2)
 			if len(parts) == 2 {
 				endpoint := strings.TrimSpace(parts[1])
-				// Remove port if present (e.g., "1.2.3.4:51820" -> "1.2.3.4")
-				if idx := strings.LastIndex(endpoint, ":"); idx != -1 {
-					endpoint = endpoint[:idx]
+
+				// Handle IPv6 format: [2001:db8::1]:51820
+				if strings.HasPrefix(endpoint, "[") {
+					if idx := strings.Index(endpoint, "]:"); idx != -1 {
+						// Return IP without brackets: 2001:db8::1
+						return endpoint[1:idx]
+					}
+					// No port, just brackets: [2001:db8::1]
+					return strings.Trim(endpoint, "[]")
 				}
+
+				// Handle IPv4:port or hostname:port
+				// IPv4 addresses and hostnames use : as port separator
+				// Count colons to distinguish from IPv6 without brackets (shouldn't happen but be safe)
+				colonCount := strings.Count(endpoint, ":")
+				if colonCount == 1 {
+					// Single colon means IPv4:port or hostname:port
+					if idx := strings.LastIndex(endpoint, ":"); idx != -1 {
+						return endpoint[:idx]
+					}
+				} else if colonCount == 0 {
+					// No colon, just hostname or IP without port
+					return endpoint
+				}
+				// Multiple colons without brackets - likely malformed IPv6
+				// Return as-is and let the caller handle it
 				return endpoint
 			}
 		}
@@ -494,18 +613,33 @@ func (m *Manager) extractEndpoint(config string) string {
 
 // getCurrentGateway returns the current default gateway IP and interface
 func (m *Manager) getCurrentGateway() (gateway, iface string) {
+	// Try "ip route show default" first (most direct)
 	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show", "default")
-	if err != nil {
-		return "", ""
-	}
-	// Parse "default via 10.10.120.1 dev wlp1s0"
-	parts := strings.Fields(output)
-	for i, part := range parts {
-		if part == "via" && i+1 < len(parts) {
-			gateway = parts[i+1]
+	if err != nil || strings.TrimSpace(output) == "" {
+		// Fallback: parse all routes looking for default
+		output, err = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show")
+		if err != nil {
+			return "", ""
 		}
-		if part == "dev" && i+1 < len(parts) {
-			iface = parts[i+1]
+	}
+
+	// Parse routes looking for "default via X.X.X.X dev IFACE" pattern
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "default") {
+			continue
+		}
+		parts := strings.Fields(line)
+		for i, part := range parts {
+			if part == "via" && i+1 < len(parts) {
+				gateway = parts[i+1]
+			}
+			if part == "dev" && i+1 < len(parts) {
+				iface = parts[i+1]
+			}
+		}
+		if gateway != "" && iface != "" {
+			return gateway, iface
 		}
 	}
 	return gateway, iface
@@ -523,8 +657,14 @@ func (m *Manager) activeVPNFilePath() string {
 	return filepath.Join(m.runtimeDir, "active-vpn")
 }
 
-// setActiveVPN records the currently active VPN name to the state file
+// setActiveVPN records the currently active VPN state to the state file
+// Enhanced format: vpn-name|interface|type|originalGateway|originalInterface
 func (m *Manager) setActiveVPN(name string) error {
+	return m.setActiveVPNState(vpnState{Name: name})
+}
+
+// setActiveVPNState records the full VPN state to the state file
+func (m *Manager) setActiveVPNState(state vpnState) error {
 	activeVPNFile := m.activeVPNFilePath()
 	// Ensure runtime directory exists
 	if err := os.MkdirAll(filepath.Dir(activeVPNFile), 0755); err != nil {
@@ -532,8 +672,41 @@ func (m *Manager) setActiveVPN(name string) error {
 		// Non-fatal: status will fall back to interface detection
 		return err
 	}
+	// Format: vpn-name|interface|type|originalGateway|originalInterface
+	content := fmt.Sprintf("%s|%s|%s|%s|%s",
+		state.Name, state.Interface, state.Type,
+		state.OriginalGateway, state.OriginalInterface)
 	// Use 0600 for consistency with other runtime files (e.g., wg.conf, openvpn.conf)
-	return os.WriteFile(activeVPNFile, []byte(name), 0600)
+	return os.WriteFile(activeVPNFile, []byte(content), 0600)
+}
+
+// getActiveVPNState reads the full VPN state from the state file
+func (m *Manager) getActiveVPNState() *vpnState {
+	data, err := os.ReadFile(m.activeVPNFilePath())
+	if err != nil {
+		return nil
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		return nil
+	}
+
+	// Parse enhanced format: vpn-name|interface|type|originalGateway|originalInterface
+	parts := strings.Split(content, "|")
+	state := &vpnState{Name: parts[0]}
+	if len(parts) >= 2 {
+		state.Interface = parts[1]
+	}
+	if len(parts) >= 3 {
+		state.Type = parts[2]
+	}
+	if len(parts) >= 4 {
+		state.OriginalGateway = parts[3]
+	}
+	if len(parts) >= 5 {
+		state.OriginalInterface = parts[4]
+	}
+	return state
 }
 
 // clearActiveVPN removes the active VPN state file
@@ -546,9 +719,9 @@ func (m *Manager) clearActiveVPN() {
 
 // getActiveVPN reads the currently active VPN name from the state file
 func (m *Manager) getActiveVPN() string {
-	data, err := os.ReadFile(m.activeVPNFilePath())
-	if err != nil {
+	state := m.getActiveVPNState()
+	if state == nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	return state.Name
 }
