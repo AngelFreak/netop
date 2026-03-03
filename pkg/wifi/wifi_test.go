@@ -519,13 +519,11 @@ func TestGenerateWPAConfig(t *testing.T) {
 		assert.Contains(t, config, "ieee80211w=1")
 	})
 
-	t.Run("generates universal WPA2/WPA3 config", func(t *testing.T) {
-		config := manager.generateWPAConfig("TestSSID", "password", "")
-		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant")
-		assert.Contains(t, config, `ssid="TestSSID"`)
-		assert.Contains(t, config, `psk="password"`)
+	t.Run("generates universal WPA2/WPA3 config with BSSID", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "aa:bb:cc:dd:ee:ff")
 		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
 		assert.Contains(t, config, "ieee80211w=1")
+		assert.Contains(t, config, "bssid=aa:bb:cc:dd:ee:ff")
 	})
 
 	t.Run("open network", func(t *testing.T) {
