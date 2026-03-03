@@ -508,10 +508,16 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 	// Clean up credentials file on all paths (success and failure)
 	defer m.removeFile(tempConfig)
 
-	// Create WireGuard interface (ignore error if already exists)
+	// Create WireGuard interface — if it already exists, delete and recreate
+	// to ensure clean state (no stale routes/config from previous connection)
 	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "add", "dev", iface, "type", "wireguard")
 	if err != nil {
-		m.logger.Warn("Failed to add WireGuard interface, it may already exist", "error", err)
+		m.logger.Debug("WireGuard interface exists, recreating for clean state", "interface", iface)
+		m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface)
+		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "add", "dev", iface, "type", "wireguard")
+		if err != nil {
+			return fmt.Errorf("failed to create WireGuard interface: %w", err)
+		}
 	}
 
 	// Set config
