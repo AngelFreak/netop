@@ -66,22 +66,17 @@ func (m *Manager) Scan() ([]types.WiFiNetwork, error) {
 		m.logger.Warn("Failed to bring interface up", "error", err)
 	}
 
-	// Note: Don't kill wpa_supplicant here - iw scan works even with active connection
-	// This prevents dropping existing connections during scan
+	// Always trigger a fresh scan — cached results from scan dump may only
+	// contain the currently connected AP when connected to a network
+	_, err = m.executor.ExecuteWithTimeout(10*time.Second, "iw", m.iface, "scan")
+	if err != nil {
+		m.logger.Warn("Fresh scan failed, falling back to cached results", "error", err)
+	}
 
-	// Try to get cached scan results first (fast path)
+	// Read scan results (includes results from fresh scan above)
 	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "iw", m.iface, "scan", "dump")
-	if err != nil || output == "" || !strings.Contains(output, "BSS") {
-		// No cached results, trigger a new scan
-		_, err = m.executor.ExecuteWithTimeout(10*time.Second, "iw", m.iface, "scan")
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan: %w", err)
-		}
-		// Get fresh scan results
-		output, err = m.executor.ExecuteWithTimeout(5*time.Second, "iw", m.iface, "scan", "dump")
-		if err != nil {
-			return nil, fmt.Errorf("failed to get scan results: %w", err)
-		}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get scan results: %w", err)
 	}
 
 	return m.parseScanResults(output)

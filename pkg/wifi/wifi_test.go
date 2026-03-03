@@ -182,14 +182,39 @@ freq: 2437
 		assert.Equal(t, 2437, networks[1].Frequency)
 	})
 
-	t.Run("scan fails", func(t *testing.T) {
+	t.Run("fresh scan fails but dump succeeds", func(t *testing.T) {
+		// When iw scan fails (e.g. permission error), we fall back to cached results
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"ip link set wlan0 up": "",
-				"iw wlan0 scan":        "",
+				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: CachedNetwork
+signal: -55.00
+freq: 2412
+`,
 			},
 			errors: map[string]error{
 				"iw wlan0 scan": assert.AnError,
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+
+		networks, err := manager.Scan()
+		assert.NoError(t, err)
+		assert.Len(t, networks, 1)
+		assert.Equal(t, "CachedNetwork", networks[0].SSID)
+	})
+
+	t.Run("both scan and dump fail", func(t *testing.T) {
+		// When both iw scan and iw scan dump fail, Scan() returns an error
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip link set wlan0 up": "",
+			},
+			errors: map[string]error{
+				"iw wlan0 scan":      assert.AnError,
+				"iw wlan0 scan dump": assert.AnError,
 			},
 		}
 		logger := &mockLogger{}
@@ -1005,6 +1030,40 @@ func TestListConnections_AdditionalCases(t *testing.T) {
 		assert.Len(t, connections, 1)
 		assert.Nil(t, connections[0].Gateway)
 	})
+}
+
+func TestScan_AlwaysTriggersFreshScan(t *testing.T) {
+	// Even when scan dump returns cached results, a fresh scan should be triggered
+	executor := &recordingExecutor{
+		mockSystemExecutor: mockSystemExecutor{
+			commands: map[string]string{
+				"ip link set wlan0 up": "",
+				"iw wlan0 scan":       "",
+				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: FreshNetwork
+signal: -50.00
+freq: 2412
+`,
+			},
+		},
+	}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+
+	networks, err := manager.Scan()
+	assert.NoError(t, err)
+	assert.Len(t, networks, 1)
+
+	// Verify iw scan was called (fresh scan triggered)
+	assert.Contains(t, executor.calledCommands, "iw wlan0 scan",
+		"should always trigger a fresh scan")
+
+	// Verify fresh scan happens before scan dump
+	scanIdx := indexOf(executor.calledCommands, "iw wlan0 scan")
+	dumpIdx := indexOf(executor.calledCommands, "iw wlan0 scan dump")
+	assert.True(t, scanIdx >= 0, "iw scan should have been called")
+	assert.True(t, dumpIdx >= 0, "iw scan dump should have been called")
+	assert.True(t, scanIdx < dumpIdx, "iw scan should be called before iw scan dump")
 }
 
 func TestScan_AdditionalCases(t *testing.T) {
