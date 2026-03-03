@@ -180,6 +180,13 @@ func (a *App) RunScan(showOpen bool) error {
 func (a *App) RunConnect(name, password string) error {
 	a.Logger.Debug("Connect command called", "name", name)
 
+	// Disconnect any active VPN before connecting to new network
+	// This prevents stale VPN routes/interfaces from interfering
+	a.Logger.Debug("Disconnecting any active VPN before connecting")
+	if err := a.VPNMgr.Disconnect(""); err != nil {
+		a.Logger.Debug("No active VPN to disconnect", "error", err)
+	}
+
 	// Check if it's a configured network
 	a.Logger.Debug("Looking up network config", "name", name)
 	networkConfig, err := a.ConfigMgr.GetNetworkConfig(name)

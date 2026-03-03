@@ -958,6 +958,29 @@ func TestApp_RunShow_MergesWithCommon(t *testing.T) {
 	assert.Contains(t, stdout.String(), "8.8.8.8")
 }
 
+// trackingVPNManager tracks whether Disconnect was called
+type trackingVPNManager struct {
+	testVPNManager
+	disconnectCalled bool
+}
+
+func (v *trackingVPNManager) Disconnect(name string) error {
+	v.disconnectCalled = true
+	return nil
+}
+
+func TestApp_RunConnect_DisconnectsActiveVPNFirst(t *testing.T) {
+	app, _, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{networkErr: errors.New("not found")}
+	// Create a custom VPN manager that tracks disconnect calls
+	vpnMgr := &trackingVPNManager{}
+	app.VPNMgr = vpnMgr
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.True(t, vpnMgr.disconnectCalled, "should disconnect active VPN before connecting")
+}
+
 func TestMaskSecret(t *testing.T) {
 	// Short secrets are fully masked
 	assert.Equal(t, "****", maskSecret("abc"))
