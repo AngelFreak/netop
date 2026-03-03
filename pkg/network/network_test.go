@@ -136,6 +136,17 @@ func (m *mockSystemExecutor) assertInputContains(t *testing.T, cmd, expected str
 	}
 }
 
+// assertCommandNotExecuted verifies a command was NOT executed
+func (m *mockSystemExecutor) assertCommandNotExecuted(t *testing.T, cmd string) {
+	t.Helper()
+	for _, executed := range m.executedCmds {
+		if executed == cmd {
+			t.Errorf("expected command %q to NOT be executed, but it was", cmd)
+			return
+		}
+	}
+}
+
 type mockLogger struct{}
 
 func (m *mockLogger) Debug(msg string, fields ...interface{}) {}
@@ -284,6 +295,37 @@ func TestSetDNS(t *testing.T) {
 		err := manager.SetDNS([]string{"8.8.8.8"})
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to write resolv.conf")
+	})
+
+	t.Run("does not lock resolv.conf when DNS is DHCP", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, &mockDHCPClient{})
+
+		err := manager.SetDNS([]string{"dhcp"})
+		assert.NoError(t, err)
+
+		// Should unlock but NOT re-lock — DHCP needs to write resolv.conf,
+		// and external VPN tools (NetBird, Tailscale) also need to modify it
+		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+		executor.assertCommandNotExecuted(t, "chattr +i /etc/resolv.conf")
+	})
+
+	t.Run("only locks resolv.conf when custom DNS is set", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, &mockDHCPClient{})
+
+		err := manager.SetDNS([]string{"8.8.8.8"})
+		assert.NoError(t, err)
+
+		// Should lock when custom DNS is set — prevents DHCP from overwriting
+		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
 	})
 }
 
