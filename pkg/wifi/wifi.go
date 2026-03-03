@@ -290,13 +290,13 @@ func (m *Manager) parseScanResults(output string) ([]types.WiFiNetwork, error) {
 
 	var currentNetwork *types.WiFiNetwork
 	var currentSecurity string
-	// Use package-level compiled regexes for better performance
+	var inRSN bool
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
 		if strings.HasPrefix(line, "BSS ") {
-			// New network
+			// Save previous network
 			if currentNetwork != nil && currentNetwork.SSID != "" {
 				currentNetwork.Security = currentSecurity
 				if existing, ok := networksMap[currentNetwork.SSID]; !ok || currentNetwork.Signal > existing.Signal {
@@ -307,7 +307,8 @@ func (m *Manager) parseScanResults(output string) ([]types.WiFiNetwork, error) {
 				}
 			}
 			currentNetwork = &types.WiFiNetwork{}
-			currentSecurity = "Open" // Default to open
+			currentSecurity = "Open"
+			inRSN = false
 			if match := bssidRegex.FindStringSubmatch(line); len(match) > 1 {
 				currentNetwork.BSSID = match[1]
 				if m.logger != nil {
@@ -348,16 +349,21 @@ func (m *Manager) parseScanResults(output string) ([]types.WiFiNetwork, error) {
 				}
 			}
 		} else if strings.Contains(line, "RSN:") {
-			// WPA2 or WPA3
-			if strings.Contains(line, "Authentication suites: SAE") {
-				currentSecurity = "WPA3"
-			} else {
-				currentSecurity = "WPA2"
-			}
+			inRSN = true
+			currentSecurity = "WPA2" // default RSN = WPA2, may upgrade to WPA3
 		} else if strings.Contains(line, "WPA:") {
+			inRSN = false
 			currentSecurity = "WPA"
 		} else if strings.Contains(line, "WEP:") {
+			inRSN = false
 			currentSecurity = "WEP"
+		} else if inRSN && strings.Contains(line, "Authentication suites:") {
+			if strings.Contains(line, "SAE") && strings.Contains(line, "PSK") {
+				currentSecurity = "WPA2/WPA3"
+			} else if strings.Contains(line, "SAE") {
+				currentSecurity = "WPA3"
+			}
+			// PSK-only stays as "WPA2" (set when RSN: was seen)
 		}
 	}
 

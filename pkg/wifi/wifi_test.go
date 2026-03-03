@@ -453,6 +453,59 @@ freq: 5180
 	assert.Equal(t, -95, networks[3].Signal)
 }
 
+func TestParseScanResultsWPA3Detection(t *testing.T) {
+	manager := &Manager{}
+
+	t.Run("detects WPA3-SAE from RSN block", func(t *testing.T) {
+		output := `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: WPA3Network
+signal: -45.00
+freq: 5180
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: SAE
+		 * Capabilities: MFPReq (0x00ac)
+`
+		networks, err := manager.parseScanResults(output)
+		assert.NoError(t, err)
+		assert.Len(t, networks, 1)
+		assert.Equal(t, "WPA3", networks[0].Security)
+	})
+
+	t.Run("detects WPA2 from RSN block without SAE", func(t *testing.T) {
+		output := `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: WPA2Network
+signal: -50.00
+freq: 2412
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+`
+		networks, err := manager.parseScanResults(output)
+		assert.NoError(t, err)
+		assert.Len(t, networks, 1)
+		assert.Equal(t, "WPA2", networks[0].Security)
+	})
+
+	t.Run("detects WPA2/WPA3 transition mode", func(t *testing.T) {
+		output := `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: TransitionNetwork
+signal: -50.00
+freq: 2412
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK SAE
+`
+		networks, err := manager.parseScanResults(output)
+		assert.NoError(t, err)
+		assert.Len(t, networks, 1)
+		assert.Equal(t, "WPA2/WPA3", networks[0].Security)
+	})
+}
+
 func TestGenerateWPAConfig(t *testing.T) {
 	manager := &Manager{logger: &mockLogger{}}
 
