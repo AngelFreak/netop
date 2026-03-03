@@ -515,6 +515,17 @@ func TestGenerateWPAConfig(t *testing.T) {
 		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="password"`)
+		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
+		assert.Contains(t, config, "ieee80211w=1")
+	})
+
+	t.Run("generates universal WPA2/WPA3 config", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "")
+		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant")
+		assert.Contains(t, config, `ssid="TestSSID"`)
+		assert.Contains(t, config, `psk="password"`)
+		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
+		assert.Contains(t, config, "ieee80211w=1")
 	})
 
 	t.Run("open network", func(t *testing.T) {

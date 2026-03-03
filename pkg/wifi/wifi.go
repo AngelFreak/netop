@@ -435,11 +435,16 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 		return config
 	}
 
-	// WPA2 network
+	// WPA2/WPA3 universal network config
+	// key_mgmt=WPA-PSK SAE lets wpa_supplicant negotiate the best protocol
+	// psk serves as fallback for SAE when sae_password is not set
+	// ieee80211w=1 enables optional PMF (required for WPA3, optional for WPA2)
 	escapedPassword := escapeWPAString(password)
 	config := header + fmt.Sprintf(`network={
 	ssid="%s"
-	psk="%s"`, escapedSSID, escapedPassword)
+	psk="%s"
+	key_mgmt=WPA-PSK SAE
+	ieee80211w=1`, escapedSSID, escapedPassword)
 	if validatedBSSID != "" {
 		config += fmt.Sprintf("\n\tbssid=%s", validatedBSSID)
 	}
