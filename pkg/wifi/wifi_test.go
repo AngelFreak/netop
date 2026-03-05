@@ -531,22 +531,110 @@ freq: 2412
 	})
 }
 
+func TestDetectNetworkSecurity(t *testing.T) {
+	t.Run("detects WPA3 for SAE-only network", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: MyWPA3AP
+signal: -45.00
+freq: 5180
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: SAE
+		 * Capabilities: MFPReq (0x00ac)
+`,
+			},
+		}
+		manager := &Manager{
+			iface:    "wlan0",
+			executor: executor,
+			logger:   &mockLogger{},
+		}
+		security := manager.detectNetworkSecurity("MyWPA3AP")
+		assert.Equal(t, "WPA3", security)
+	})
+
+	t.Run("detects WPA2/WPA3 for transition mode", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: TransitionAP
+signal: -50.00
+freq: 2412
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK SAE
+`,
+			},
+		}
+		manager := &Manager{
+			iface:    "wlan0",
+			executor: executor,
+			logger:   &mockLogger{},
+		}
+		security := manager.detectNetworkSecurity("TransitionAP")
+		assert.Equal(t, "WPA2/WPA3", security)
+	})
+
+	t.Run("returns empty for unknown SSID", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: OtherNetwork
+signal: -50.00
+freq: 2412
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+`,
+			},
+		}
+		manager := &Manager{
+			iface:    "wlan0",
+			executor: executor,
+			logger:   &mockLogger{},
+		}
+		security := manager.detectNetworkSecurity("NotFound")
+		assert.Equal(t, "", security)
+	})
+
+	t.Run("returns empty on scan failure", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{},
+			errors: map[string]error{
+				"iw wlan0 scan dump": fmt.Errorf("scan failed"),
+			},
+		}
+		manager := &Manager{
+			iface:    "wlan0",
+			executor: executor,
+			logger:   &mockLogger{},
+		}
+		security := manager.detectNetworkSecurity("AnyNetwork")
+		assert.Equal(t, "", security)
+	})
+}
+
 func TestGenerateWPAConfig(t *testing.T) {
 	manager := &Manager{logger: &mockLogger{}}
 
-	t.Run("with password", func(t *testing.T) {
+	t.Run("with password defaults to WPA2", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "")
 		// ctrl_interface is REQUIRED for wpa_cli to communicate with wpa_supplicant
 		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="password"`)
-		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK")
 		assert.Contains(t, config, "ieee80211w=1")
 	})
 
-	t.Run("generates universal WPA2/WPA3 config with BSSID", func(t *testing.T) {
+	t.Run("WPA2 config with BSSID", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "aa:bb:cc:dd:ee:ff")
-		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK")
 		assert.Contains(t, config, "ieee80211w=1")
 		assert.Contains(t, config, "bssid=aa:bb:cc:dd:ee:ff")
 	})
@@ -668,6 +756,57 @@ func TestGenerateWPAConfig(t *testing.T) {
 			config := manager.generateWPAConfig("TestSSID", "password", invalidBSSID)
 			assert.NotContains(t, config, "bssid=", "invalid BSSID %q should be rejected", invalidBSSID)
 		}
+	})
+}
+
+func TestGenerateWPAConfigSecurityAware(t *testing.T) {
+	manager := &Manager{logger: &mockLogger{}}
+
+	t.Run("WPA3-only uses SAE key_mgmt and required PMF", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "", "WPA3")
+		assert.Contains(t, config, "key_mgmt=SAE")
+		assert.NotContains(t, config, "WPA-PSK")
+		assert.Contains(t, config, "ieee80211w=2")
+		assert.Contains(t, config, `sae_password="password"`)
+		assert.NotContains(t, config, "psk=")
+	})
+
+	t.Run("WPA2/WPA3 transition uses both key_mgmt and sae_password", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "", "WPA2/WPA3")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
+		assert.Contains(t, config, "ieee80211w=1")
+		assert.Contains(t, config, `psk="password"`)
+		assert.Contains(t, config, `sae_password="password"`)
+	})
+
+	t.Run("WPA2-only uses WPA-PSK only", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "", "WPA2")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK")
+		assert.NotContains(t, config, "SAE")
+		assert.Contains(t, config, "ieee80211w=1")
+		assert.Contains(t, config, `psk="password"`)
+		assert.NotContains(t, config, "sae_password=")
+	})
+
+	t.Run("empty security defaults to WPA2 behavior", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "", "")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK")
+		assert.Contains(t, config, "ieee80211w=1")
+		assert.Contains(t, config, `psk="password"`)
+		assert.NotContains(t, config, "sae_password=")
+	})
+
+	t.Run("WPA3 with BSSID pinning", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", "password", "aa:bb:cc:dd:ee:ff", "WPA3")
+		assert.Contains(t, config, "key_mgmt=SAE")
+		assert.Contains(t, config, "ieee80211w=2")
+		assert.Contains(t, config, `sae_password="password"`)
+		assert.Contains(t, config, "bssid=aa:bb:cc:dd:ee:ff")
+	})
+
+	t.Run("WPA3 escapes special characters in sae_password", func(t *testing.T) {
+		config := manager.generateWPAConfig("TestSSID", `pass"word\special`, "", "WPA3")
+		assert.Contains(t, config, `sae_password="pass\"word\\special"`)
 	})
 }
 
@@ -1216,4 +1355,86 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 		// "pkill -9 -f wpa_supplicant" or "pkill -9 -f dhclient"
 		// which would kill processes on other interfaces
 	})
+}
+
+func TestWaitForAssociationPollingDetectsCrash(t *testing.T) {
+	t.Run("returns error after consecutive wpa_cli failures", func(t *testing.T) {
+		// Simulate wpa_supplicant crash: all wpa_cli calls fail
+		executor := &mockSystemExecutor{
+			commands: map[string]string{},
+			errors: map[string]error{
+				"wpa_cli -i wlan0 status":                                                                                              fmt.Errorf("Failed to connect to non-global ctrl_ifname: wlan0"),
+				"wpa_cli -i wlan0 wait_event CTRL-EVENT-CONNECTED CTRL-EVENT-ASSOC-REJECT CTRL-EVENT-DISCONNECTED CTRL-EVENT-TEMP-DISABLED CTRL-EVENT-AUTH-REJECT": fmt.Errorf("Failed to connect to non-global ctrl_ifname: wlan0"),
+			},
+		}
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+		manager.associationTimeout = 5 * time.Second
+
+		err := manager.waitForAssociation("TestSSID")
+
+		assert.Error(t, err)
+		// Should detect crash quickly, not wait the full 5s timeout
+		assert.Contains(t, err.Error(), "wpa_supplicant")
+		// Should NOT contain "timeout" — it should detect the crash before timeout
+		assert.NotContains(t, err.Error(), "timeout")
+	})
+
+	t.Run("does not false-positive on transient wpa_cli failure", func(t *testing.T) {
+		// First few wpa_cli calls fail, then succeeds — should not report crash
+		callNum := 0
+		executor := &countingExecutor{
+			mockSystemExecutor: mockSystemExecutor{
+				commands: map[string]string{},
+			},
+			statusFunc: func(n int) (string, error) {
+				if n < 2 {
+					return "", fmt.Errorf("temporarily unavailable")
+				}
+				return "wpa_state=COMPLETED\nssid=TestSSID", nil
+			},
+		}
+		_ = callNum
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+		manager.associationTimeout = 5 * time.Second
+
+		err := manager.waitForAssociation("TestSSID")
+
+		assert.NoError(t, err)
+	})
+}
+
+// countingExecutor tracks call counts per command for fine-grained control
+type countingExecutor struct {
+	mockSystemExecutor
+	statusFunc func(callNum int) (string, error)
+	statusCalls int
+}
+
+func (c *countingExecutor) Execute(cmd string, args ...string) (string, error) {
+	fullCmd := cmd
+	for _, arg := range args {
+		fullCmd += " " + arg
+	}
+	if fullCmd == "wpa_cli -i wlan0 status" && c.statusFunc != nil {
+		n := c.statusCalls
+		c.statusCalls++
+		return c.statusFunc(n)
+	}
+	return c.mockSystemExecutor.Execute(cmd, args...)
+}
+
+func (c *countingExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
+	fullCmd := cmd
+	for _, arg := range args {
+		fullCmd += " " + arg
+	}
+	if fullCmd == "wpa_cli -i wlan0 status" && c.statusFunc != nil {
+		n := c.statusCalls
+		c.statusCalls++
+		return c.statusFunc(n)
+	}
+	// For wait_event, use the error map
+	return c.mockSystemExecutor.Execute(cmd, args...)
 }

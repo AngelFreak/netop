@@ -118,13 +118,17 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 		_ = m.Disconnect()
 	}
 
-	// Skip scan verification - wpa_supplicant will fail quickly if network is not in range
-	// This saves 2-3 seconds on every connection
+	// Detect AP security type from cached scan results to generate the correct
+	// wpa_supplicant config (WPA3 needs SAE key_mgmt and required PMF)
+	security := m.detectNetworkSecurity(ssid)
+	if security != "" {
+		m.logger.Debug("Detected AP security type", "ssid", ssid, "security", security)
+	}
 
 	// Create wpa_supplicant config with optional BSSID pinning
-	config := m.generateWPAConfig(ssid, password, bssid)
+	config := m.generateWPAConfig(ssid, password, bssid, security)
 	// Don't log config - it contains credentials
-	m.logger.Debug("Generated WPA config", "ssid", ssid, "hasBSSID", bssid != "")
+	m.logger.Debug("Generated WPA config", "ssid", ssid, "hasBSSID", bssid != "", "security", security)
 
 	// Write config to temp file in secure runtime directory
 	tempConfig := types.RuntimeDir + "/wpa_supplicant.conf"
@@ -176,6 +180,9 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	if err != nil {
 		// Clean up wpa_supplicant on failure (interface-specific)
 		m.terminateWpaSupplicant()
+		if security == "WPA3" && strings.Contains(err.Error(), "crashed") {
+			return fmt.Errorf("WPA3 (SAE) connection failed — wpa_supplicant crashed. Your wpa_supplicant may not support SAE. Check with: wpa_supplicant -h 2>&1 | grep SAE")
+		}
 		return fmt.Errorf("failed to associate with access point: %w", err)
 	}
 
@@ -402,7 +409,29 @@ func isValidBSSID(bssid string) bool {
 	return validBSSIDRegex.MatchString(bssid)
 }
 
-func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string {
+// detectNetworkSecurity does a quick scan dump to determine the security type
+// of a given SSID. Returns "WPA3", "WPA2/WPA3", "WPA2", or "" if not found.
+func (m *Manager) detectNetworkSecurity(ssid string) string {
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "iw", m.iface, "scan", "dump")
+	if err != nil {
+		m.logger.Debug("Scan dump failed during security detection", "error", err)
+		return ""
+	}
+	networks, err := m.parseScanResults(output)
+	if err != nil {
+		m.logger.Debug("Failed to parse scan results for security detection", "error", err)
+		return ""
+	}
+	for _, net := range networks {
+		if net.SSID == ssid {
+			return net.Security
+		}
+	}
+	m.logger.Debug("SSID not found in scan results", "ssid", ssid)
+	return ""
+}
+
+func (m *Manager) generateWPAConfig(ssid, password string, bssid string, security ...string) string {
 	// Escape SSID and password to prevent injection
 	escapedSSID := escapeWPAString(ssid)
 
@@ -430,16 +459,38 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 		return config
 	}
 
-	// WPA2/WPA3 universal network config
-	// key_mgmt=WPA-PSK SAE lets wpa_supplicant negotiate the best protocol
-	// psk serves as fallback for SAE when sae_password is not set
-	// ieee80211w=1 enables optional PMF (required for WPA3, optional for WPA2)
 	escapedPassword := escapeWPAString(password)
-	config := header + fmt.Sprintf(`network={
+	sec := ""
+	if len(security) > 0 {
+		sec = security[0]
+	}
+
+	var config string
+	switch sec {
+	case "WPA3":
+		// WPA3-only: SAE authentication with required PMF
+		config = header + fmt.Sprintf(`network={
+	ssid="%s"
+	sae_password="%s"
+	key_mgmt=SAE
+	ieee80211w=2`, escapedSSID, escapedPassword)
+	case "WPA2/WPA3":
+		// Transition mode: both WPA-PSK and SAE with optional PMF
+		config = header + fmt.Sprintf(`network={
 	ssid="%s"
 	psk="%s"
+	sae_password="%s"
 	key_mgmt=WPA-PSK SAE
+	ieee80211w=1`, escapedSSID, escapedPassword, escapedPassword)
+	default:
+		// WPA2 or unknown: WPA-PSK with optional PMF
+		config = header + fmt.Sprintf(`network={
+	ssid="%s"
+	psk="%s"
+	key_mgmt=WPA-PSK
 	ieee80211w=1`, escapedSSID, escapedPassword)
+	}
+
 	if validatedBSSID != "" {
 		config += fmt.Sprintf("\n\tbssid=%s", validatedBSSID)
 	}
@@ -618,26 +669,38 @@ func (m *Manager) waitForAssociationPolling(expectedSSID string, timeout time.Du
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
+	const maxConsecutiveFailures = 5
+	consecutiveFailures := 0
+
 	for {
 		select {
 		case <-timeoutCh:
 			return fmt.Errorf("timeout waiting for association to %s", expectedSSID)
 		case <-ticker.C:
-			// Use wpa_cli status which is faster than iw link
-			if m.isAssociatedWpaCli(expectedSSID) {
+			associated, reachable := m.checkAssociationStatus(expectedSSID)
+			if associated {
 				m.logger.Debug("Successfully associated with access point", "ssid", expectedSSID)
 				return nil
+			}
+			if !reachable {
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("wpa_supplicant crashed or is unreachable (control socket disappeared)")
+				}
+			} else {
+				consecutiveFailures = 0
 			}
 		}
 	}
 }
 
-// isAssociatedWpaCli checks association status using wpa_cli (faster than iw)
-func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
-	// Use 2s timeout - wpa_cli typically responds in <100ms
+// checkAssociationStatus returns (associated, wpaSupplicantReachable).
+// associated is true when the SSID matches and wpa_state=COMPLETED.
+// wpaSupplicantReachable is true when wpa_cli can communicate with wpa_supplicant.
+func (m *Manager) checkAssociationStatus(expectedSSID string) (bool, bool) {
 	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "status")
 	if err != nil {
-		return false
+		return false, false
 	}
 
 	var ssidMatch, stateCompleted bool
@@ -652,7 +715,13 @@ func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
 		}
 	}
 
-	return ssidMatch && stateCompleted
+	return ssidMatch && stateCompleted, true
+}
+
+// isAssociatedWpaCli checks association status using wpa_cli (faster than iw)
+func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
+	associated, _ := m.checkAssociationStatus(expectedSSID)
+	return associated
 }
 
 func (m *Manager) hasValidIP() bool {
