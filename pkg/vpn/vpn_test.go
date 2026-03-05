@@ -81,6 +81,84 @@ func (m *mockSystemExecutor) assertCommandExecuted(t *testing.T, cmd string) {
 	t.Errorf("expected command %q to be executed, but it wasn't. Executed commands: %v", cmd, m.executedCommands)
 }
 
+// assertCommandNotExecuted verifies a command was NOT executed
+func (m *mockSystemExecutor) assertCommandNotExecuted(t *testing.T, cmd string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, executed := range m.executedCommands {
+		if executed == cmd {
+			t.Errorf("expected command %q to NOT be executed, but it was", cmd)
+			return
+		}
+	}
+}
+
+// sequencingExecutor returns different results for successive calls to the same command
+type sequencingExecutor struct {
+	mockSystemExecutor
+	callSequence map[string][]struct {
+		output string
+		err    error
+	}
+	callIndex map[string]int
+}
+
+func (s *sequencingExecutor) Execute(cmd string, args ...string) (string, error) {
+	fullCmd := cmd
+	for _, arg := range args {
+		fullCmd += " " + arg
+	}
+
+	s.mu.Lock()
+	s.executedCommands = append(s.executedCommands, fullCmd)
+
+	if seq, ok := s.callSequence[fullCmd]; ok {
+		if s.callIndex == nil {
+			s.callIndex = make(map[string]int)
+		}
+		idx := s.callIndex[fullCmd]
+		if idx < len(seq) {
+			s.callIndex[fullCmd] = idx + 1
+			s.mu.Unlock()
+			return seq[idx].output, seq[idx].err
+		}
+	}
+
+	// Fall through to base mock for non-sequenced commands
+	// Check for errors first
+	if err, hasErr := s.errors[fullCmd]; hasErr {
+		output := ""
+		if val, ok := s.commands[fullCmd]; ok {
+			output = val
+		}
+		s.mu.Unlock()
+		return output, err
+	}
+
+	if output, ok := s.commands[fullCmd]; ok {
+		s.mu.Unlock()
+		return output, nil
+	}
+	s.mu.Unlock()
+	return "mock output", nil
+}
+
+func (s *sequencingExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
+	return s.Execute(cmd, args...)
+}
+
+func (s *sequencingExecutor) ExecuteContext(ctx context.Context, cmd string, args ...string) (string, error) {
+	return s.Execute(cmd, args...)
+}
+
+func (s *sequencingExecutor) ExecuteWithInput(cmd string, input string, args ...string) (string, error) {
+	return s.mockSystemExecutor.ExecuteWithInput(cmd, input, args...)
+}
+
+func (s *sequencingExecutor) ExecuteWithInputContext(ctx context.Context, cmd string, input string, args ...string) (string, error) {
+	return s.mockSystemExecutor.ExecuteWithInputContext(ctx, cmd, input, args...)
+}
+
 type mockLogger struct{}
 
 func (m *mockLogger) Debug(msg string, fields ...interface{}) {}
@@ -590,15 +668,15 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("interface creation error (warning only)", func(t *testing.T) {
+	t.Run("interface creation error after cleanup retry", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"install -m 0600 /dev/stdin /run/net/wg.conf": "",
-				"wg setconf wg0 /run/net/wg.conf":             "",
-				"ip addr replace 10.0.0.1/24 dev wg0":         "",
-				"ip link set wg0 up":                          "",
+				"ip link delete wg0":                          "",
+				"rm -f /run/net/wg.conf":                      "",
 			},
 			errors: map[string]error{
+				// Both create attempts fail (mock returns same error each time)
 				"ip link add dev wg0 type wireguard": assert.AnError,
 			},
 		}
@@ -611,9 +689,12 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 			Address:   "10.0.0.1/24",
 		}
 
-		// Interface creation error is only a warning, not a fatal error
+		// When both create attempts fail, it should return an error
 		err := manager.connectWireGuard(config)
-		assert.NoError(t, err)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to create WireGuard interface")
+		// Verify cleanup was attempted
+		executor.assertCommandExecuted(t, "ip link delete wg0")
 	})
 
 	t.Run("setconf error", func(t *testing.T) {
@@ -1115,4 +1196,77 @@ func TestDisconnect_ClearsActiveVPNStateFile(t *testing.T) {
 	// Verify state file was removed
 	_, err = os.Stat(activeVPNFile)
 	assert.True(t, os.IsNotExist(err), "active VPN state file should be removed after disconnect")
+}
+
+func TestConnectWireGuard_CleansUpStaleInterface(t *testing.T) {
+	t.Run("deletes and recreates interface when it already exists", func(t *testing.T) {
+		executor := &sequencingExecutor{
+			mockSystemExecutor: mockSystemExecutor{
+				commands: map[string]string{
+					"install -m 0600 /dev/stdin /run/net/wg.conf": "",
+					"ip link delete wg0":                          "",
+					"wg setconf wg0 /run/net/wg.conf":             "",
+					"rm -f /run/net/wg.conf":                      "",
+					"ip addr replace 10.0.0.1/24 dev wg0":         "",
+					"ip link set wg0 up":                          "",
+				},
+			},
+			callSequence: map[string][]struct {
+				output string
+				err    error
+			}{
+				"ip link add dev wg0 type wireguard": {
+					{output: "", err: fmt.Errorf("RTNETLINK answers: File exists")}, // first call fails
+					{output: "", err: nil}, // second call succeeds after cleanup
+				},
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, runtimeDir: types.RuntimeDir}
+
+		config := &types.VPNConfig{
+			Config:    "wireguard config",
+			Interface: "wg0",
+			Address:   "10.0.0.1/24",
+		}
+
+		err := manager.connectWireGuard(config)
+		assert.NoError(t, err)
+
+		// Verify cleanup was called between the two ip link add attempts
+		executor.assertCommandExecuted(t, "ip link delete wg0")
+	})
+
+	t.Run("returns error when recreate also fails", func(t *testing.T) {
+		executor := &sequencingExecutor{
+			mockSystemExecutor: mockSystemExecutor{
+				commands: map[string]string{
+					"install -m 0600 /dev/stdin /run/net/wg.conf": "",
+					"ip link delete wg0":                          "",
+					"rm -f /run/net/wg.conf":                      "",
+				},
+			},
+			callSequence: map[string][]struct {
+				output string
+				err    error
+			}{
+				"ip link add dev wg0 type wireguard": {
+					{output: "", err: fmt.Errorf("RTNETLINK answers: File exists")}, // first call fails
+					{output: "", err: fmt.Errorf("some other error")},               // second call also fails
+				},
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, runtimeDir: types.RuntimeDir}
+
+		config := &types.VPNConfig{
+			Config:    "wireguard config",
+			Interface: "wg0",
+			Address:   "10.0.0.1/24",
+		}
+
+		err := manager.connectWireGuard(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to create WireGuard interface")
+	})
 }

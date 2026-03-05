@@ -5,18 +5,21 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/angelfreak/net/pkg/types"
 )
 
 // dhcpManagerImpl implements the DHCPManager interface
 type dhcpManagerImpl struct {
-	executor       types.SystemExecutor
-	logger         types.Logger
-	dnsmasqPidFile string
+	executor        types.SystemExecutor
+	logger          types.Logger
+	dnsmasqPidFile  string
 	dnsmasqConfFile string
-	currentConfig  *types.DHCPServerConfig
+	leasesFile      string
+	currentConfig   *types.DHCPServerConfig
 }
 
 // NewDHCPManager creates a new DHCP server manager
@@ -26,6 +29,7 @@ func NewDHCPManager(executor types.SystemExecutor, logger types.Logger) types.DH
 		logger:          logger,
 		dnsmasqPidFile:  types.RuntimeDir + "/dnsmasq-dhcp.pid",
 		dnsmasqConfFile: types.RuntimeDir + "/dnsmasq-dhcp.conf",
+		leasesFile:      types.RuntimeDir + "/dnsmasq-dhcp.leases",
 	}
 }
 
@@ -104,8 +108,9 @@ func (d *dhcpManagerImpl) Stop() error {
 		}
 	}
 
-	// Clean up configuration file
+	// Clean up configuration and lease files
 	os.Remove(d.dnsmasqConfFile)
+	os.Remove(d.leasesFile)
 
 	d.currentConfig = nil
 	d.logger.Info("DHCP server stopped successfully")
@@ -115,6 +120,54 @@ func (d *dhcpManagerImpl) Stop() error {
 // IsRunning checks if the DHCP server is currently running
 func (d *dhcpManagerImpl) IsRunning() bool {
 	return d.dnsmasqRunning()
+}
+
+// GetCurrentConfig returns the current DHCP server configuration, or nil if not running
+func (d *dhcpManagerImpl) GetCurrentConfig() *types.DHCPServerConfig {
+	return d.currentConfig
+}
+
+// GetLeases reads and parses the dnsmasq lease file.
+// Each line has format: expiry mac ip hostname clientid
+func (d *dhcpManagerImpl) GetLeases() ([]types.DHCPLease, error) {
+	data, err := os.ReadFile(d.leasesFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read lease file: %w", err)
+	}
+
+	var leases []types.DHCPLease
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		expirySec, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		hostname := fields[3]
+		if hostname == "*" {
+			hostname = ""
+		}
+
+		leases = append(leases, types.DHCPLease{
+			Expiry:   time.Unix(expirySec, 0),
+			MAC:      fields[1],
+			IP:       fields[2],
+			Hostname: hostname,
+		})
+	}
+
+	return leases, nil
 }
 
 // validateConfig validates the DHCP server configuration
@@ -166,7 +219,8 @@ func (d *dhcpManagerImpl) generateDnsmasqConfig(config *types.DHCPServerConfig) 
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("interface=%s\n", config.Interface))
-	sb.WriteString(fmt.Sprintf("bind-interfaces\n"))
+	sb.WriteString("bind-interfaces\n")
+	sb.WriteString(fmt.Sprintf("dhcp-leasefile=%s\n", d.leasesFile))
 
 	// Set lease time
 	leaseTime := config.LeaseTime
