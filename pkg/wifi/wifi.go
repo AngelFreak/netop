@@ -125,6 +125,11 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 		m.logger.Debug("Detected AP security type", "ssid", ssid, "security", security)
 	}
 
+	// Warn if AP requires encryption but no password was provided
+	if password == "" && (security == "WPA3" || security == "WPA2/WPA3" || security == "WPA2") {
+		m.logger.Warn("Network requires encryption but no password provided - check config file (YAML '#' starts a comment, quote passwords containing '#')", "ssid", ssid, "security", security)
+	}
+
 	// Create wpa_supplicant config with optional BSSID pinning
 	config := m.generateWPAConfig(ssid, password, bssid, security)
 	// Don't log config - it contains credentials
@@ -164,8 +169,9 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// Ensure wpa_supplicant control directory exists
 	_, _ = m.executor.Execute("mkdir", "-p", "/run/wpa_supplicant")
 
-	// Start wpa_supplicant with control interface for wpa_cli communication
-	_, err = m.executor.Execute("wpa_supplicant", "-B", "-i", m.iface, "-c", tempConfig, "-C", "/run/wpa_supplicant")
+	// Start wpa_supplicant — ctrl_interface is set in the config file,
+	// don't also pass -C which can conflict and cause crashes with SAE.
+	_, err = m.executor.Execute("wpa_supplicant", "-B", "-i", m.iface, "-c", tempConfig)
 	if err != nil {
 		return fmt.Errorf("failed to start wpa_supplicant: %w", err)
 	}
@@ -409,12 +415,28 @@ func isValidBSSID(bssid string) bool {
 	return validBSSIDRegex.MatchString(bssid)
 }
 
-// detectNetworkSecurity does a quick scan dump to determine the security type
-// of a given SSID. Returns "WPA3", "WPA2/WPA3", "WPA2", or "" if not found.
+// detectNetworkSecurity determines the security type of a given SSID.
+// Tries cached scan results first (fast), falls back to a fresh scan if
+// the cache is empty (e.g. after interface was cycled for MAC change).
+// Returns "WPA3", "WPA2/WPA3", "WPA2", or "" if not found.
 func (m *Manager) detectNetworkSecurity(ssid string) string {
-	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "iw", m.iface, "scan", "dump")
+	// Try cached results first (instant)
+	if sec := m.findSecurityInScan(ssid, "iw", m.iface, "scan", "dump"); sec != "" {
+		return sec
+	}
+
+	// Cache was empty or SSID not found — do a fresh scan.
+	// This happens when the interface was cycled (e.g. MAC change) before connect.
+	m.logger.Debug("Scan cache empty, running fresh scan for security detection")
+	return m.findSecurityInScan(ssid, "iw", m.iface, "scan")
+}
+
+// findSecurityInScan runs the given iw scan command and returns the security
+// type for the given SSID, or "" if not found.
+func (m *Manager) findSecurityInScan(ssid string, cmd ...string) string {
+	output, err := m.executor.ExecuteWithTimeout(10*time.Second, cmd[0], cmd[1:]...)
 	if err != nil {
-		m.logger.Debug("Scan dump failed during security detection", "error", err)
+		m.logger.Debug("Scan failed during security detection", "error", err)
 		return ""
 	}
 	networks, err := m.parseScanResults(output)
@@ -427,7 +449,6 @@ func (m *Manager) detectNetworkSecurity(ssid string) string {
 			return net.Security
 		}
 	}
-	m.logger.Debug("SSID not found in scan results", "ssid", ssid)
 	return ""
 }
 
@@ -445,13 +466,11 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 	}
 
 	// ctrl_interface is required for wpa_cli communication
-	header := "ctrl_interface=/run/wpa_supplicant\n\n"
+	header := "ctrl_interface=/run/wpa_supplicant\n"
 
 	if password == "" {
 		// Open network
-		config := header + fmt.Sprintf(`network={
-	ssid="%s"
-	key_mgmt=NONE`, escapedSSID)
+		config := header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tkey_mgmt=NONE", escapedSSID)
 		if validatedBSSID != "" {
 			config += fmt.Sprintf("\n\tbssid=%s", validatedBSSID)
 		}
@@ -465,30 +484,34 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 		sec = security[0]
 	}
 
+	// SAE (WPA3) needs sae_pwe in the global section for driver compatibility.
+	// sae_pwe=2 accepts both hunting-and-pecking and hash-to-element methods,
+	// which is the most compatible mode across APs (some iPhone hotspots
+	// only support hunting-and-pecking).
+	// Include for all password-protected networks since the default case also
+	// offers SAE when security type is unknown.
+	header += "sae_pwe=2\n"
+
 	var config string
 	switch sec {
 	case "WPA3":
-		// WPA3-only: SAE authentication with required PMF
-		config = header + fmt.Sprintf(`network={
-	ssid="%s"
-	sae_password="%s"
-	key_mgmt=SAE
-	ieee80211w=2`, escapedSSID, escapedPassword)
+		// WPA3-only: SAE authentication with required PMF.
+		// scan_ssid=1 triggers active probing — needed for iPhone hotspots
+		// which can behave like hidden networks when the hotspot screen isn't open.
+		// proto=RSN and pairwise=CCMP are required for SAE.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tsae_password=\"%s\"\n\tkey_mgmt=SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=2",
+			escapedSSID, escapedPassword)
 	case "WPA2/WPA3":
-		// Transition mode: both WPA-PSK and SAE with optional PMF
-		config = header + fmt.Sprintf(`network={
-	ssid="%s"
-	psk="%s"
-	sae_password="%s"
-	key_mgmt=WPA-PSK SAE
-	ieee80211w=1`, escapedSSID, escapedPassword, escapedPassword)
+		// Transition mode: WPA-PSK-SHA256 works better than WPA-PSK for
+		// mixed-mode APs that require management frame protection.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK-SHA256 SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=1",
+			escapedSSID, escapedPassword, escapedPassword)
 	default:
-		// WPA2 or unknown: WPA-PSK with optional PMF
-		config = header + fmt.Sprintf(`network={
-	ssid="%s"
-	psk="%s"
-	key_mgmt=WPA-PSK
-	ieee80211w=1`, escapedSSID, escapedPassword)
+		// WPA2 or unknown: offer both WPA-PSK and SAE so wpa_supplicant
+		// negotiates the right protocol regardless of AP security type.
+		// This handles the case where scan-based detection didn't find the AP.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK-SHA256 SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=1",
+			escapedSSID, escapedPassword, escapedPassword)
 	}
 
 	if validatedBSSID != "" {
@@ -569,14 +592,26 @@ func (m *Manager) killProcess(pattern string) {
 // terminateWpaSupplicant terminates wpa_supplicant for this interface only
 // Uses wpa_cli terminate for graceful shutdown, with pkill fallback
 func (m *Manager) terminateWpaSupplicant() {
-	// Try graceful termination via wpa_cli (interface-specific)
+	// Tell NetworkManager to stop managing this interface.
+	// This prevents NM from restarting wpa_supplicant after we kill it.
+	// Fails silently if nmcli is not installed (non-NM systems).
+	m.executor.ExecuteWithTimeout(2*time.Second, "nmcli", "device", "set", m.iface, "managed", "no")
+
+	// Try graceful termination via wpa_cli (interface-specific).
+	// This reaches both standalone and system (D-Bus) wpa_supplicant instances.
 	_, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "terminate")
 	if err != nil {
-		// Fallback to interface-specific pkill
-		// Pattern matches: wpa_supplicant ... -i <interface> ...
+		// Fallback: kill ALL wpa_supplicant processes.
+		// The system wpa_supplicant (started via -u -s for D-Bus) doesn't use
+		// -i flag, so interface-specific pkill won't match it.
+		// We must kill it to avoid nl80211 "Match already configured" conflicts
+		// that prevent our instance from creating its control socket.
 		m.executor.ExecuteWithTimeout(500*time.Millisecond,
-			"pkill", "-9", "-f", fmt.Sprintf("wpa_supplicant.*-i[[:space:]]+%s", m.iface))
+			"pkill", "-9", "wpa_supplicant")
 	}
+
+	// Give the process time to fully exit and release nl80211 resources
+	time.Sleep(500 * time.Millisecond)
 
 	// Remove stale control socket — after suspend/resume the old wpa_supplicant
 	// process is gone but its socket file remains, causing the new instance to

@@ -241,7 +241,7 @@ SSID: OtherSSID`,
 				// Reconnect commands
 				"ip link set wlan0 up":                              "",
 				"mkdir -p /run/wpa_supplicant":                      "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
 				"wpa_cli -i wlan0 status":                           "wpa_state=COMPLETED\nssid=TestSSID",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0":                         "",
@@ -265,7 +265,7 @@ SSID: OtherSSID`,
 				// Interface-specific wpa_supplicant termination
 				"wpa_cli -i wlan0 terminate": "",
 				"mkdir -p /run/wpa_supplicant": "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0":   "",
 				"pkill -9 -f dhclient.*wlan0":   "",
@@ -291,7 +291,7 @@ SSID: OtherSSID`,
 				// Interface-specific wpa_supplicant termination
 				"wpa_cli -i wlan0 terminate": "",
 				"mkdir -p /run/wpa_supplicant": "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
 				"wpa_cli -i wlan0 status": "wpa_state=SCANNING", // Never completes
 			},
 		}
@@ -318,7 +318,7 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 				"ip addr flush dev wlan0": "",
 				"ip route flush dev wlan0": "",
 				"mkdir -p /run/wpa_supplicant": "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf -C /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
 				"wpa_cli -i wlan0 status": "wpa_state=COMPLETED\nssid=TestSSID",
 			},
 		},
@@ -580,9 +580,7 @@ freq: 2412
 	})
 
 	t.Run("returns empty for unknown SSID", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+		scanData := `BSS aa:bb:cc:dd:ee:ff(on wlan0)
 SSID: OtherNetwork
 signal: -50.00
 freq: 2412
@@ -590,7 +588,11 @@ freq: 2412
 		 * Group cipher: CCMP
 		 * Pairwise ciphers: CCMP
 		 * Authentication suites: PSK
-`,
+`
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 scan dump": scanData,
+				"iw wlan0 scan":     scanData,
 			},
 		}
 		manager := &Manager{
@@ -607,6 +609,7 @@ freq: 2412
 			commands: map[string]string{},
 			errors: map[string]error{
 				"iw wlan0 scan dump": fmt.Errorf("scan failed"),
+				"iw wlan0 scan":     fmt.Errorf("scan failed"),
 			},
 		}
 		manager := &Manager{
@@ -617,24 +620,53 @@ freq: 2412
 		security := manager.detectNetworkSecurity("AnyNetwork")
 		assert.Equal(t, "", security)
 	})
+
+	t.Run("falls back to fresh scan when dump is empty", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"iw wlan0 scan dump": "",
+				"iw wlan0 scan": `BSS 7c:7b:ec:1a:75:7a(on wlan0)
+SSID: Lanso iPhone
+signal: -56.00
+freq: 5180
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: SAE
+		 * Capabilities: MFP-required MFP-capable (0x00cc)
+`,
+			},
+		}
+		manager := &Manager{
+			iface:    "wlan0",
+			executor: executor,
+			logger:   &mockLogger{},
+		}
+		security := manager.detectNetworkSecurity("Lanso iPhone")
+		assert.Equal(t, "WPA3", security)
+	})
 }
 
 func TestGenerateWPAConfig(t *testing.T) {
 	manager := &Manager{logger: &mockLogger{}}
 
-	t.Run("with password defaults to WPA2", func(t *testing.T) {
+	t.Run("with password defaults to transition mode", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "")
 		// ctrl_interface is REQUIRED for wpa_cli to communicate with wpa_supplicant
 		assert.Contains(t, config, "ctrl_interface=/run/wpa_supplicant", "ctrl_interface is required for wpa_cli communication")
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="password"`)
-		assert.Contains(t, config, "key_mgmt=WPA-PSK")
+		assert.Contains(t, config, `sae_password="password"`)
+		assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
 		assert.Contains(t, config, "ieee80211w=1")
+		assert.Contains(t, config, "scan_ssid=1")
+		assert.Contains(t, config, "proto=RSN")
+		assert.Contains(t, config, "pairwise=CCMP")
 	})
 
-	t.Run("WPA2 config with BSSID", func(t *testing.T) {
+	t.Run("config with BSSID defaults to transition mode", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "aa:bb:cc:dd:ee:ff")
-		assert.Contains(t, config, "key_mgmt=WPA-PSK")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
 		assert.Contains(t, config, "ieee80211w=1")
 		assert.Contains(t, config, "bssid=aa:bb:cc:dd:ee:ff")
 	})
@@ -769,31 +801,36 @@ func TestGenerateWPAConfigSecurityAware(t *testing.T) {
 		assert.Contains(t, config, "ieee80211w=2")
 		assert.Contains(t, config, `sae_password="password"`)
 		assert.NotContains(t, config, "psk=")
+		assert.Contains(t, config, "sae_pwe=2")
+		assert.Contains(t, config, "scan_ssid=1")
+		assert.Contains(t, config, "proto=RSN")
+		assert.Contains(t, config, "pairwise=CCMP")
+		assert.Contains(t, config, "group=CCMP")
 	})
 
-	t.Run("WPA2/WPA3 transition uses both key_mgmt and sae_password", func(t *testing.T) {
+	t.Run("WPA2/WPA3 transition uses SHA256 key_mgmt and sae_password", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "", "WPA2/WPA3")
-		assert.Contains(t, config, "key_mgmt=WPA-PSK SAE")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
 		assert.Contains(t, config, "ieee80211w=1")
 		assert.Contains(t, config, `psk="password"`)
 		assert.Contains(t, config, `sae_password="password"`)
+		assert.Contains(t, config, "sae_pwe=2")
+		assert.Contains(t, config, "scan_ssid=1")
+		assert.Contains(t, config, "proto=RSN")
+		assert.Contains(t, config, "pairwise=CCMP")
 	})
 
-	t.Run("WPA2-only uses WPA-PSK only", func(t *testing.T) {
-		config := manager.generateWPAConfig("TestSSID", "password", "", "WPA2")
-		assert.Contains(t, config, "key_mgmt=WPA-PSK")
-		assert.NotContains(t, config, "SAE")
-		assert.Contains(t, config, "ieee80211w=1")
-		assert.Contains(t, config, `psk="password"`)
-		assert.NotContains(t, config, "sae_password=")
-	})
-
-	t.Run("empty security defaults to WPA2 behavior", func(t *testing.T) {
-		config := manager.generateWPAConfig("TestSSID", "password", "", "")
-		assert.Contains(t, config, "key_mgmt=WPA-PSK")
-		assert.Contains(t, config, "ieee80211w=1")
-		assert.Contains(t, config, `psk="password"`)
-		assert.NotContains(t, config, "sae_password=")
+	t.Run("WPA2 or unknown defaults to transition mode for compatibility", func(t *testing.T) {
+		for _, sec := range []string{"WPA2", ""} {
+			config := manager.generateWPAConfig("TestSSID", "password", "", sec)
+			assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
+			assert.Contains(t, config, "ieee80211w=1")
+			assert.Contains(t, config, `psk="password"`)
+			assert.Contains(t, config, `sae_password="password"`)
+			assert.Contains(t, config, "sae_pwe=2")
+			assert.Contains(t, config, "scan_ssid=1")
+			assert.Contains(t, config, "proto=RSN")
+		}
 	})
 
 	t.Run("WPA3 with BSSID pinning", func(t *testing.T) {
@@ -1245,8 +1282,8 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("fallback to pkill when wpa_cli fails", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pkill -9 -f wpa_supplicant.*-i[[:space:]]+wlan0": "",
-				"rm -f /run/wpa_supplicant/wlan0":                 "",
+				"pkill -9 wpa_supplicant":      "",
+				"rm -f /run/wpa_supplicant/wlan0": "",
 			},
 			errors: map[string]error{
 				"wpa_cli -i wlan0 terminate": assert.AnError,
@@ -1255,7 +1292,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
 
-		// Should not panic, falls back to pkill
+		// Should not panic, falls back to killing all wpa_supplicant processes
 		manager.terminateWpaSupplicant()
 	})
 
@@ -1272,11 +1309,11 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 		manager.terminateWpaSupplicant()
 	})
 
-	t.Run("uses correct interface pattern in pkill fallback", func(t *testing.T) {
+	t.Run("kills all wpa_supplicant in pkill fallback", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pkill -9 -f wpa_supplicant.*-i[[:space:]]+wlp2s0": "",
-				"rm -f /run/wpa_supplicant/wlp2s0":                 "",
+				"pkill -9 wpa_supplicant":       "",
+				"rm -f /run/wpa_supplicant/wlp2s0": "",
 			},
 			errors: map[string]error{
 				"wpa_cli -i wlp2s0 terminate": assert.AnError,
@@ -1351,9 +1388,8 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 		err := manager.Disconnect()
 		assert.NoError(t, err)
 
-		// Note: The key verification is that we're NOT calling global
-		// "pkill -9 -f wpa_supplicant" or "pkill -9 -f dhclient"
-		// which would kill processes on other interfaces
+		// Note: dhclient termination is still interface-specific to avoid
+		// killing dhclient on other interfaces
 	})
 }
 
