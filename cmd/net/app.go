@@ -758,10 +758,31 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 		a.println("✓ DHCP server stopped successfully")
 
 	case "status":
-		if a.DHCPMgr.IsRunning() {
-			a.println("DHCP server is running")
-		} else {
+		if !a.DHCPMgr.IsRunning() {
 			a.println("DHCP server is not running")
+			return nil
+		}
+		a.println("DHCP server is running")
+		if cfg := a.DHCPMgr.GetCurrentConfig(); cfg != nil {
+			a.printf("  Interface: %s\n", cfg.Interface)
+			a.printf("  Gateway:   %s\n", cfg.Gateway)
+			a.printf("  IP Range:  %s\n", cfg.IPRange)
+		}
+		leases, err := a.DHCPMgr.GetLeases()
+		if err != nil {
+			a.Logger.Warn("Failed to read leases", "error", err)
+		}
+		if len(leases) == 0 {
+			a.println("\n(no active leases)")
+		} else {
+			a.printf("\n%-17s  %-15s  %-20s  %s\n", "MAC", "IP", "HOSTNAME", "EXPIRES")
+			for _, l := range leases {
+				hostname := l.Hostname
+				if hostname == "" {
+					hostname = "-"
+				}
+				a.printf("%-17s  %-15s  %-20s  %s\n", l.MAC, l.IP, hostname, l.Expiry.Format("2006-01-02 15:04"))
+			}
 		}
 
 	default:
