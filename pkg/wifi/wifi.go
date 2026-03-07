@@ -125,6 +125,11 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 		m.logger.Debug("Detected AP security type", "ssid", ssid, "security", security)
 	}
 
+	// Reject WEP networks - insecure and not supported
+	if security == "WEP" {
+		return fmt.Errorf("WEP networks are not supported: WEP encryption is broken and insecure, use WPA2 or WPA3 instead")
+	}
+
 	// Warn if AP requires encryption but no password was provided
 	if password == "" && (security == "WPA3" || security == "WPA2/WPA3" || security == "WPA2") {
 		m.logger.Warn("Network requires encryption but no password provided - check config file (YAML '#' starts a comment, quote passwords containing '#')", "ssid", ssid, "security", security)

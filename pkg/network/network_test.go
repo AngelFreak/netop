@@ -211,11 +211,8 @@ func TestSetDNS(t *testing.T) {
 
 	t.Run("valid servers writes resolv.conf with correct content", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		// Actual implementation: chattr -i, rm temp, tee temp, mv temp to dest, chattr +i
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -223,21 +220,17 @@ func TestSetDNS(t *testing.T) {
 		err := manager.SetDNS([]string{"8.8.8.8", "1.1.1.1"})
 		assert.NoError(t, err)
 
-		// Verify the correct content was written to temp file
 		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
-		executor.assertCommandExecuted(t, "tee /run/net/staging.conf")
-		executor.assertCommandExecuted(t, "mv /run/net/staging.conf /etc/resolv.conf")
+		executor.assertCommandExecuted(t, "tee /etc/resolv.conf")
 		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
-		executor.assertInputContains(t, "tee /run/net/staging.conf", "nameserver 8.8.8.8")
-		executor.assertInputContains(t, "tee /run/net/staging.conf", "nameserver 1.1.1.1")
+		executor.assertInputContains(t, "tee /etc/resolv.conf", "nameserver 8.8.8.8")
+		executor.assertInputContains(t, "tee /etc/resolv.conf", "nameserver 1.1.1.1")
 	})
 
 	t.Run("invalid IP addresses are filtered out", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -246,7 +239,7 @@ func TestSetDNS(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Only valid IP should be in output
-		input := executor.inputsReceived["tee /run/net/staging.conf"]
+		input := executor.inputsReceived["tee /etc/resolv.conf"]
 		assert.Contains(t, input, "nameserver 8.8.8.8")
 		assert.NotContains(t, input, "invalid")
 		assert.NotContains(t, input, "not-an-ip")
@@ -255,9 +248,7 @@ func TestSetDNS(t *testing.T) {
 	t.Run("all invalid IPs results in empty file", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -266,29 +257,14 @@ func TestSetDNS(t *testing.T) {
 		assert.NoError(t, err)
 
 		// File should be written but empty (no valid nameservers)
-		input := executor.inputsReceived["tee /run/net/staging.conf"]
+		input := executor.inputsReceived["tee /etc/resolv.conf"]
 		assert.NotContains(t, input, "nameserver")
 	})
 
 	t.Run("tee failure returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.errors["tee /run/net/staging.conf"] = fmt.Errorf("permission denied")
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
-
-		err := manager.SetDNS([]string{"8.8.8.8"})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to write resolv.conf")
-	})
-
-	t.Run("mv failure returns error", func(t *testing.T) {
-		executor := newStrictMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.errors["mv /run/net/staging.conf /etc/resolv.conf"] = fmt.Errorf("permission denied")
+		executor.errors["tee /etc/resolv.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -1019,9 +995,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -1041,14 +1015,14 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
 				unlockCalled = true
 			}
-			if strings.Contains(cmd, "mv") && strings.Contains(cmd, "resolv.conf") {
+			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
 				clearCalled = true
 			}
 		}
 		assert.True(t, unlockCalled, "should unlock resolv.conf for DHCP DNS")
 		assert.True(t, clearCalled, "should clear resolv.conf before DHCP runs")
 		// Verify the placeholder content was written
-		assert.Contains(t, executor.inputsReceived["tee /run/net/staging.conf"], "Waiting for DHCP")
+		assert.Contains(t, executor.inputsReceived["tee /etc/resolv.conf"], "Waiting for DHCP")
 	})
 
 	t.Run("auto-detect interface falls back when detection finds nothing", func(t *testing.T) {
@@ -1113,9 +1087,7 @@ func TestClearDNS(t *testing.T) {
 	t.Run("success - removes immutable attribute", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -1127,9 +1099,7 @@ func TestClearDNS(t *testing.T) {
 	t.Run("chattr fails but continues - file not locked", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
