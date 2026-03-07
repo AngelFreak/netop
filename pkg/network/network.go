@@ -54,21 +54,19 @@ func (m *Manager) SetDNS(servers []string) error {
 		}
 	}
 
-	// Use chattr to make file immutable temporarily
-	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-	if err != nil {
-		m.logger.Warn("Failed to remove immutable flag from resolv.conf", "error", err)
+	if err := m.unlockResolvConf(); err != nil {
+		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
-	err = m.writeFile("/etc/resolv.conf", resolvConf.String())
+	err := m.writeFileDirect("/etc/resolv.conf", resolvConf.String())
 	if err != nil {
 		return fmt.Errorf("failed to write resolv.conf: %w", err)
 	}
 
-	// Make immutable again
+	// Lock to prevent other tools (dhclient, netbird) from overwriting
 	_, err = m.executor.Execute("chattr", "+i", "/etc/resolv.conf")
 	if err != nil {
-		m.logger.Warn("Failed to set immutable flag on resolv.conf", "error", err)
+		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
 
 	return nil
@@ -78,20 +76,26 @@ func (m *Manager) SetDNS(servers []string) error {
 func (m *Manager) ClearDNS() error {
 	m.logger.Debug("Clearing DNS configuration")
 
-	// Remove immutable flag if set
-	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-	if err != nil {
-		m.logger.Debug("Failed to remove immutable flag from resolv.conf", "error", err)
+	if err := m.unlockResolvConf(); err != nil {
+		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
 	// Clear the file by writing an empty configuration
-	err = m.writeFile("/etc/resolv.conf", "# DNS cleared by net\n")
+	err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n")
 	if err != nil {
 		return fmt.Errorf("failed to clear resolv.conf: %w", err)
 	}
 
 	m.logger.Debug("DNS configuration cleared")
 	return nil
+}
+
+// unlockResolvConf removes the immutable flag from /etc/resolv.conf.
+// VPN clients like netbird set this flag and may leave it after disconnecting,
+// which prevents DHCP or net from updating DNS.
+func (m *Manager) unlockResolvConf() error {
+	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
+	return err
 }
 
 // SetMAC sets the MAC address for an interface
@@ -558,15 +562,14 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 	useDHCPForDNS := config.DNS == nil || len(config.DNS) == 0 || (len(config.DNS) == 1 && config.DNS[0] == "dhcp")
 	if useDHCPForDNS {
 		m.logger.Debug("Clearing resolv.conf for DHCP DNS")
-		_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-		if err != nil {
-			m.logger.Debug("Failed to unlock resolv.conf (may not be locked)", "error", err)
+		if err := m.unlockResolvConf(); err != nil {
+			m.logger.Warn("Failed to unlock resolv.conf, DHCP may not be able to set DNS", "error", err)
 		}
 		// Clear stale DNS entries so DHCP client can write fresh ones.
 		// Without this, resolv.conf may retain DNS from a previous connection
-		// (set via SetDNS with chattr +i), and the DHCP client may not overwrite it.
-		if err := m.writeFile("/etc/resolv.conf", "# Waiting for DHCP\n"); err != nil {
-			m.logger.Debug("Failed to clear resolv.conf", "error", err)
+		// (set via SetDNS with chattr +i), or from a VPN client like netbird.
+		if err := m.writeFileDirect("/etc/resolv.conf", "# Waiting for DHCP\n"); err != nil {
+			m.logger.Warn("Failed to clear resolv.conf", "error", err)
 		}
 	}
 
