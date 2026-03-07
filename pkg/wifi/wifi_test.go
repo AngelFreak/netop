@@ -305,6 +305,26 @@ SSID: OtherSSID`,
 	})
 }
 
+func TestConnectRejectsWEP(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"iw wlan0 link": "Not connected",
+			"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
+SSID: WEPNetwork
+signal: -50.00
+freq: 2412
+	WEP:
+`,
+		},
+	}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+
+	err := manager.Connect("WEPNetwork", "password", "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "WEP networks are not supported")
+}
+
 func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	// After suspend/resume, wpa_supplicant is dead so getCurrentSSID() returns empty.
 	// The full Disconnect() cleanup is skipped, but stale IPs and routes remain
