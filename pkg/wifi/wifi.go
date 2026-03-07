@@ -507,10 +507,12 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK-SHA256 SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=1",
 			escapedSSID, escapedPassword, escapedPassword)
 	default:
-		// WPA2 or unknown: offer both WPA-PSK and SAE so wpa_supplicant
-		// negotiates the right protocol regardless of AP security type.
-		// This handles the case where scan-based detection didn't find the AP.
-		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK-SHA256 SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=1",
+		// WPA2 or unknown: offer WPA-PSK first (most compatible), then
+		// WPA-PSK-SHA256 and SAE for transition/WPA3 APs.
+		// WPA-PSK must be listed so pure WPA2 APs (which only advertise PSK)
+		// can negotiate successfully.
+		// ieee80211w=1 (optional PMF) allows both PMF and non-PMF APs.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK WPA-PSK-SHA256 SAE\n\tproto=RSN WPA\n\tpairwise=CCMP TKIP\n\tgroup=CCMP TKIP\n\tieee80211w=1",
 			escapedSSID, escapedPassword, escapedPassword)
 	}
 

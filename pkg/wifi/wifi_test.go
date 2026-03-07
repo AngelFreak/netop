@@ -657,16 +657,16 @@ func TestGenerateWPAConfig(t *testing.T) {
 		assert.Contains(t, config, `ssid="TestSSID"`)
 		assert.Contains(t, config, `psk="password"`)
 		assert.Contains(t, config, `sae_password="password"`)
-		assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK WPA-PSK-SHA256 SAE")
 		assert.Contains(t, config, "ieee80211w=1")
 		assert.Contains(t, config, "scan_ssid=1")
-		assert.Contains(t, config, "proto=RSN")
-		assert.Contains(t, config, "pairwise=CCMP")
+		assert.Contains(t, config, "proto=RSN WPA")
+		assert.Contains(t, config, "pairwise=CCMP TKIP")
 	})
 
 	t.Run("config with BSSID defaults to transition mode", func(t *testing.T) {
 		config := manager.generateWPAConfig("TestSSID", "password", "aa:bb:cc:dd:ee:ff")
-		assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
+		assert.Contains(t, config, "key_mgmt=WPA-PSK WPA-PSK-SHA256 SAE")
 		assert.Contains(t, config, "ieee80211w=1")
 		assert.Contains(t, config, "bssid=aa:bb:cc:dd:ee:ff")
 	})
@@ -820,16 +820,16 @@ func TestGenerateWPAConfigSecurityAware(t *testing.T) {
 		assert.Contains(t, config, "pairwise=CCMP")
 	})
 
-	t.Run("WPA2 or unknown defaults to transition mode for compatibility", func(t *testing.T) {
+	t.Run("WPA2 or unknown defaults to universal mode for compatibility", func(t *testing.T) {
 		for _, sec := range []string{"WPA2", ""} {
 			config := manager.generateWPAConfig("TestSSID", "password", "", sec)
-			assert.Contains(t, config, "key_mgmt=WPA-PSK-SHA256 SAE")
+			assert.Contains(t, config, "key_mgmt=WPA-PSK WPA-PSK-SHA256 SAE")
 			assert.Contains(t, config, "ieee80211w=1")
 			assert.Contains(t, config, `psk="password"`)
 			assert.Contains(t, config, `sae_password="password"`)
 			assert.Contains(t, config, "sae_pwe=2")
 			assert.Contains(t, config, "scan_ssid=1")
-			assert.Contains(t, config, "proto=RSN")
+			assert.Contains(t, config, "proto=RSN WPA")
 		}
 	})
 
