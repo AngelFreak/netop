@@ -90,6 +90,14 @@ func (m *Manager) ClearDNS() error {
 	return nil
 }
 
+// LockDNS sets the immutable flag on /etc/resolv.conf to prevent external
+// tools (like netbird) from overwriting DNS configuration.
+func (m *Manager) LockDNS() {
+	if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
+		m.logger.Warn("Failed to lock resolv.conf", "error", err)
+	}
+}
+
 // unlockResolvConf removes the immutable flag from /etc/resolv.conf.
 // VPN clients like netbird set this flag and may leave it after disconnecting,
 // which prevents DHCP or net from updating DNS.
@@ -672,6 +680,19 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			if err != nil {
 				m.logger.Warn("Failed to set DNS", "error", err)
 			}
+		}
+	}
+
+	// Lock resolv.conf after DHCP-provided DNS is written.
+	// External tools like netbird actively rewrite resolv.conf with their own
+	// DNS servers. If netbird is still connected when switching WiFi, it will
+	// overwrite the DHCP-provided DNS, breaking internet connectivity.
+	// Custom DNS is already locked by SetDNS(), so only lock here for DHCP DNS.
+	if useDHCPForDNS {
+		if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
+			m.logger.Warn("Failed to lock resolv.conf after DHCP DNS", "error", err)
+		} else {
+			m.logger.Debug("Locked resolv.conf to prevent external DNS overwrite")
 		}
 	}
 

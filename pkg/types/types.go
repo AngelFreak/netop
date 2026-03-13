@@ -198,6 +198,7 @@ type VPNManager interface {
 type NetworkManager interface {
 	SetDNS(servers []string) error
 	ClearDNS() error
+	LockDNS()
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
 	SetIP(iface, addr, gateway string) error

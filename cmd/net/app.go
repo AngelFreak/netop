@@ -195,6 +195,10 @@ func (a *App) RunConnect(name, password string) error {
 		// Not configured, treat as SSID
 		a.Logger.Debug("Network config not found, treating as direct SSID", "name", name, "error", err)
 		a.Logger.Info("Connecting to SSID", "ssid", name)
+
+		// Flush stale DNS before DHCP so external tools (netbird) don't retain their DNS
+		a.NetworkMgr.ClearDNS()
+
 		a.progress("Connecting to WiFi...\n")
 		err = a.WiFiMgr.Connect(name, password, "")
 		if err != nil {
@@ -203,6 +207,10 @@ func (a *App) RunConnect(name, password string) error {
 			return err
 		}
 		connectedIface = a.WiFiMgr.GetInterface()
+
+		// Lock resolv.conf after DHCP writes DNS to prevent external tools
+		// (like netbird) from overwriting with their own DNS servers
+		a.NetworkMgr.LockDNS()
 	} else {
 		// Use configured network - merge with common settings first
 		networkConfig = a.ConfigMgr.MergeWithCommon(name, networkConfig)
