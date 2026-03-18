@@ -824,3 +824,24 @@ func TestWarnAboutPlainTextCredentials(t *testing.T) {
 		manager.WarnAboutPlainTextCredentials()
 	})
 }
+
+func TestValidateConfig_TailscaleAndNetBirdFields(t *testing.T) {
+	raw := map[string]interface{}{
+		"vpn": map[string]interface{}{
+			"my-tailscale": map[string]interface{}{
+				"type":          "tailscale",
+				"auth_key":      "tskey-auth-xxxxx",
+				"exit_node":     "us-east-1",
+				"accept_routes": true,
+			},
+			"my-netbird": map[string]interface{}{
+				"type":           "netbird",
+				"setup_key":      "XXXXXXXX",
+				"management_url": "https://api.netbird.io",
+			},
+		},
+	}
+
+	errors := validateRawConfig(raw)
+	assert.Empty(t, errors, "Tailscale and NetBird fields should be valid: %v", errors)
+}
