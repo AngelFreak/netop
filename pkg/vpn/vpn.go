@@ -82,6 +82,18 @@ func (m *Manager) Connect(name string) error {
 		if vpnIface == "" {
 			vpnIface = "wg0"
 		}
+	case "tailscale":
+		if !m.executor.HasCommand("tailscale") {
+			return fmt.Errorf("tailscale CLI not found. Install it: https://tailscale.com/download/linux")
+		}
+		connectErr = m.connectTailscale(config)
+		vpnIface = "tailscale0"
+	case "netbird":
+		if !m.executor.HasCommand("netbird") {
+			return fmt.Errorf("netbird CLI not found. Install it: https://docs.netbird.io/how-to/installation")
+		}
+		connectErr = m.connectNetBird(config)
+		vpnIface = "wt0"
 	default:
 		return fmt.Errorf("unsupported VPN type: %s", config.Type)
 	}
@@ -449,6 +461,45 @@ func (m *Manager) removeFile(path string) {
 	if err != nil {
 		m.logger.Debug("Failed to remove temp file", "path", path, "error", err)
 	}
+}
+
+// connectTailscale connects using the Tailscale CLI
+func (m *Manager) connectTailscale(config *types.VPNConfig) error {
+	m.logger.Info("Connecting to Tailscale")
+
+	// Build args: always disable DNS (netop manages resolv.conf)
+	args := []string{"up", "--accept-dns=false"}
+
+	if config.AuthKey != "" {
+		args = append(args, "--authkey="+config.AuthKey)
+	}
+	if config.ExitNode != "" {
+		args = append(args, "--exit-node="+config.ExitNode)
+	}
+	if config.AcceptRoutes {
+		args = append(args, "--accept-routes")
+	}
+
+	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", args...)
+	if err != nil {
+		return fmt.Errorf("failed to connect Tailscale: %w", err)
+	}
+
+	// Verify connection
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "tailscale", "status", "--json")
+	if err != nil {
+		m.logger.Warn("Could not verify Tailscale status", "error", err)
+	} else if !strings.Contains(output, "Running") {
+		m.logger.Warn("Tailscale may not be fully connected", "status", output)
+	}
+
+	m.logger.Info("Tailscale connected")
+	return nil
+}
+
+// connectNetBird is a placeholder for NetBird connect (implemented in Task 4)
+func (m *Manager) connectNetBird(config *types.VPNConfig) error {
+	return fmt.Errorf("netbird connect not yet implemented")
 }
 
 // connectOpenVPN connects to an OpenVPN server
