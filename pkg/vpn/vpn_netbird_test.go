@@ -101,6 +101,49 @@ func TestListVPNs_NetBirdRunning(t *testing.T) {
 	assert.Equal(t, "wt0", vpns[0].Interface)
 }
 
+func TestNetBird_ConnectDisconnectCycle(t *testing.T) {
+	tempDir := t.TempDir()
+
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":    "default via 192.168.1.1 dev eth0",
+			"netbird up --disable-dns": "",
+			"netbird status":           "Connected",
+			"netbird down":             "",
+			"ip route show":            "default via 192.168.1.1 dev eth0",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+	// Connect
+	err := manager.Connect("nb")
+	assert.NoError(t, err)
+
+	// Verify state file
+	state := manager.getActiveVPNState()
+	assert.NotNil(t, state)
+	assert.Equal(t, "nb", state.Name)
+	assert.Equal(t, "netbird", state.Type)
+	assert.Equal(t, "wt0", state.Interface)
+
+	// Disconnect
+	err = manager.Disconnect("nb")
+	assert.NoError(t, err)
+
+	// Verify state file cleared
+	state = manager.getActiveVPNState()
+	assert.Nil(t, state)
+
+	// Verify netbird down was called
+	executor.assertCommandExecuted(t, "netbird down")
+}
+
 func TestDisconnectNetBird_Tracked(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{

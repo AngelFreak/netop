@@ -164,6 +164,49 @@ func TestListVPNs_TailscaleNotRunning(t *testing.T) {
 	assert.False(t, vpns[0].Connected)
 }
 
+func TestTailscale_ConnectDisconnectCycle(t *testing.T) {
+	tempDir := t.TempDir()
+
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":           "default via 192.168.1.1 dev eth0",
+			"tailscale up --accept-dns=false": "",
+			"tailscale status --json":         `{"BackendState":"Running"}`,
+			"tailscale down":                  "",
+			"ip route show":                   "default via 192.168.1.1 dev eth0",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"ts": {Type: "tailscale"},
+		},
+	}
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+	// Connect
+	err := manager.Connect("ts")
+	assert.NoError(t, err)
+
+	// Verify state file
+	state := manager.getActiveVPNState()
+	assert.NotNil(t, state)
+	assert.Equal(t, "ts", state.Name)
+	assert.Equal(t, "tailscale", state.Type)
+	assert.Equal(t, "tailscale0", state.Interface)
+
+	// Disconnect
+	err = manager.Disconnect("ts")
+	assert.NoError(t, err)
+
+	// Verify state file cleared
+	state = manager.getActiveVPNState()
+	assert.Nil(t, state)
+
+	// Verify tailscale down was called
+	executor.assertCommandExecuted(t, "tailscale down")
+}
+
 func TestDisconnectTailscale_Tracked(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
