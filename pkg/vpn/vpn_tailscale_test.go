@@ -109,6 +109,7 @@ func TestConnectTailscale_WithAcceptRoutes(t *testing.T) {
 }
 
 func TestListVPNs_TailscaleRunning(t *testing.T) {
+	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			"pgrep -f openvpn":            "",
@@ -127,7 +128,7 @@ func TestListVPNs_TailscaleRunning(t *testing.T) {
 			"my-ts": {Type: "tailscale"},
 		},
 	}
-	manager := NewManager(executor, logger, configMgr)
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
 
 	vpns, err := manager.ListVPNs()
 	assert.NoError(t, err)
@@ -138,6 +139,7 @@ func TestListVPNs_TailscaleRunning(t *testing.T) {
 }
 
 func TestListVPNs_TailscaleNotRunning(t *testing.T) {
+	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			"pgrep -f openvpn":            "",
@@ -156,7 +158,7 @@ func TestListVPNs_TailscaleNotRunning(t *testing.T) {
 			"my-ts": {Type: "tailscale"},
 		},
 	}
-	manager := NewManager(executor, logger, configMgr)
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
 
 	vpns, err := manager.ListVPNs()
 	assert.NoError(t, err)

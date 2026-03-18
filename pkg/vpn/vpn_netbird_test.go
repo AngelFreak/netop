@@ -73,6 +73,7 @@ func TestConnectNetBird_NoSetupKey(t *testing.T) {
 }
 
 func TestListVPNs_NetBirdRunning(t *testing.T) {
+	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			"pgrep -f openvpn":            "",
@@ -91,7 +92,7 @@ func TestListVPNs_NetBirdRunning(t *testing.T) {
 			"my-nb": {Type: "netbird"},
 		},
 	}
-	manager := NewManager(executor, logger, configMgr)
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
 
 	vpns, err := manager.ListVPNs()
 	assert.NoError(t, err)
