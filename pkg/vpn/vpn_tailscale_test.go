@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/angelfreak/net/pkg/types"
@@ -105,6 +106,62 @@ func TestConnectTailscale_WithAcceptRoutes(t *testing.T) {
 	err := manager.Connect("ts")
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "tailscale up --accept-dns=false --accept-routes")
+}
+
+func TestListVPNs_TailscaleRunning(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pgrep -f openvpn":            "",
+			"ip link show type wireguard": "",
+			"tailscale status --json":     `{"BackendState":"Running"}`,
+			"netbird status --json":       "",
+		},
+		errors: map[string]error{
+			"pgrep -f openvpn":      fmt.Errorf("no match"),
+			"netbird status --json": fmt.Errorf("not installed"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"my-ts": {Type: "tailscale"},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	vpns, err := manager.ListVPNs()
+	assert.NoError(t, err)
+	assert.Len(t, vpns, 1)
+	assert.Equal(t, "my-ts", vpns[0].Name)
+	assert.True(t, vpns[0].Connected)
+	assert.Equal(t, "tailscale0", vpns[0].Interface)
+}
+
+func TestListVPNs_TailscaleNotRunning(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pgrep -f openvpn":            "",
+			"ip link show type wireguard": "",
+			"tailscale status --json":     `{"BackendState":"Stopped"}`,
+			"netbird status --json":       "",
+		},
+		errors: map[string]error{
+			"pgrep -f openvpn":      fmt.Errorf("no match"),
+			"netbird status --json": fmt.Errorf("not installed"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"my-ts": {Type: "tailscale"},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	vpns, err := manager.ListVPNs()
+	assert.NoError(t, err)
+	assert.Len(t, vpns, 1)
+	assert.False(t, vpns[0].Connected)
 }
 
 func TestDisconnectTailscale_Tracked(t *testing.T) {

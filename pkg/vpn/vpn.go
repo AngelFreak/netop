@@ -371,6 +371,20 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 		}
 	}
 
+	// Check Tailscale status
+	runningTailscale := false
+	tsOutput, tsErr := m.executor.ExecuteWithTimeout(2*time.Second, "tailscale", "status", "--json")
+	if tsErr == nil && strings.Contains(tsOutput, `"Running"`) {
+		runningTailscale = true
+	}
+
+	// Check NetBird status
+	runningNetBird := false
+	nbOutput, nbErr := m.executor.ExecuteWithTimeout(2*time.Second, "netbird", "status", "--json")
+	if nbErr == nil && strings.Contains(nbOutput, `"Connected"`) {
+		runningNetBird = true
+	}
+
 	var vpns []types.VPNStatus
 
 	// Get configured VPNs from config
@@ -399,6 +413,10 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 					if vpnConfig.Interface != "" {
 						status.Connected = runningWireGuard[vpnConfig.Interface]
 					}
+				case "tailscale":
+					status.Connected = runningTailscale
+				case "netbird":
+					status.Connected = runningNetBird
 				}
 			}
 
@@ -408,6 +426,10 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 					status.Interface = "tun0"
 				case "wireguard":
 					status.Interface = "wg0"
+				case "tailscale":
+					status.Interface = "tailscale0"
+				case "netbird":
+					status.Interface = "wt0"
 				}
 			}
 

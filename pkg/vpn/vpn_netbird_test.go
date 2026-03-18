@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/angelfreak/net/pkg/types"
@@ -69,6 +70,35 @@ func TestConnectNetBird_NoSetupKey(t *testing.T) {
 	err := manager.Connect("nb")
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "netbird up --disable-dns")
+}
+
+func TestListVPNs_NetBirdRunning(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pgrep -f openvpn":            "",
+			"ip link show type wireguard": "",
+			"tailscale status --json":     "",
+			"netbird status --json":       `{"status":"Connected"}`,
+		},
+		errors: map[string]error{
+			"pgrep -f openvpn":        fmt.Errorf("no match"),
+			"tailscale status --json": fmt.Errorf("not installed"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"my-nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	vpns, err := manager.ListVPNs()
+	assert.NoError(t, err)
+	assert.Len(t, vpns, 1)
+	assert.Equal(t, "my-nb", vpns[0].Name)
+	assert.True(t, vpns[0].Connected)
+	assert.Equal(t, "wt0", vpns[0].Interface)
 }
 
 func TestDisconnectNetBird_Tracked(t *testing.T) {
