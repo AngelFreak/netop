@@ -497,9 +497,38 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	return nil
 }
 
-// connectNetBird is a placeholder for NetBird connect (implemented in Task 4)
+// connectNetBird connects using the NetBird CLI
 func (m *Manager) connectNetBird(config *types.VPNConfig) error {
-	return fmt.Errorf("netbird connect not yet implemented")
+	m.logger.Info("Connecting to NetBird")
+
+	// Build args
+	args := []string{"up"}
+
+	if config.SetupKey != "" {
+		args = append(args, "--setup-key", config.SetupKey)
+	}
+	if config.ManagementURL != "" {
+		args = append(args, "--management-url", config.ManagementURL)
+	}
+
+	// Always disable DNS (netop manages resolv.conf)
+	args = append(args, "--disable-dns")
+
+	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "netbird", args...)
+	if err != nil {
+		return fmt.Errorf("failed to connect NetBird: %w", err)
+	}
+
+	// Verify connection
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "netbird", "status")
+	if err != nil {
+		m.logger.Warn("Could not verify NetBird status", "error", err)
+	} else if !strings.Contains(output, "Connected") {
+		m.logger.Warn("NetBird may not be fully connected", "status", output)
+	}
+
+	m.logger.Info("NetBird connected")
+	return nil
 }
 
 // connectOpenVPN connects to an OpenVPN server

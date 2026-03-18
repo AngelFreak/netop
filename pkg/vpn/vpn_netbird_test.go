@@ -7,6 +7,70 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestConnectNetBird_MissingBinary(t *testing.T) {
+	executor := &mockSystemExecutor{
+		hasCommandOverride: map[string]bool{"netbird": false},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("nb")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "netbird")
+	assert.Contains(t, err.Error(), "install")
+}
+
+func TestConnectNetBird_Success(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":                                                                               "default via 192.168.1.1 dev eth0",
+			"netbird up --setup-key XXXXXXXX --management-url https://api.netbird.io --disable-dns": "",
+			"netbird status": "Connected",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {
+				Type:          "netbird",
+				SetupKey:      "XXXXXXXX",
+				ManagementURL: "https://api.netbird.io",
+			},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("nb")
+	assert.NoError(t, err)
+	executor.assertCommandExecuted(t, "netbird up --setup-key XXXXXXXX --management-url https://api.netbird.io --disable-dns")
+}
+
+func TestConnectNetBird_NoSetupKey(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":         "default via 192.168.1.1 dev eth0",
+			"netbird up --disable-dns": "",
+			"netbird status": "Connected",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("nb")
+	assert.NoError(t, err)
+	executor.assertCommandExecuted(t, "netbird up --disable-dns")
+}
+
 func TestNetBirdConfigFields(t *testing.T) {
 	config := types.VPNConfig{
 		Type:          "netbird",
