@@ -207,6 +207,9 @@ func (n *testNetworkManager) ClearDNS() error {
 	return nil
 }
 
+func (n *testNetworkManager) LockDNS() {
+}
+
 func (n *testNetworkManager) DHCPRenew(iface, hostname string) error {
 	return n.dhcpErr
 }

@@ -49,6 +49,15 @@ vpn:
       Endpoint = vpn.example.com:51820
       PublicKey = SERVER_PUBLIC_KEY_HERE
       AllowedIPs = 0.0.0.0/0
+  my-tailscale:
+    type: tailscale
+    auth_key: tskey-auth-xxxxx     # Optional: omit if already logged in via browser
+    exit_node: us-east-1           # Optional: route traffic through exit node
+    accept_routes: true            # Optional: accept subnet routes from admin
+  my-netbird:
+    type: netbird
+    setup_key: XXXXXXXX            # Optional: omit if already logged in
+    management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
 
 office:
   vpn: myvpn

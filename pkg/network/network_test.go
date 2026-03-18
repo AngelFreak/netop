@@ -995,6 +995,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -1011,6 +1012,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// resolv.conf should be unlocked and cleared so DHCP client can write fresh DNS
 		unlockCalled := false
 		clearCalled := false
+		lockCalled := false
 		for _, cmd := range executor.executedCmds {
 			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
 				unlockCalled = true
@@ -1018,11 +1020,70 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
 				clearCalled = true
 			}
+			if strings.Contains(cmd, "chattr +i") && strings.Contains(cmd, "resolv.conf") {
+				lockCalled = true
+			}
 		}
 		assert.True(t, unlockCalled, "should unlock resolv.conf for DHCP DNS")
 		assert.True(t, clearCalled, "should clear resolv.conf before DHCP runs")
+		assert.True(t, lockCalled, "should lock resolv.conf after DHCP to prevent external tools from overwriting")
 		// Verify the placeholder content was written
 		assert.Contains(t, executor.inputsReceived["tee /etc/resolv.conf"], "Waiting for DHCP")
+	})
+
+	t.Run("DHCP DNS locks resolv.conf after connection to prevent netbird overwrite", func(t *testing.T) {
+		// When using DHCP for DNS and netbird is still connected, netbird
+		// will overwrite resolv.conf with its own DNS after DHCP writes it.
+		// The fix: lock resolv.conf with chattr +i AFTER DHCP completes.
+		executor := newMockExecutor()
+		executor.commands["ip link set wlan0 down"] = ""
+		executor.commands["ip link set wlan0 up"] = ""
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger}
+
+		// No DNS configured = DHCP handles DNS
+		config := &types.NetworkConfig{
+			Interface: "wlan0",
+			SSID:      "coffee-shop",
+			PSK:       "password",
+		}
+
+		wifiManager := &mockWiFiManagerImpl{
+			executor: executor,
+			logger:   logger,
+		}
+
+		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		assert.NoError(t, err)
+
+		// Verify the sequence: unlock -> clear -> (DHCP via wifi connect) -> lock
+		unlockIdx := -1
+		clearIdx := -1
+		lockIdx := -1
+		for i, cmd := range executor.executedCmds {
+			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
+				if unlockIdx == -1 {
+					unlockIdx = i
+				}
+			}
+			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
+				if clearIdx == -1 {
+					clearIdx = i
+				}
+			}
+			if strings.Contains(cmd, "chattr +i") && strings.Contains(cmd, "resolv.conf") {
+				lockIdx = i // last lock is the one after connection
+			}
+		}
+
+		assert.True(t, unlockIdx >= 0, "should unlock resolv.conf before DHCP")
+		assert.True(t, clearIdx >= 0, "should clear resolv.conf before DHCP")
+		assert.True(t, lockIdx >= 0, "should lock resolv.conf after DHCP to prevent netbird overwrite")
+		assert.True(t, unlockIdx < clearIdx, "unlock should come before clear")
+		assert.True(t, clearIdx < lockIdx, "lock should come after clear (i.e., after DHCP)")
 	})
 
 	t.Run("auto-detect interface falls back when detection finds nothing", func(t *testing.T) {

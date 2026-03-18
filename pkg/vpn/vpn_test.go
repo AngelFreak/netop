@@ -15,10 +15,11 @@ import (
 
 // Mock implementations
 type mockSystemExecutor struct {
-	mu               sync.Mutex
-	commands         map[string]string
-	errors           map[string]error
-	executedCommands []string // Track executed commands for verification
+	mu                 sync.Mutex
+	commands           map[string]string
+	errors             map[string]error
+	executedCommands   []string          // Track executed commands for verification
+	hasCommandOverride map[string]bool   // Override HasCommand results per command
 }
 
 func (m *mockSystemExecutor) Execute(cmd string, args ...string) (string, error) {
@@ -66,7 +67,12 @@ func (m *mockSystemExecutor) ExecuteWithInputContext(ctx context.Context, cmd st
 }
 
 func (m *mockSystemExecutor) HasCommand(cmd string) bool {
-	return true // mock always has the command
+	if m.hasCommandOverride != nil {
+		if val, ok := m.hasCommandOverride[cmd]; ok {
+			return val
+		}
+	}
+	return true
 }
 
 // assertCommandExecuted verifies a command was executed

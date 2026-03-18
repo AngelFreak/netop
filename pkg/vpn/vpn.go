@@ -82,6 +82,18 @@ func (m *Manager) Connect(name string) error {
 		if vpnIface == "" {
 			vpnIface = "wg0"
 		}
+	case "tailscale":
+		if !m.executor.HasCommand("tailscale") {
+			return fmt.Errorf("tailscale CLI not found. Install it: https://tailscale.com/download/linux")
+		}
+		connectErr = m.connectTailscale(config)
+		vpnIface = "tailscale0"
+	case "netbird":
+		if !m.executor.HasCommand("netbird") {
+			return fmt.Errorf("netbird CLI not found. Install it: https://docs.netbird.io/how-to/installation")
+		}
+		connectErr = m.connectNetBird(config)
+		vpnIface = "wt0"
 	default:
 		return fmt.Errorf("unsupported VPN type: %s", config.Type)
 	}
@@ -166,6 +178,14 @@ func (m *Manager) disconnectTracked(state *vpnState) {
 		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface); err != nil {
 			m.logger.Debug("Failed to delete WireGuard interface", "interface", iface, "error", err)
 		}
+	case "tailscale":
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect Tailscale", "error", err)
+		}
+	case "netbird":
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect NetBird", "error", err)
+		}
 	}
 }
 
@@ -222,6 +242,18 @@ func (m *Manager) disconnectLegacy() {
 		}(iface)
 	}
 	wg.Wait()
+
+	// Also try to disconnect Tailscale and NetBird if their CLIs are available
+	if m.executor.HasCommand("tailscale") {
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect Tailscale (legacy)", "error", err)
+		}
+	}
+	if m.executor.HasCommand("netbird") {
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect NetBird (legacy)", "error", err)
+		}
+	}
 }
 
 // restoreDefaultRouteFromState restores the default route using saved state
@@ -351,6 +383,20 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 		}
 	}
 
+	// Check Tailscale status
+	runningTailscale := false
+	tsOutput, tsErr := m.executor.ExecuteWithTimeout(2*time.Second, "tailscale", "status", "--json")
+	if tsErr == nil && strings.Contains(tsOutput, `"Running"`) {
+		runningTailscale = true
+	}
+
+	// Check NetBird status
+	runningNetBird := false
+	nbOutput, nbErr := m.executor.ExecuteWithTimeout(2*time.Second, "netbird", "status", "--json")
+	if nbErr == nil && strings.Contains(nbOutput, `"Connected"`) {
+		runningNetBird = true
+	}
+
 	var vpns []types.VPNStatus
 
 	// Get configured VPNs from config
@@ -379,6 +425,10 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 					if vpnConfig.Interface != "" {
 						status.Connected = runningWireGuard[vpnConfig.Interface]
 					}
+				case "tailscale":
+					status.Connected = runningTailscale
+				case "netbird":
+					status.Connected = runningNetBird
 				}
 			}
 
@@ -388,6 +438,10 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 					status.Interface = "tun0"
 				case "wireguard":
 					status.Interface = "wg0"
+				case "tailscale":
+					status.Interface = "tailscale0"
+				case "netbird":
+					status.Interface = "wt0"
 				}
 			}
 
@@ -449,6 +503,74 @@ func (m *Manager) removeFile(path string) {
 	if err != nil {
 		m.logger.Debug("Failed to remove temp file", "path", path, "error", err)
 	}
+}
+
+// connectTailscale connects using the Tailscale CLI
+func (m *Manager) connectTailscale(config *types.VPNConfig) error {
+	m.logger.Info("Connecting to Tailscale")
+
+	// Build args: always disable DNS (netop manages resolv.conf)
+	args := []string{"up", "--accept-dns=false"}
+
+	if config.AuthKey != "" {
+		args = append(args, "--authkey="+config.AuthKey)
+	}
+	if config.ExitNode != "" {
+		args = append(args, "--exit-node="+config.ExitNode)
+	}
+	if config.AcceptRoutes {
+		args = append(args, "--accept-routes")
+	}
+
+	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", args...)
+	if err != nil {
+		return fmt.Errorf("failed to connect Tailscale: %w", err)
+	}
+
+	// Verify connection
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "tailscale", "status", "--json")
+	if err != nil {
+		m.logger.Warn("Could not verify Tailscale status", "error", err)
+	} else if !strings.Contains(output, "Running") {
+		m.logger.Warn("Tailscale may not be fully connected", "status", output)
+	}
+
+	m.logger.Info("Tailscale connected")
+	return nil
+}
+
+// connectNetBird connects using the NetBird CLI
+func (m *Manager) connectNetBird(config *types.VPNConfig) error {
+	m.logger.Info("Connecting to NetBird")
+
+	// Build args
+	args := []string{"up"}
+
+	if config.SetupKey != "" {
+		args = append(args, "--setup-key", config.SetupKey)
+	}
+	if config.ManagementURL != "" {
+		args = append(args, "--management-url", config.ManagementURL)
+	}
+
+	// Always disable DNS (netop manages resolv.conf)
+	args = append(args, "--disable-dns")
+
+	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "netbird", args...)
+	if err != nil {
+		return fmt.Errorf("failed to connect NetBird: %w", err)
+	}
+
+	// Verify connection
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "netbird", "status")
+	if err != nil {
+		m.logger.Warn("Could not verify NetBird status", "error", err)
+	} else if !strings.Contains(output, "Connected") {
+		m.logger.Warn("NetBird may not be fully connected", "status", output)
+	}
+
+	m.logger.Info("NetBird connected")
+	return nil
 }
 
 // connectOpenVPN connects to an OpenVPN server

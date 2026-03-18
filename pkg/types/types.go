@@ -75,11 +75,16 @@ type IgnoredConfig struct {
 
 // VPNConfig represents VPN configuration
 type VPNConfig struct {
-	Type      string `yaml:"type" mapstructure:"type"` // "openvpn" or "wireguard"
-	Config    string `yaml:"config" mapstructure:"config"`
-	Address   string `yaml:"address" mapstructure:"address"`     // WireGuard
-	Interface string `yaml:"interface" mapstructure:"interface"` // WireGuard
-	Gateway   bool   `yaml:"gateway" mapstructure:"gateway"`     // WireGuard
+	Type          string `yaml:"type" mapstructure:"type"`               // "openvpn", "wireguard", "tailscale", or "netbird"
+	Config        string `yaml:"config" mapstructure:"config"`           // Inline config (OpenVPN/WireGuard)
+	Address       string `yaml:"address" mapstructure:"address"`         // WireGuard IP
+	Interface     string `yaml:"interface" mapstructure:"interface"`     // WireGuard interface name
+	Gateway       bool   `yaml:"gateway" mapstructure:"gateway"`         // Route all traffic via VPN (WireGuard)
+	AuthKey       string `yaml:"auth_key" mapstructure:"auth_key"`       // Tailscale auth key
+	ExitNode      string `yaml:"exit_node" mapstructure:"exit_node"`     // Tailscale exit node
+	AcceptRoutes  bool   `yaml:"accept_routes" mapstructure:"accept_routes"` // Tailscale accept routes
+	SetupKey      string `yaml:"setup_key" mapstructure:"setup_key"`     // NetBird setup key
+	ManagementURL string `yaml:"management_url" mapstructure:"management_url"` // NetBird management URL
 }
 
 // NetworkConfig represents a network configuration
@@ -198,6 +203,7 @@ type VPNManager interface {
 type NetworkManager interface {
 	SetDNS(servers []string) error
 	ClearDNS() error
+	LockDNS()
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
 	SetIP(iface, addr, gateway string) error
