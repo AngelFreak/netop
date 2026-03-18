@@ -178,6 +178,14 @@ func (m *Manager) disconnectTracked(state *vpnState) {
 		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface); err != nil {
 			m.logger.Debug("Failed to delete WireGuard interface", "interface", iface, "error", err)
 		}
+	case "tailscale":
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect Tailscale", "error", err)
+		}
+	case "netbird":
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect NetBird", "error", err)
+		}
 	}
 }
 

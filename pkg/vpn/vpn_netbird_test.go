@@ -71,6 +71,21 @@ func TestConnectNetBird_NoSetupKey(t *testing.T) {
 	executor.assertCommandExecuted(t, "netbird up --disable-dns")
 }
 
+func TestDisconnectNetBird_Tracked(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"netbird down": "",
+		},
+	}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger}
+
+	state := &vpnState{Type: "netbird", Interface: "wt0"}
+	manager.disconnectTracked(state)
+
+	executor.assertCommandExecuted(t, "netbird down")
+}
+
 func TestNetBirdConfigFields(t *testing.T) {
 	config := types.VPNConfig{
 		Type:          "netbird",

@@ -106,3 +106,18 @@ func TestConnectTailscale_WithAcceptRoutes(t *testing.T) {
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "tailscale up --accept-dns=false --accept-routes")
 }
+
+func TestDisconnectTailscale_Tracked(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"tailscale down": "",
+		},
+	}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger}
+
+	state := &vpnState{Type: "tailscale", Interface: "tailscale0"}
+	manager.disconnectTracked(state)
+
+	executor.assertCommandExecuted(t, "tailscale down")
+}
