@@ -242,6 +242,18 @@ func (m *Manager) disconnectLegacy() {
 		}(iface)
 	}
 	wg.Wait()
+
+	// Also try to disconnect Tailscale and NetBird if their CLIs are available
+	if m.executor.HasCommand("tailscale") {
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect Tailscale (legacy)", "error", err)
+		}
+	}
+	if m.executor.HasCommand("netbird") {
+		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
+			m.logger.Debug("Failed to disconnect NetBird (legacy)", "error", err)
+		}
+	}
 }
 
 // restoreDefaultRouteFromState restores the default route using saved state
