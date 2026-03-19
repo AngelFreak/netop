@@ -14,6 +14,8 @@ ignored:
   - veth.*
   - vmnet[0-9]+ # VMWare
   - wg.* # Probably WireGuard
+  - tailscale[0-9]+ # Tailscale
+  - wt[0-9]+ # NetBird
 
 vpn:
   myvpn:
@@ -69,7 +71,7 @@ crappy-hotel-wifi:
   # Pin access point address to avoid switching between a gazillion equally
   # crappy ones.  This tends to give a more reliable connection.
   ap-addr: 00:11:22:33:44:55
-  vpn: myvpn # Connect to VPN when away from home
+  vpn: my-tailscale # Connect via Tailscale exit node when away from home
 
 wired:
   dns: dhcp
