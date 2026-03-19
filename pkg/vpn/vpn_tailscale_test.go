@@ -108,6 +108,35 @@ func TestConnectTailscale_WithAcceptRoutes(t *testing.T) {
 	executor.assertCommandExecuted(t, "tailscale up --accept-dns=false --accept-routes")
 }
 
+func TestConnectTailscale_WithProfile(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":                                                          "default via 192.168.1.1 dev eth0",
+			"tailscale switch work@company.com":                                               "",
+			"tailscale up --accept-dns=false --exit-node=us-east-1": "",
+			"tailscale status --json": `{"BackendState":"Running"}`,
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"work-ts": {
+				Type:     "tailscale",
+				Profile:  "work@company.com",
+				ExitNode: "us-east-1",
+			},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("work-ts")
+	assert.NoError(t, err)
+
+	// Verify profile switch happened before up
+	executor.assertCommandExecuted(t, "tailscale switch work@company.com")
+	executor.assertCommandExecuted(t, "tailscale up --accept-dns=false --exit-node=us-east-1")
+}
+
 func TestListVPNs_TailscaleRunning(t *testing.T) {
 	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{
