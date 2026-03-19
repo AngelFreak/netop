@@ -85,6 +85,7 @@ type VPNConfig struct {
 	AcceptRoutes  bool   `yaml:"accept_routes" mapstructure:"accept_routes"` // Tailscale accept routes
 	SetupKey      string `yaml:"setup_key" mapstructure:"setup_key"`     // NetBird setup key
 	ManagementURL string `yaml:"management_url" mapstructure:"management_url"` // NetBird management URL
+	Profile       string `yaml:"profile" mapstructure:"profile"`         // Tailscale/NetBird profile for account switching
 }
 
 // NetworkConfig represents a network configuration

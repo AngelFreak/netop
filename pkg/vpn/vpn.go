@@ -509,6 +509,15 @@ func (m *Manager) removeFile(path string) {
 func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to Tailscale")
 
+	// Switch profile if specified (for multi-account support)
+	if config.Profile != "" {
+		m.logger.Debug("Switching Tailscale profile", "profile", config.Profile)
+		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "switch", config.Profile)
+		if err != nil {
+			m.logger.Warn("Failed to switch Tailscale profile (may not exist yet)", "profile", config.Profile, "error", err)
+		}
+	}
+
 	// Build args: always disable DNS (netop manages resolv.conf)
 	args := []string{"up", "--accept-dns=false"}
 
@@ -546,6 +555,9 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 	// Build args
 	args := []string{"up"}
 
+	if config.Profile != "" {
+		args = append(args, "--profile", config.Profile)
+	}
 	if config.SetupKey != "" {
 		args = append(args, "--setup-key", config.SetupKey)
 	}

@@ -53,11 +53,16 @@ vpn:
       AllowedIPs = 0.0.0.0/0
   my-tailscale:
     type: tailscale
+    profile: work@company.com      # Optional: switch Tailscale profile (multi-account)
     auth_key: tskey-auth-xxxxx     # Optional: omit if already logged in via browser
     exit_node: us-east-1           # Optional: route traffic through exit node
     accept_routes: true            # Optional: accept subnet routes from admin
+  personal-tailscale:
+    type: tailscale
+    profile: me@gmail.com          # Switch to personal account
   my-netbird:
     type: netbird
+    profile: work                  # Optional: NetBird profile (multi-account)
     setup_key: XXXXXXXX            # Optional: omit if already logged in
     management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
 

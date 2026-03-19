@@ -415,23 +415,31 @@ vpn:
 **Tailscale:**
 ```yaml
 vpn:
-  my-tailscale:
+  work-tailscale:
     type: tailscale
+    profile: work@company.com   # Optional: switch profile (multi-account)
     auth_key: tskey-auth-xxxxx  # Optional: omit if logged in via browser
     exit_node: us-east-1        # Optional: route traffic through exit node
     accept_routes: true         # Optional: accept subnet routes from admin
+  personal-tailscale:
+    type: tailscale
+    profile: me@gmail.com       # Switch to personal account
 ```
 
 **NetBird:**
 ```yaml
 vpn:
-  my-netbird:
+  work-netbird:
     type: netbird
+    profile: work                          # Optional: NetBird profile (multi-account)
     setup_key: XXXXXXXX                    # Optional: omit if already logged in
     management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
+  home-netbird:
+    type: netbird
+    profile: home                          # Switch to home account
 ```
 
-> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled).
+> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled). Multi-account support uses `tailscale switch` and `netbird up --profile` under the hood.
 
 </details>
 

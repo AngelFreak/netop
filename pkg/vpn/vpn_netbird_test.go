@@ -72,6 +72,30 @@ func TestConnectNetBird_NoSetupKey(t *testing.T) {
 	executor.assertCommandExecuted(t, "netbird up --disable-dns")
 }
 
+func TestConnectNetBird_WithProfile(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":                        "default via 192.168.1.1 dev eth0",
+			"netbird up --profile work --disable-dns": "",
+			"netbird status":                               "Connected",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"work-nb": {
+				Type:    "netbird",
+				Profile: "work",
+			},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("work-nb")
+	assert.NoError(t, err)
+	executor.assertCommandExecuted(t, "netbird up --profile work --disable-dns")
+}
+
 func TestListVPNs_NetBirdRunning(t *testing.T) {
 	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{

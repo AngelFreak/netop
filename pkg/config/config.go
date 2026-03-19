@@ -47,6 +47,7 @@ var (
 		"accept_routes":  true, // Tailscale accept routes
 		"setup_key":      true, // NetBird setup key
 		"management_url": true, // NetBird management URL
+		"profile":        true, // Tailscale/NetBird profile for account switching
 	}
 
 	// Valid fields for NetworkConfig
