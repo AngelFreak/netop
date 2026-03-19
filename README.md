@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-Unlicense-blue.svg)](UNLICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)](https://www.linux.org/)
 
-Manage WiFi connections, VPNs (WireGuard/OpenVPN), DNS, MAC addresses, and more through a simple CLI and YAML configuration.
+Manage WiFi connections, VPNs (WireGuard/OpenVPN/Tailscale/NetBird), DNS, MAC addresses, and more through a simple CLI and YAML configuration.
 
 [Features](#-features) •
 [Installation](#-installation) •
@@ -34,7 +34,7 @@ Manage WiFi connections, VPNs (WireGuard/OpenVPN), DNS, MAC addresses, and more 
 <td width="50%">
 
 ### 🔒 Security & Privacy
-- **VPN Support** - WireGuard and OpenVPN with automatic connection
+- **VPN Support** - WireGuard, OpenVPN, Tailscale, and NetBird
 - **MAC Randomization** - Randomize or set custom MAC addresses
 - **Hostname Spoofing** - Configurable hostname per network
 - **DNS Configuration** - Custom DNS servers or DHCP
@@ -104,6 +104,8 @@ The following system utilities are required:
 | `dhclient` or `udhcpc` | `isc-dhcp-client` / `busybox` | DHCP client |
 | `openvpn` | `openvpn` | OpenVPN support (optional) |
 | `wg` | `wireguard-tools` | WireGuard support (optional) |
+| `tailscale` | [tailscale.com/download](https://tailscale.com/download/linux) | Tailscale support (optional) |
+| `netbird` | [docs.netbird.io](https://docs.netbird.io/how-to/installation) | NetBird support (optional) |
 
 **Install on Debian/Ubuntu:**
 ```bash
@@ -256,14 +258,20 @@ sudo net stop
 <summary><b>🔒 VPN Commands</b></summary>
 
 ```bash
-# Connect to VPN
+# Connect to VPN (WireGuard/OpenVPN)
 sudo net vpn myvpn
+
+# Connect to Tailscale
+sudo net vpn my-tailscale
+
+# Connect to NetBird
+sudo net vpn my-netbird
 
 # Disconnect all VPNs
 sudo net vpn stop
 
 # List VPN status
-sudo net list
+sudo net vpn
 ```
 
 </details>
@@ -391,9 +399,10 @@ network-name:
 <details>
 <summary><b>VPN Settings</b></summary>
 
+**WireGuard / OpenVPN:**
 ```yaml
 vpn:
-  vpn-name:
+  myvpn:
     type: wireguard        # or "openvpn"
     interface: wg0         # WireGuard interface name
     address: 10.0.0.2/32   # WireGuard IP address
@@ -402,6 +411,27 @@ vpn:
       [Interface]
       PrivateKey = ...
 ```
+
+**Tailscale:**
+```yaml
+vpn:
+  my-tailscale:
+    type: tailscale
+    auth_key: tskey-auth-xxxxx  # Optional: omit if logged in via browser
+    exit_node: us-east-1        # Optional: route traffic through exit node
+    accept_routes: true         # Optional: accept subnet routes from admin
+```
+
+**NetBird:**
+```yaml
+vpn:
+  my-netbird:
+    type: netbird
+    setup_key: XXXXXXXX                    # Optional: omit if already logged in
+    management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
+```
+
+> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled).
 
 </details>
 
