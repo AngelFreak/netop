@@ -136,6 +136,17 @@ func (m *mockSystemExecutor) assertInputContains(t *testing.T, cmd, expected str
 	}
 }
 
+// assertCommandNotExecuted verifies a command was NOT executed
+func (m *mockSystemExecutor) assertCommandNotExecuted(t *testing.T, cmd string) {
+	t.Helper()
+	for _, executed := range m.executedCmds {
+		if executed == cmd {
+			t.Errorf("expected command %q to NOT be executed, but it was", cmd)
+			return
+		}
+	}
+}
+
 type mockLogger struct{}
 
 func (m *mockLogger) Debug(msg string, fields ...interface{}) {}
@@ -200,11 +211,8 @@ func TestSetDNS(t *testing.T) {
 
 	t.Run("valid servers writes resolv.conf with correct content", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		// Actual implementation: chattr -i, rm temp, tee temp, mv temp to dest, chattr +i
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -212,21 +220,17 @@ func TestSetDNS(t *testing.T) {
 		err := manager.SetDNS([]string{"8.8.8.8", "1.1.1.1"})
 		assert.NoError(t, err)
 
-		// Verify the correct content was written to temp file
 		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
-		executor.assertCommandExecuted(t, "tee /run/net/staging.conf")
-		executor.assertCommandExecuted(t, "mv /run/net/staging.conf /etc/resolv.conf")
+		executor.assertCommandExecuted(t, "tee /etc/resolv.conf")
 		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
-		executor.assertInputContains(t, "tee /run/net/staging.conf", "nameserver 8.8.8.8")
-		executor.assertInputContains(t, "tee /run/net/staging.conf", "nameserver 1.1.1.1")
+		executor.assertInputContains(t, "tee /etc/resolv.conf", "nameserver 8.8.8.8")
+		executor.assertInputContains(t, "tee /etc/resolv.conf", "nameserver 1.1.1.1")
 	})
 
 	t.Run("invalid IP addresses are filtered out", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -235,7 +239,7 @@ func TestSetDNS(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Only valid IP should be in output
-		input := executor.inputsReceived["tee /run/net/staging.conf"]
+		input := executor.inputsReceived["tee /etc/resolv.conf"]
 		assert.Contains(t, input, "nameserver 8.8.8.8")
 		assert.NotContains(t, input, "invalid")
 		assert.NotContains(t, input, "not-an-ip")
@@ -244,9 +248,7 @@ func TestSetDNS(t *testing.T) {
 	t.Run("all invalid IPs results in empty file", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -255,15 +257,14 @@ func TestSetDNS(t *testing.T) {
 		assert.NoError(t, err)
 
 		// File should be written but empty (no valid nameservers)
-		input := executor.inputsReceived["tee /run/net/staging.conf"]
+		input := executor.inputsReceived["tee /etc/resolv.conf"]
 		assert.NotContains(t, input, "nameserver")
 	})
 
 	t.Run("tee failure returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.errors["tee /run/net/staging.conf"] = fmt.Errorf("permission denied")
+		executor.errors["tee /etc/resolv.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -272,18 +273,35 @@ func TestSetDNS(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to write resolv.conf")
 	})
 
-	t.Run("mv failure returns error", func(t *testing.T) {
-		executor := newStrictMockExecutor()
+	t.Run("does not lock resolv.conf when DNS is DHCP", func(t *testing.T) {
+		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.errors["mv /run/net/staging.conf /etc/resolv.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := NewManager(executor, logger, &mockDHCPClient{})
+
+		err := manager.SetDNS([]string{"dhcp"})
+		assert.NoError(t, err)
+
+		// Should unlock but NOT re-lock — DHCP needs to write resolv.conf,
+		// and external VPN tools (NetBird, Tailscale) also need to modify it
+		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+		executor.assertCommandNotExecuted(t, "chattr +i /etc/resolv.conf")
+	})
+
+	t.Run("only locks resolv.conf when custom DNS is set", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		logger := &mockLogger{}
+		manager := NewManager(executor, logger, &mockDHCPClient{})
 
 		err := manager.SetDNS([]string{"8.8.8.8"})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to write resolv.conf")
+		assert.NoError(t, err)
+
+		// Should lock when custom DNS is set — prevents DHCP from overwriting
+		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
 	})
 }
 
@@ -854,6 +872,54 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// DHCP is now handled by the mock DHCPClientManager
 	})
 
+	t.Run("wired connection flushes stale state before DHCP", func(t *testing.T) {
+		// After suspend/resume, stale IPs and routes remain on the interface.
+		// Verify that wired connect flushes them before bringing the interface up.
+		executor := newMockExecutor()
+		executor.commands["ip addr flush dev eth0"] = ""
+		executor.commands["ip route flush dev eth0"] = ""
+		executor.commands["ip link set eth0 up"] = ""
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		executor.commands["rm -f /run/net/staging.conf"] = ""
+		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		logger := &mockLogger{}
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{executor: executor, logger: logger, dhcpClient: dhcpClient}
+
+		config := &types.NetworkConfig{
+			Interface: "eth0",
+		}
+
+		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		assert.NoError(t, err)
+
+		// Verify flush commands were called
+		executor.assertCommandExecuted(t, "ip addr flush dev eth0")
+		executor.assertCommandExecuted(t, "ip route flush dev eth0")
+
+		// Verify flush happens before interface up
+		flushAddrIdx := -1
+		flushRouteIdx := -1
+		ifaceUpIdx := -1
+		for i, cmd := range executor.executedCmds {
+			switch cmd {
+			case "ip addr flush dev eth0":
+				if flushAddrIdx == -1 {
+					flushAddrIdx = i
+				}
+			case "ip route flush dev eth0":
+				if flushRouteIdx == -1 {
+					flushRouteIdx = i
+				}
+			case "ip link set eth0 up":
+				ifaceUpIdx = i
+			}
+		}
+		assert.True(t, flushAddrIdx < ifaceUpIdx, "flush addr should come before interface up")
+		assert.True(t, flushRouteIdx < ifaceUpIdx, "flush route should come before interface up")
+	})
+
 	t.Run("static IP configuration", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["ip link set eth0 up"] = ""
@@ -929,9 +995,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -947,18 +1012,78 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// resolv.conf should be unlocked and cleared so DHCP client can write fresh DNS
 		unlockCalled := false
 		clearCalled := false
+		lockCalled := false
 		for _, cmd := range executor.executedCmds {
 			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
 				unlockCalled = true
 			}
-			if strings.Contains(cmd, "mv") && strings.Contains(cmd, "resolv.conf") {
+			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
 				clearCalled = true
+			}
+			if strings.Contains(cmd, "chattr +i") && strings.Contains(cmd, "resolv.conf") {
+				lockCalled = true
 			}
 		}
 		assert.True(t, unlockCalled, "should unlock resolv.conf for DHCP DNS")
 		assert.True(t, clearCalled, "should clear resolv.conf before DHCP runs")
+		assert.True(t, lockCalled, "should lock resolv.conf after DHCP to prevent external tools from overwriting")
 		// Verify the placeholder content was written
-		assert.Contains(t, executor.inputsReceived["tee /run/net/staging.conf"], "Waiting for DHCP")
+		assert.Contains(t, executor.inputsReceived["tee /etc/resolv.conf"], "Waiting for DHCP")
+	})
+
+	t.Run("DHCP DNS locks resolv.conf after connection to prevent netbird overwrite", func(t *testing.T) {
+		// When using DHCP for DNS and netbird is still connected, netbird
+		// will overwrite resolv.conf with its own DNS after DHCP writes it.
+		// The fix: lock resolv.conf with chattr +i AFTER DHCP completes.
+		executor := newMockExecutor()
+		executor.commands["ip link set wlan0 down"] = ""
+		executor.commands["ip link set wlan0 up"] = ""
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger}
+
+		// No DNS configured = DHCP handles DNS
+		config := &types.NetworkConfig{
+			Interface: "wlan0",
+			SSID:      "coffee-shop",
+			PSK:       "password",
+		}
+
+		wifiManager := &mockWiFiManagerImpl{
+			executor: executor,
+			logger:   logger,
+		}
+
+		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		assert.NoError(t, err)
+
+		// Verify the sequence: unlock -> clear -> (DHCP via wifi connect) -> lock
+		unlockIdx := -1
+		clearIdx := -1
+		lockIdx := -1
+		for i, cmd := range executor.executedCmds {
+			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
+				if unlockIdx == -1 {
+					unlockIdx = i
+				}
+			}
+			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
+				if clearIdx == -1 {
+					clearIdx = i
+				}
+			}
+			if strings.Contains(cmd, "chattr +i") && strings.Contains(cmd, "resolv.conf") {
+				lockIdx = i // last lock is the one after connection
+			}
+		}
+
+		assert.True(t, unlockIdx >= 0, "should unlock resolv.conf before DHCP")
+		assert.True(t, clearIdx >= 0, "should clear resolv.conf before DHCP")
+		assert.True(t, lockIdx >= 0, "should lock resolv.conf after DHCP to prevent netbird overwrite")
+		assert.True(t, unlockIdx < clearIdx, "unlock should come before clear")
+		assert.True(t, clearIdx < lockIdx, "lock should come after clear (i.e., after DHCP)")
 	})
 
 	t.Run("auto-detect interface falls back when detection finds nothing", func(t *testing.T) {
@@ -1023,9 +1148,7 @@ func TestClearDNS(t *testing.T) {
 	t.Run("success - removes immutable attribute", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -1037,9 +1160,7 @@ func TestClearDNS(t *testing.T) {
 	t.Run("chattr fails but continues - file not locked", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 

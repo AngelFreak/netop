@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/angelfreak/net/pkg/types"
@@ -15,10 +16,10 @@ var dhcpServerCmd = &cobra.Command{
 Useful when sharing your connection via ethernet cable.
 
 Examples:
-  net dhcp                              Show status
-  net dhcp start                        Start with defaults
-  net dhcp start --gateway 10.0.0.1     Custom gateway
-  net dhcp stop                         Stop the server`,
+  net dhcp                                          Show status
+  net dhcp start --interface eth0                   Start on eth0 with defaults
+  net dhcp start --interface eth0 --gateway 10.0.0.1  Custom gateway
+  net dhcp stop                                     Stop the server`,
 	Run: func(cmd *cobra.Command, args []string) {
 		action := "status"
 		if len(args) > 0 {
@@ -27,6 +28,13 @@ Examples:
 
 		var config *types.DHCPServerConfig
 		if action == "start" {
+			// Interface is required for start
+			ifaceName, _ := cmd.Flags().GetString("interface")
+			if ifaceName == "" {
+				fmt.Fprintln(os.Stderr, "Error: --interface is required (e.g., --interface eth0)")
+				os.Exit(1)
+			}
+
 			// Get configuration from flags or use defaults
 			gateway, _ := cmd.Flags().GetString("gateway")
 			ipRange, _ := cmd.Flags().GetString("ip-range")
@@ -48,7 +56,7 @@ Examples:
 			}
 
 			config = &types.DHCPServerConfig{
-				Interface: iface,
+				Interface: ifaceName,
 				Gateway:   gateway,
 				IPRange:   ipRange,
 				DNS:       dnsServers,
@@ -63,6 +71,7 @@ Examples:
 }
 
 func init() {
+	dhcpServerCmd.Flags().String("interface", "", "Network interface to run DHCP server on (required for start)")
 	dhcpServerCmd.Flags().String("gateway", "192.168.100.1", "Gateway IP address")
 	dhcpServerCmd.Flags().String("ip-range", "192.168.100.50,192.168.100.150", "DHCP IP range")
 	dhcpServerCmd.Flags().StringSlice("dns", []string{"8.8.8.8", "8.8.4.4"}, "DNS servers")

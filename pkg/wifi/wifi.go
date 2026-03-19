@@ -66,22 +66,17 @@ func (m *Manager) Scan() ([]types.WiFiNetwork, error) {
 		m.logger.Warn("Failed to bring interface up", "error", err)
 	}
 
-	// Note: Don't kill wpa_supplicant here - iw scan works even with active connection
-	// This prevents dropping existing connections during scan
+	// Always trigger a fresh scan — cached results from scan dump may only
+	// contain the currently connected AP when connected to a network
+	_, err = m.executor.ExecuteWithTimeout(10*time.Second, "iw", m.iface, "scan")
+	if err != nil {
+		m.logger.Warn("Fresh scan failed, falling back to cached results", "error", err)
+	}
 
-	// Try to get cached scan results first (fast path)
+	// Read scan results (includes results from fresh scan above)
 	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "iw", m.iface, "scan", "dump")
-	if err != nil || output == "" || !strings.Contains(output, "BSS") {
-		// No cached results, trigger a new scan
-		_, err = m.executor.ExecuteWithTimeout(10*time.Second, "iw", m.iface, "scan")
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan: %w", err)
-		}
-		// Get fresh scan results
-		output, err = m.executor.ExecuteWithTimeout(5*time.Second, "iw", m.iface, "scan", "dump")
-		if err != nil {
-			return nil, fmt.Errorf("failed to get scan results: %w", err)
-		}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get scan results: %w", err)
 	}
 
 	return m.parseScanResults(output)
@@ -123,13 +118,27 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 		_ = m.Disconnect()
 	}
 
-	// Skip scan verification - wpa_supplicant will fail quickly if network is not in range
-	// This saves 2-3 seconds on every connection
+	// Detect AP security type from cached scan results to generate the correct
+	// wpa_supplicant config (WPA3 needs SAE key_mgmt and required PMF)
+	security := m.detectNetworkSecurity(ssid)
+	if security != "" {
+		m.logger.Debug("Detected AP security type", "ssid", ssid, "security", security)
+	}
+
+	// Reject WEP networks - insecure and not supported
+	if security == "WEP" {
+		return fmt.Errorf("WEP networks are not supported: WEP encryption is broken and insecure, use WPA2 or WPA3 instead")
+	}
+
+	// Warn if AP requires encryption but no password was provided
+	if password == "" && (security == "WPA3" || security == "WPA2/WPA3" || security == "WPA2") {
+		m.logger.Warn("Network requires encryption but no password provided - check config file (YAML '#' starts a comment, quote passwords containing '#')", "ssid", ssid, "security", security)
+	}
 
 	// Create wpa_supplicant config with optional BSSID pinning
-	config := m.generateWPAConfig(ssid, password, bssid)
+	config := m.generateWPAConfig(ssid, password, bssid, security)
 	// Don't log config - it contains credentials
-	m.logger.Debug("Generated WPA config", "ssid", ssid, "hasBSSID", bssid != "")
+	m.logger.Debug("Generated WPA config", "ssid", ssid, "hasBSSID", bssid != "", "security", security)
 
 	// Write config to temp file in secure runtime directory
 	tempConfig := types.RuntimeDir + "/wpa_supplicant.conf"
@@ -150,6 +159,12 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// Terminate existing wpa_supplicant for this interface only
 	m.terminateWpaSupplicant()
 
+	// Flush stale IP addresses and routes — after suspend/resume the old
+	// network state remains on the interface even though the connection is dead.
+	// Without this, DHCP may add a new IP but the default route won't be set.
+	m.executor.Execute("ip", "addr", "flush", "dev", m.iface)
+	m.executor.Execute("ip", "route", "flush", "dev", m.iface)
+
 	// Bring interface up before starting wpa_supplicant
 	_, err = m.executor.Execute("ip", "link", "set", m.iface, "up")
 	if err != nil {
@@ -159,8 +174,9 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// Ensure wpa_supplicant control directory exists
 	_, _ = m.executor.Execute("mkdir", "-p", "/run/wpa_supplicant")
 
-	// Start wpa_supplicant with control interface for wpa_cli communication
-	_, err = m.executor.Execute("wpa_supplicant", "-B", "-i", m.iface, "-c", tempConfig, "-C", "/run/wpa_supplicant")
+	// Start wpa_supplicant — ctrl_interface is set in the config file,
+	// don't also pass -C which can conflict and cause crashes with SAE.
+	_, err = m.executor.Execute("wpa_supplicant", "-B", "-i", m.iface, "-c", tempConfig)
 	if err != nil {
 		return fmt.Errorf("failed to start wpa_supplicant: %w", err)
 	}
@@ -175,6 +191,9 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	if err != nil {
 		// Clean up wpa_supplicant on failure (interface-specific)
 		m.terminateWpaSupplicant()
+		if security == "WPA3" && strings.Contains(err.Error(), "crashed") {
+			return fmt.Errorf("WPA3 (SAE) connection failed — wpa_supplicant crashed. Your wpa_supplicant may not support SAE. Check with: wpa_supplicant -h 2>&1 | grep SAE")
+		}
 		return fmt.Errorf("failed to associate with access point: %w", err)
 	}
 
@@ -284,13 +303,13 @@ func (m *Manager) parseScanResults(output string) ([]types.WiFiNetwork, error) {
 
 	var currentNetwork *types.WiFiNetwork
 	var currentSecurity string
-	// Use package-level compiled regexes for better performance
+	var inRSN bool
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
 		if strings.HasPrefix(line, "BSS ") {
-			// New network
+			// Save previous network
 			if currentNetwork != nil && currentNetwork.SSID != "" {
 				currentNetwork.Security = currentSecurity
 				if existing, ok := networksMap[currentNetwork.SSID]; !ok || currentNetwork.Signal > existing.Signal {
@@ -301,7 +320,8 @@ func (m *Manager) parseScanResults(output string) ([]types.WiFiNetwork, error) {
 				}
 			}
 			currentNetwork = &types.WiFiNetwork{}
-			currentSecurity = "Open" // Default to open
+			currentSecurity = "Open"
+			inRSN = false
 			if match := bssidRegex.FindStringSubmatch(line); len(match) > 1 {
 				currentNetwork.BSSID = match[1]
 				if m.logger != nil {
@@ -342,16 +362,21 @@ func (m *Manager) parseScanResults(output string) ([]types.WiFiNetwork, error) {
 				}
 			}
 		} else if strings.Contains(line, "RSN:") {
-			// WPA2 or WPA3
-			if strings.Contains(line, "Authentication suites: SAE") {
-				currentSecurity = "WPA3"
-			} else {
-				currentSecurity = "WPA2"
-			}
+			inRSN = true
+			currentSecurity = "WPA2" // default RSN = WPA2, may upgrade to WPA3
 		} else if strings.Contains(line, "WPA:") {
+			inRSN = false
 			currentSecurity = "WPA"
 		} else if strings.Contains(line, "WEP:") {
+			inRSN = false
 			currentSecurity = "WEP"
+		} else if inRSN && strings.Contains(line, "Authentication suites:") {
+			if strings.Contains(line, "SAE") && strings.Contains(line, "PSK") {
+				currentSecurity = "WPA2/WPA3"
+			} else if strings.Contains(line, "SAE") {
+				currentSecurity = "WPA3"
+			}
+			// PSK-only stays as "WPA2" (set when RSN: was seen)
 		}
 	}
 
@@ -395,7 +420,44 @@ func isValidBSSID(bssid string) bool {
 	return validBSSIDRegex.MatchString(bssid)
 }
 
-func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string {
+// detectNetworkSecurity determines the security type of a given SSID.
+// Tries cached scan results first (fast), falls back to a fresh scan if
+// the cache is empty (e.g. after interface was cycled for MAC change).
+// Returns "WPA3", "WPA2/WPA3", "WPA2", or "" if not found.
+func (m *Manager) detectNetworkSecurity(ssid string) string {
+	// Try cached results first (instant)
+	if sec := m.findSecurityInScan(ssid, "iw", m.iface, "scan", "dump"); sec != "" {
+		return sec
+	}
+
+	// Cache was empty or SSID not found — do a fresh scan.
+	// This happens when the interface was cycled (e.g. MAC change) before connect.
+	m.logger.Debug("Scan cache empty, running fresh scan for security detection")
+	return m.findSecurityInScan(ssid, "iw", m.iface, "scan")
+}
+
+// findSecurityInScan runs the given iw scan command and returns the security
+// type for the given SSID, or "" if not found.
+func (m *Manager) findSecurityInScan(ssid string, cmd ...string) string {
+	output, err := m.executor.ExecuteWithTimeout(10*time.Second, cmd[0], cmd[1:]...)
+	if err != nil {
+		m.logger.Debug("Scan failed during security detection", "error", err)
+		return ""
+	}
+	networks, err := m.parseScanResults(output)
+	if err != nil {
+		m.logger.Debug("Failed to parse scan results for security detection", "error", err)
+		return ""
+	}
+	for _, net := range networks {
+		if net.SSID == ssid {
+			return net.Security
+		}
+	}
+	return ""
+}
+
+func (m *Manager) generateWPAConfig(ssid, password string, bssid string, security ...string) string {
 	// Escape SSID and password to prevent injection
 	escapedSSID := escapeWPAString(ssid)
 
@@ -409,13 +471,11 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 	}
 
 	// ctrl_interface is required for wpa_cli communication
-	header := "ctrl_interface=/run/wpa_supplicant\n\n"
+	header := "ctrl_interface=/run/wpa_supplicant\n"
 
 	if password == "" {
 		// Open network
-		config := header + fmt.Sprintf(`network={
-	ssid="%s"
-	key_mgmt=NONE`, escapedSSID)
+		config := header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tkey_mgmt=NONE", escapedSSID)
 		if validatedBSSID != "" {
 			config += fmt.Sprintf("\n\tbssid=%s", validatedBSSID)
 		}
@@ -423,11 +483,44 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string) string 
 		return config
 	}
 
-	// WPA2 network
 	escapedPassword := escapeWPAString(password)
-	config := header + fmt.Sprintf(`network={
-	ssid="%s"
-	psk="%s"`, escapedSSID, escapedPassword)
+	sec := ""
+	if len(security) > 0 {
+		sec = security[0]
+	}
+
+	// SAE (WPA3) needs sae_pwe in the global section for driver compatibility.
+	// sae_pwe=2 accepts both hunting-and-pecking and hash-to-element methods,
+	// which is the most compatible mode across APs (some iPhone hotspots
+	// only support hunting-and-pecking).
+	// Include for all password-protected networks since the default case also
+	// offers SAE when security type is unknown.
+	header += "sae_pwe=2\n"
+
+	var config string
+	switch sec {
+	case "WPA3":
+		// WPA3-only: SAE authentication with required PMF.
+		// scan_ssid=1 triggers active probing — needed for iPhone hotspots
+		// which can behave like hidden networks when the hotspot screen isn't open.
+		// proto=RSN and pairwise=CCMP are required for SAE.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tsae_password=\"%s\"\n\tkey_mgmt=SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=2",
+			escapedSSID, escapedPassword)
+	case "WPA2/WPA3":
+		// Transition mode: WPA-PSK-SHA256 works better than WPA-PSK for
+		// mixed-mode APs that require management frame protection.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK-SHA256 SAE\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tieee80211w=1",
+			escapedSSID, escapedPassword, escapedPassword)
+	default:
+		// WPA2 or unknown: offer WPA-PSK first (most compatible), then
+		// WPA-PSK-SHA256 and SAE for transition/WPA3 APs.
+		// WPA-PSK must be listed so pure WPA2 APs (which only advertise PSK)
+		// can negotiate successfully.
+		// ieee80211w=1 (optional PMF) allows both PMF and non-PMF APs.
+		config = header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tscan_ssid=1\n\tpsk=\"%s\"\n\tsae_password=\"%s\"\n\tkey_mgmt=WPA-PSK WPA-PSK-SHA256 SAE\n\tproto=RSN WPA\n\tpairwise=CCMP TKIP\n\tgroup=CCMP TKIP\n\tieee80211w=1",
+			escapedSSID, escapedPassword, escapedPassword)
+	}
+
 	if validatedBSSID != "" {
 		config += fmt.Sprintf("\n\tbssid=%s", validatedBSSID)
 	}
@@ -506,14 +599,26 @@ func (m *Manager) killProcess(pattern string) {
 // terminateWpaSupplicant terminates wpa_supplicant for this interface only
 // Uses wpa_cli terminate for graceful shutdown, with pkill fallback
 func (m *Manager) terminateWpaSupplicant() {
-	// Try graceful termination via wpa_cli (interface-specific)
+	// Tell NetworkManager to stop managing this interface.
+	// This prevents NM from restarting wpa_supplicant after we kill it.
+	// Fails silently if nmcli is not installed (non-NM systems).
+	m.executor.ExecuteWithTimeout(2*time.Second, "nmcli", "device", "set", m.iface, "managed", "no")
+
+	// Try graceful termination via wpa_cli (interface-specific).
+	// This reaches both standalone and system (D-Bus) wpa_supplicant instances.
 	_, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "terminate")
 	if err != nil {
-		// Fallback to interface-specific pkill
-		// Pattern matches: wpa_supplicant ... -i <interface> ...
+		// Fallback: kill ALL wpa_supplicant processes.
+		// The system wpa_supplicant (started via -u -s for D-Bus) doesn't use
+		// -i flag, so interface-specific pkill won't match it.
+		// We must kill it to avoid nl80211 "Match already configured" conflicts
+		// that prevent our instance from creating its control socket.
 		m.executor.ExecuteWithTimeout(500*time.Millisecond,
-			"pkill", "-9", "-f", fmt.Sprintf("wpa_supplicant.*-i[[:space:]]+%s", m.iface))
+			"pkill", "-9", "wpa_supplicant")
 	}
+
+	// Give the process time to fully exit and release nl80211 resources
+	time.Sleep(500 * time.Millisecond)
 
 	// Remove stale control socket — after suspend/resume the old wpa_supplicant
 	// process is gone but its socket file remains, causing the new instance to
@@ -606,26 +711,38 @@ func (m *Manager) waitForAssociationPolling(expectedSSID string, timeout time.Du
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
+	const maxConsecutiveFailures = 5
+	consecutiveFailures := 0
+
 	for {
 		select {
 		case <-timeoutCh:
 			return fmt.Errorf("timeout waiting for association to %s", expectedSSID)
 		case <-ticker.C:
-			// Use wpa_cli status which is faster than iw link
-			if m.isAssociatedWpaCli(expectedSSID) {
+			associated, reachable := m.checkAssociationStatus(expectedSSID)
+			if associated {
 				m.logger.Debug("Successfully associated with access point", "ssid", expectedSSID)
 				return nil
+			}
+			if !reachable {
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("wpa_supplicant crashed or is unreachable (control socket disappeared)")
+				}
+			} else {
+				consecutiveFailures = 0
 			}
 		}
 	}
 }
 
-// isAssociatedWpaCli checks association status using wpa_cli (faster than iw)
-func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
-	// Use 2s timeout - wpa_cli typically responds in <100ms
+// checkAssociationStatus returns (associated, wpaSupplicantReachable).
+// associated is true when the SSID matches and wpa_state=COMPLETED.
+// wpaSupplicantReachable is true when wpa_cli can communicate with wpa_supplicant.
+func (m *Manager) checkAssociationStatus(expectedSSID string) (bool, bool) {
 	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "status")
 	if err != nil {
-		return false
+		return false, false
 	}
 
 	var ssidMatch, stateCompleted bool
@@ -640,7 +757,13 @@ func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
 		}
 	}
 
-	return ssidMatch && stateCompleted
+	return ssidMatch && stateCompleted, true
+}
+
+// isAssociatedWpaCli checks association status using wpa_cli (faster than iw)
+func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
+	associated, _ := m.checkAssociationStatus(expectedSSID)
+	return associated
 }
 
 func (m *Manager) hasValidIP() bool {

@@ -180,6 +180,13 @@ func (a *App) RunScan(showOpen bool) error {
 func (a *App) RunConnect(name, password string) error {
 	a.Logger.Debug("Connect command called", "name", name)
 
+	// Disconnect any active VPN before connecting to new network
+	// This prevents stale VPN routes/interfaces from interfering
+	a.Logger.Debug("Disconnecting any active VPN before connecting")
+	if err := a.VPNMgr.Disconnect(""); err != nil {
+		a.Logger.Debug("No active VPN to disconnect", "error", err)
+	}
+
 	// Check if it's a configured network
 	a.Logger.Debug("Looking up network config", "name", name)
 	networkConfig, err := a.ConfigMgr.GetNetworkConfig(name)
@@ -188,6 +195,10 @@ func (a *App) RunConnect(name, password string) error {
 		// Not configured, treat as SSID
 		a.Logger.Debug("Network config not found, treating as direct SSID", "name", name, "error", err)
 		a.Logger.Info("Connecting to SSID", "ssid", name)
+
+		// Flush stale DNS before DHCP so external tools (netbird) don't retain their DNS
+		a.NetworkMgr.ClearDNS()
+
 		a.progress("Connecting to WiFi...\n")
 		err = a.WiFiMgr.Connect(name, password, "")
 		if err != nil {
@@ -196,6 +207,10 @@ func (a *App) RunConnect(name, password string) error {
 			return err
 		}
 		connectedIface = a.WiFiMgr.GetInterface()
+
+		// Lock resolv.conf after DHCP writes DNS to prevent external tools
+		// (like netbird) from overwriting with their own DNS servers
+		a.NetworkMgr.LockDNS()
 	} else {
 		// Use configured network - merge with common settings first
 		networkConfig = a.ConfigMgr.MergeWithCommon(name, networkConfig)
@@ -751,10 +766,31 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 		a.println("✓ DHCP server stopped successfully")
 
 	case "status":
-		if a.DHCPMgr.IsRunning() {
-			a.println("DHCP server is running")
-		} else {
+		if !a.DHCPMgr.IsRunning() {
 			a.println("DHCP server is not running")
+			return nil
+		}
+		a.println("DHCP server is running")
+		if cfg := a.DHCPMgr.GetCurrentConfig(); cfg != nil {
+			a.printf("  Interface: %s\n", cfg.Interface)
+			a.printf("  Gateway:   %s\n", cfg.Gateway)
+			a.printf("  IP Range:  %s\n", cfg.IPRange)
+		}
+		leases, err := a.DHCPMgr.GetLeases()
+		if err != nil {
+			a.Logger.Warn("Failed to read leases", "error", err)
+		}
+		if len(leases) == 0 {
+			a.println("\n(no active leases)")
+		} else {
+			a.printf("\n%-17s  %-15s  %-20s  %s\n", "MAC", "IP", "HOSTNAME", "EXPIRES")
+			for _, l := range leases {
+				hostname := l.Hostname
+				if hostname == "" {
+					hostname = "-"
+				}
+				a.printf("%-17s  %-15s  %-20s  %s\n", l.MAC, l.IP, hostname, l.Expiry.Format("2006-01-02 15:04"))
+			}
 		}
 
 	default:

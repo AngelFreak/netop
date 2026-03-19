@@ -54,21 +54,19 @@ func (m *Manager) SetDNS(servers []string) error {
 		}
 	}
 
-	// Use chattr to make file immutable temporarily
-	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-	if err != nil {
-		m.logger.Warn("Failed to remove immutable flag from resolv.conf", "error", err)
+	if err := m.unlockResolvConf(); err != nil {
+		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
-	err = m.writeFile("/etc/resolv.conf", resolvConf.String())
+	err := m.writeFileDirect("/etc/resolv.conf", resolvConf.String())
 	if err != nil {
 		return fmt.Errorf("failed to write resolv.conf: %w", err)
 	}
 
-	// Make immutable again
+	// Lock to prevent other tools (dhclient, netbird) from overwriting
 	_, err = m.executor.Execute("chattr", "+i", "/etc/resolv.conf")
 	if err != nil {
-		m.logger.Warn("Failed to set immutable flag on resolv.conf", "error", err)
+		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
 
 	return nil
@@ -78,20 +76,34 @@ func (m *Manager) SetDNS(servers []string) error {
 func (m *Manager) ClearDNS() error {
 	m.logger.Debug("Clearing DNS configuration")
 
-	// Remove immutable flag if set
-	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-	if err != nil {
-		m.logger.Debug("Failed to remove immutable flag from resolv.conf", "error", err)
+	if err := m.unlockResolvConf(); err != nil {
+		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
 	// Clear the file by writing an empty configuration
-	err = m.writeFile("/etc/resolv.conf", "# DNS cleared by net\n")
+	err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n")
 	if err != nil {
 		return fmt.Errorf("failed to clear resolv.conf: %w", err)
 	}
 
 	m.logger.Debug("DNS configuration cleared")
 	return nil
+}
+
+// LockDNS sets the immutable flag on /etc/resolv.conf to prevent external
+// tools (like netbird) from overwriting DNS configuration.
+func (m *Manager) LockDNS() {
+	if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
+		m.logger.Warn("Failed to lock resolv.conf", "error", err)
+	}
+}
+
+// unlockResolvConf removes the immutable flag from /etc/resolv.conf.
+// VPN clients like netbird set this flag and may leave it after disconnecting,
+// which prevents DHCP or net from updating DNS.
+func (m *Manager) unlockResolvConf() error {
+	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
+	return err
 }
 
 // SetMAC sets the MAC address for an interface
@@ -558,15 +570,14 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 	useDHCPForDNS := config.DNS == nil || len(config.DNS) == 0 || (len(config.DNS) == 1 && config.DNS[0] == "dhcp")
 	if useDHCPForDNS {
 		m.logger.Debug("Clearing resolv.conf for DHCP DNS")
-		_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-		if err != nil {
-			m.logger.Debug("Failed to unlock resolv.conf (may not be locked)", "error", err)
+		if err := m.unlockResolvConf(); err != nil {
+			m.logger.Warn("Failed to unlock resolv.conf, DHCP may not be able to set DNS", "error", err)
 		}
 		// Clear stale DNS entries so DHCP client can write fresh ones.
 		// Without this, resolv.conf may retain DNS from a previous connection
-		// (set via SetDNS with chattr +i), and the DHCP client may not overwrite it.
-		if err := m.writeFile("/etc/resolv.conf", "# Waiting for DHCP\n"); err != nil {
-			m.logger.Debug("Failed to clear resolv.conf", "error", err)
+		// (set via SetDNS with chattr +i), or from a VPN client like netbird.
+		if err := m.writeFileDirect("/etc/resolv.conf", "# Waiting for DHCP\n"); err != nil {
+			m.logger.Warn("Failed to clear resolv.conf", "error", err)
 		}
 	}
 
@@ -599,6 +610,12 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		m.logger.Debug("No SSID specified in network config - treating as wired connection")
 		// For wired connections, bring up the interface and get DHCP if no static IP
 		if config.Interface != "" {
+			// Flush stale IP addresses and routes — after suspend/resume the old
+			// network state remains on the interface even though the link was down.
+			// Without this, DHCP may add a new IP but the default route won't be set.
+			m.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
+			m.executor.Execute("ip", "route", "flush", "dev", config.Interface)
+
 			m.logger.Info("Bringing up wired interface", "interface", config.Interface)
 			_, err := m.executor.Execute("ip", "link", "set", config.Interface, "up")
 			if err != nil {
@@ -663,6 +680,19 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			if err != nil {
 				m.logger.Warn("Failed to set DNS", "error", err)
 			}
+		}
+	}
+
+	// Lock resolv.conf after DHCP-provided DNS is written.
+	// External tools like netbird actively rewrite resolv.conf with their own
+	// DNS servers. If netbird is still connected when switching WiFi, it will
+	// overwrite the DHCP-provided DNS, breaking internet connectivity.
+	// Custom DNS is already locked by SetDNS(), so only lock here for DHCP DNS.
+	if useDHCPForDNS {
+		if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
+			m.logger.Warn("Failed to lock resolv.conf after DHCP DNS", "error", err)
+		} else {
+			m.logger.Debug("Locked resolv.conf to prevent external DNS overwrite")
 		}
 	}
 

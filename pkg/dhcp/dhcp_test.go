@@ -467,6 +467,303 @@ func TestStart_WithDefaultNetmask(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestGenerateDnsmasqConfig_IncludesLeasefile(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		IPRange:   "192.168.100.50,192.168.100.150",
+		Gateway:   "192.168.100.1",
+	}
+
+	err := mgr.generateDnsmasqConfig(config)
+	assert.NoError(t, err)
+
+	data, err := os.ReadFile(mgr.dnsmasqConfFile)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), "dhcp-leasefile="+mgr.leasesFile)
+}
+
+func TestGetLeases_ValidEntries(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	// Use temp file for leases
+	tmpFile, err := os.CreateTemp("", "test_leases_*")
+	assert.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	mgr.leasesFile = tmpFile.Name()
+
+	content := "1709568000 aa:bb:cc:dd:ee:ff 192.168.100.51 laptop 01:aa:bb:cc:dd:ee:ff\n" +
+		"1709571600 11:22:33:44:55:66 192.168.100.52 * 01:11:22:33:44:55:66\n"
+	os.WriteFile(tmpFile.Name(), []byte(content), 0644)
+
+	leases, err := mgr.GetLeases()
+	assert.NoError(t, err)
+	assert.Len(t, leases, 2)
+
+	assert.Equal(t, "aa:bb:cc:dd:ee:ff", leases[0].MAC)
+	assert.Equal(t, "192.168.100.51", leases[0].IP)
+	assert.Equal(t, "laptop", leases[0].Hostname)
+	assert.Equal(t, int64(1709568000), leases[0].Expiry.Unix())
+
+	// Hostname "*" should become empty
+	assert.Equal(t, "11:22:33:44:55:66", leases[1].MAC)
+	assert.Equal(t, "", leases[1].Hostname)
+}
+
+func TestGetLeases_EmptyFile(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	tmpFile, err := os.CreateTemp("", "test_leases_*")
+	assert.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	mgr.leasesFile = tmpFile.Name()
+
+	leases, err := mgr.GetLeases()
+	assert.NoError(t, err)
+	assert.Empty(t, leases)
+}
+
+func TestGetLeases_MissingFile(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+	mgr.leasesFile = "/tmp/nonexistent_leases_file_test"
+
+	leases, err := mgr.GetLeases()
+	assert.NoError(t, err)
+	assert.Nil(t, leases)
+}
+
+func TestGetLeases_MalformedLines(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	tmpFile, err := os.CreateTemp("", "test_leases_*")
+	assert.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	mgr.leasesFile = tmpFile.Name()
+
+	content := "notanumber aa:bb:cc:dd:ee:ff 192.168.100.51 laptop clientid\n" + // bad expiry -> skip
+		"1709568000 aa:bb:cc 192.168.100.52\n" + // only 3 fields (<4) -> skip
+		"too few fields\n" + // fewer than 4 fields -> skip
+		"\n" + // blank line -> skip
+		"1709568000 aa:bb:cc:dd:ee:ff 192.168.100.52 myhost clientid\n" + // valid (5 fields)
+		"1709571600 11:22:33:44:55:66 192.168.100.53 phone clientid\n" // valid
+	os.WriteFile(tmpFile.Name(), []byte(content), 0644)
+
+	leases, err := mgr.GetLeases()
+	assert.NoError(t, err)
+	// Should parse: line 5 and line 6
+	assert.Len(t, leases, 2)
+	assert.Equal(t, "aa:bb:cc:dd:ee:ff", leases[0].MAC)
+	assert.Equal(t, "192.168.100.52", leases[0].IP)
+	assert.Equal(t, "myhost", leases[0].Hostname)
+	assert.Equal(t, "11:22:33:44:55:66", leases[1].MAC)
+	assert.Equal(t, "phone", leases[1].Hostname)
+}
+
+func TestGetLeases_MultipleClients(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	tmpFile, err := os.CreateTemp("", "test_leases_*")
+	assert.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	mgr.leasesFile = tmpFile.Name()
+
+	// Simulate a realistic multi-client lease file
+	content := "1709568000 aa:bb:cc:dd:ee:01 192.168.100.51 client-1 01:aa:bb:cc:dd:ee:01\n" +
+		"1709568100 aa:bb:cc:dd:ee:02 192.168.100.52 client-2 01:aa:bb:cc:dd:ee:02\n" +
+		"1709568200 aa:bb:cc:dd:ee:03 192.168.100.53 * 01:aa:bb:cc:dd:ee:03\n" +
+		"1709568300 aa:bb:cc:dd:ee:04 192.168.100.54 client-4 01:aa:bb:cc:dd:ee:04\n"
+	os.WriteFile(tmpFile.Name(), []byte(content), 0644)
+
+	leases, err := mgr.GetLeases()
+	assert.NoError(t, err)
+	assert.Len(t, leases, 4)
+
+	// Verify ordering is preserved
+	assert.Equal(t, "192.168.100.51", leases[0].IP)
+	assert.Equal(t, "192.168.100.54", leases[3].IP)
+
+	// Verify the * hostname is empty
+	assert.Equal(t, "", leases[2].Hostname)
+	assert.Equal(t, "client-4", leases[3].Hostname)
+}
+
+func TestGetLeases_WhitespaceOnly(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	tmpFile, err := os.CreateTemp("", "test_leases_*")
+	assert.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	mgr.leasesFile = tmpFile.Name()
+
+	os.WriteFile(tmpFile.Name(), []byte("   \n  \n\n"), 0644)
+
+	leases, err := mgr.GetLeases()
+	assert.NoError(t, err)
+	assert.Empty(t, leases)
+}
+
+func TestGetCurrentConfig(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	assert.Nil(t, mgr.GetCurrentConfig())
+
+	config := &types.DHCPServerConfig{Interface: "eth0"}
+	mgr.currentConfig = config
+	assert.Equal(t, config, mgr.GetCurrentConfig())
+}
+
+func TestStop_CleansUpLeaseFile(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	// Create a temp leases file
+	tmpFile, err := os.CreateTemp("", "test_leases_cleanup_*")
+	assert.NoError(t, err)
+	mgr.leasesFile = tmpFile.Name()
+	os.WriteFile(tmpFile.Name(), []byte("1709568000 aa:bb:cc:dd:ee:ff 192.168.100.51 laptop id\n"), 0644)
+
+	mgr.currentConfig = &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+	}
+
+	// Create fake process
+	dnsmasqPid, cleanDnsmasq := startFakeProcess("dnsmasq")
+	defer cleanDnsmasq()
+	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
+
+	executor.commands["kill "+dnsmasqPid] = ""
+	executor.commands["ip addr flush dev eth0"] = ""
+	executor.commands["ip link set eth0 down"] = ""
+
+	err = mgr.Stop()
+	assert.NoError(t, err)
+
+	// Lease file should be cleaned up
+	_, err = os.Stat(tmpFile.Name())
+	assert.True(t, os.IsNotExist(err), "lease file should be removed after stop")
+}
+
+func TestStart_Success_SetsLeasefile(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+		DNS:       []string{"8.8.8.8"},
+		LeaseTime: "24h",
+	}
+
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	err := mgr.Start(config)
+	assert.NoError(t, err)
+
+	// Verify generated config contains leasefile directive
+	data, err := os.ReadFile(mgr.dnsmasqConfFile)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), "dhcp-leasefile=")
+}
+
+func TestValidateConfig_InvalidInterfaceName(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	tests := []struct {
+		name  string
+		iface string
+	}{
+		{"space", "eth 0"},
+		{"tab", "eth\t0"},
+		{"newline", "eth\n0"},
+		{"slash", "eth/0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &types.DHCPServerConfig{
+				Interface: tt.iface,
+				Gateway:   "192.168.100.1",
+				IPRange:   "192.168.100.50,192.168.100.150",
+			}
+			err := mgr.Start(config)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid interface name")
+		})
+	}
+}
+
+func TestValidateConfig_InvalidGateway(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "not-an-ip",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+	err := mgr.Start(config)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid gateway")
+}
+
+func TestValidateConfig_InvalidIPRange(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	tests := []struct {
+		name    string
+		ipRange string
+	}{
+		{"single ip", "192.168.100.50"},
+		{"bad start ip", "bad,192.168.100.150"},
+		{"bad end ip", "192.168.100.50,bad"},
+		{"three parts", "192.168.100.50,192.168.100.100,192.168.100.150"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &types.DHCPServerConfig{
+				Interface: "eth0",
+				Gateway:   "192.168.100.1",
+				IPRange:   tt.ipRange,
+			}
+			err := mgr.Start(config)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid")
+		})
+	}
+}
+
+func TestValidateConfig_InvalidDNS(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+		DNS:       []string{"not-a-dns"},
+	}
+	err := mgr.Start(config)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid DNS")
+}
+
 func TestStart_WithDifferentNetmasks(t *testing.T) {
 	tests := []struct {
 		name     string

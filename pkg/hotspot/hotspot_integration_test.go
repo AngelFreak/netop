@@ -198,3 +198,11 @@ func (d *testDHCPManager) Stop() error {
 func (d *testDHCPManager) IsRunning() bool {
 	return d.running
 }
+
+func (d *testDHCPManager) GetLeases() ([]types.DHCPLease, error) {
+	return nil, nil
+}
+
+func (d *testDHCPManager) GetCurrentConfig() *types.DHCPServerConfig {
+	return nil
+}

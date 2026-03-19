@@ -204,6 +204,7 @@ type VPNManager interface {
 type NetworkManager interface {
 	SetDNS(servers []string) error
 	ClearDNS() error
+	LockDNS()
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
 	SetIP(iface, addr, gateway string) error
@@ -231,11 +232,21 @@ type HotspotManager interface {
 	GetStatus() (*HotspotStatus, error)
 }
 
+// DHCPLease represents a single DHCP lease from the dnsmasq lease file
+type DHCPLease struct {
+	Expiry   time.Time
+	MAC      string
+	IP       string
+	Hostname string
+}
+
 // DHCPManager handles DHCP server operations (running dnsmasq for hotspot)
 type DHCPManager interface {
 	Start(config *DHCPServerConfig) error
 	Stop() error
 	IsRunning() bool
+	GetLeases() ([]DHCPLease, error)
+	GetCurrentConfig() *DHCPServerConfig
 }
 
 // DHCPClientManager handles DHCP client operations (obtaining leases from a server)

@@ -207,6 +207,9 @@ func (n *testNetworkManager) ClearDNS() error {
 	return nil
 }
 
+func (n *testNetworkManager) LockDNS() {
+}
+
 func (n *testNetworkManager) DHCPRenew(iface, hostname string) error {
 	return n.dhcpErr
 }
@@ -274,9 +277,12 @@ func (h *testHotspotManager) GetStatus() (*types.HotspotStatus, error) {
 
 // testDHCPManager implements types.DHCPManager for testing
 type testDHCPManager struct {
-	running   bool
-	startErr  error
-	stopErr   error
+	running       bool
+	startErr      error
+	stopErr       error
+	leases        []types.DHCPLease
+	leasesErr     error
+	currentConfig *types.DHCPServerConfig
 }
 
 func (d *testDHCPManager) Start(config *types.DHCPServerConfig) error {
@@ -289,6 +295,14 @@ func (d *testDHCPManager) Stop() error {
 
 func (d *testDHCPManager) IsRunning() bool {
 	return d.running
+}
+
+func (d *testDHCPManager) GetLeases() ([]types.DHCPLease, error) {
+	return d.leases, d.leasesErr
+}
+
+func (d *testDHCPManager) GetCurrentConfig() *types.DHCPServerConfig {
+	return d.currentConfig
 }
 
 // Helper to create a test App
@@ -728,11 +742,53 @@ func TestApp_RunDHCPServer_Stop(t *testing.T) {
 
 func TestApp_RunDHCPServer_Status(t *testing.T) {
 	app, stdout, _ := newTestApp()
-	app.DHCPMgr = &testDHCPManager{running: true}
+	app.DHCPMgr = &testDHCPManager{
+		running: true,
+		currentConfig: &types.DHCPServerConfig{
+			Interface: "eth0",
+			Gateway:   "192.168.100.1",
+			IPRange:   "192.168.100.50,192.168.100.150",
+		},
+	}
 
 	err := app.RunDHCPServer("status", nil)
 	assert.NoError(t, err)
-	assert.Contains(t, stdout.String(), "DHCP server is running")
+	output := stdout.String()
+	assert.Contains(t, output, "DHCP server is running")
+	assert.Contains(t, output, "Interface: eth0")
+	assert.Contains(t, output, "Gateway:   192.168.100.1")
+	assert.Contains(t, output, "no active leases")
+}
+
+func TestApp_RunDHCPServer_StatusWithLeases(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		running: true,
+		currentConfig: &types.DHCPServerConfig{
+			Interface: "eth0",
+			Gateway:   "192.168.100.1",
+			IPRange:   "192.168.100.50,192.168.100.150",
+		},
+		leases: []types.DHCPLease{
+			{MAC: "aa:bb:cc:dd:ee:ff", IP: "192.168.100.51", Hostname: "laptop"},
+		},
+	}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	output := stdout.String()
+	assert.Contains(t, output, "aa:bb:cc:dd:ee:ff")
+	assert.Contains(t, output, "192.168.100.51")
+	assert.Contains(t, output, "laptop")
+}
+
+func TestApp_RunDHCPServer_StatusNotRunning(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{running: false}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "DHCP server is not running")
 }
 
 func TestApp_RunDHCPServer_StartError(t *testing.T) {
@@ -743,6 +799,145 @@ func TestApp_RunDHCPServer_StartError(t *testing.T) {
 	err := app.RunDHCPServer("start", config)
 	assert.Error(t, err)
 	assert.Contains(t, stderr.String(), "Failed to start DHCP server")
+}
+
+func TestApp_RunDHCPServer_StartNilConfig(t *testing.T) {
+	app, _, stderr := newTestApp()
+
+	err := app.RunDHCPServer("start", nil)
+	assert.Error(t, err)
+	assert.Contains(t, stderr.String(), "Configuration required")
+}
+
+func TestApp_RunDHCPServer_StopError(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.DHCPMgr = &testDHCPManager{stopErr: errors.New("stop failed")}
+
+	err := app.RunDHCPServer("stop", nil)
+	assert.Error(t, err)
+	assert.Contains(t, stderr.String(), "Failed to stop DHCP server")
+}
+
+func TestApp_RunDHCPServer_UnknownAction(t *testing.T) {
+	app, _, stderr := newTestApp()
+
+	err := app.RunDHCPServer("restart", nil)
+	assert.Error(t, err)
+	assert.Contains(t, stderr.String(), "Unknown action")
+}
+
+func TestApp_RunDHCPServer_StatusShowsIPRange(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		running: true,
+		currentConfig: &types.DHCPServerConfig{
+			Interface: "enp3s0",
+			Gateway:   "10.0.0.1",
+			IPRange:   "10.0.0.50,10.0.0.150",
+		},
+	}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	output := stdout.String()
+	assert.Contains(t, output, "Interface: enp3s0")
+	assert.Contains(t, output, "Gateway:   10.0.0.1")
+	assert.Contains(t, output, "IP Range:  10.0.0.50,10.0.0.150")
+}
+
+func TestApp_RunDHCPServer_StatusNoConfig(t *testing.T) {
+	// Running but currentConfig is nil (edge case — e.g., process detected but not started by us)
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		running:       true,
+		currentConfig: nil,
+	}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	output := stdout.String()
+	assert.Contains(t, output, "DHCP server is running")
+	// Should not crash, just skip config display
+	assert.NotContains(t, output, "Interface:")
+	assert.Contains(t, output, "no active leases")
+}
+
+func TestApp_RunDHCPServer_StatusMultipleLeases(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		running: true,
+		currentConfig: &types.DHCPServerConfig{
+			Interface: "eth0",
+			Gateway:   "192.168.100.1",
+			IPRange:   "192.168.100.50,192.168.100.150",
+		},
+		leases: []types.DHCPLease{
+			{MAC: "aa:bb:cc:dd:ee:01", IP: "192.168.100.51", Hostname: "laptop"},
+			{MAC: "aa:bb:cc:dd:ee:02", IP: "192.168.100.52", Hostname: ""},
+			{MAC: "aa:bb:cc:dd:ee:03", IP: "192.168.100.53", Hostname: "phone"},
+		},
+	}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	output := stdout.String()
+
+	// Table header
+	assert.Contains(t, output, "MAC")
+	assert.Contains(t, output, "IP")
+	assert.Contains(t, output, "HOSTNAME")
+	assert.Contains(t, output, "EXPIRES")
+
+	// All three leases
+	assert.Contains(t, output, "aa:bb:cc:dd:ee:01")
+	assert.Contains(t, output, "192.168.100.51")
+	assert.Contains(t, output, "laptop")
+	assert.Contains(t, output, "aa:bb:cc:dd:ee:02")
+	assert.Contains(t, output, "192.168.100.52")
+	assert.Contains(t, output, "-") // empty hostname renders as "-"
+	assert.Contains(t, output, "aa:bb:cc:dd:ee:03")
+	assert.Contains(t, output, "phone")
+
+	// Should NOT show "no active leases"
+	assert.NotContains(t, output, "no active leases")
+}
+
+func TestApp_RunDHCPServer_StatusLeaseError(t *testing.T) {
+	// GetLeases returns error — should still show running status, just no table
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		running: true,
+		currentConfig: &types.DHCPServerConfig{
+			Interface: "eth0",
+			Gateway:   "192.168.100.1",
+			IPRange:   "192.168.100.50,192.168.100.150",
+		},
+		leasesErr: errors.New("permission denied"),
+	}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	output := stdout.String()
+	assert.Contains(t, output, "DHCP server is running")
+	assert.Contains(t, output, "no active leases")
+}
+
+func TestApp_RunDHCPServer_StartShowsConfig(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	config := &types.DHCPServerConfig{
+		Interface: "enp3s0",
+		Gateway:   "10.0.0.1",
+		IPRange:   "10.0.0.50,10.0.0.150",
+		LeaseTime: "6h",
+	}
+
+	err := app.RunDHCPServer("start", config)
+	assert.NoError(t, err)
+	output := stdout.String()
+	assert.Contains(t, output, "Interface: enp3s0")
+	assert.Contains(t, output, "Gateway:   10.0.0.1")
+	assert.Contains(t, output, "IP Range:  10.0.0.50,10.0.0.150")
+	assert.Contains(t, output, "Lease:     6h")
 }
 
 // Tests for connectVPN and attemptVPNConnect
@@ -956,6 +1151,29 @@ func TestApp_RunShow_MergesWithCommon(t *testing.T) {
 	assert.Equal(t, "work", cfgMgr.lastMergedNetwork)
 	// Verify merged DNS is shown in output
 	assert.Contains(t, stdout.String(), "8.8.8.8")
+}
+
+// trackingVPNManager tracks whether Disconnect was called
+type trackingVPNManager struct {
+	testVPNManager
+	disconnectCalled bool
+}
+
+func (v *trackingVPNManager) Disconnect(name string) error {
+	v.disconnectCalled = true
+	return nil
+}
+
+func TestApp_RunConnect_DisconnectsActiveVPNFirst(t *testing.T) {
+	app, _, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{networkErr: errors.New("not found")}
+	// Create a custom VPN manager that tracks disconnect calls
+	vpnMgr := &trackingVPNManager{}
+	app.VPNMgr = vpnMgr
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.True(t, vpnMgr.disconnectCalled, "should disconnect active VPN before connecting")
 }
 
 func TestMaskSecret(t *testing.T) {
