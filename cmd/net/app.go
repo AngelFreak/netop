@@ -223,6 +223,12 @@ func (a *App) RunConnect(name, password string) error {
 		if networkConfig.SSID != "" {
 			a.progress("Connecting to WiFi...\n")
 		} else {
+			// Switching to wired — disconnect WiFi first so its stale default
+			// route doesn't prevent DHCP from setting the correct gateway.
+			a.Logger.Debug("Disconnecting WiFi before wired connection")
+			if err := a.WiFiMgr.Disconnect(); err != nil {
+				a.Logger.Debug("No active WiFi to disconnect", "error", err)
+			}
 			a.progress("Connecting to wired network...\n")
 		}
 		err = a.NetworkMgr.ConnectToConfiguredNetwork(networkConfig, password, a.WiFiMgr)
