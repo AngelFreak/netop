@@ -165,6 +165,11 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	m.executor.Execute("ip", "addr", "flush", "dev", m.iface)
 	m.executor.Execute("ip", "route", "flush", "dev", m.iface)
 
+	// Delete any existing default route so DHCP can set a fresh one
+	// after connecting. Stale default routes from a previous location
+	// or interface prevent the new gateway from being set.
+	m.executor.Execute("ip", "route", "del", "default")
+
 	// Bring interface up before starting wpa_supplicant
 	_, err = m.executor.Execute("ip", "link", "set", m.iface, "up")
 	if err != nil {

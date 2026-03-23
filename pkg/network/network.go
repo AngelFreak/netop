@@ -616,6 +616,12 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			m.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
 			m.executor.Execute("ip", "route", "flush", "dev", config.Interface)
 
+			// Delete any existing default route (regardless of interface) so
+			// DHCP can set a fresh one. Without this, udhcpc/dhclient's
+			// "ip route add default" fails when a stale default route exists
+			// from a previous location or interface.
+			m.executor.Execute("ip", "route", "del", "default")
+
 			m.logger.Info("Bringing up wired interface", "interface", config.Interface)
 			_, err := m.executor.Execute("ip", "link", "set", config.Interface, "up")
 			if err != nil {
