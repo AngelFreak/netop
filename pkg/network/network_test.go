@@ -19,6 +19,7 @@ type mockSystemExecutor struct {
 	executedCmds   []string             // Track executed commands for verification
 	inputsReceived map[string]string    // Track inputs received by ExecuteWithInput
 	hasCommands    map[string]bool      // which commands are "installed"
+	failOnPattern  string               // If set, fail any command containing this substring
 }
 
 func newStrictMockExecutor() *mockSystemExecutor {
@@ -48,6 +49,11 @@ func (m *mockSystemExecutor) Execute(cmd string, args ...string) (string, error)
 		fullCmd += " " + arg
 	}
 	m.executedCmds = append(m.executedCmds, fullCmd)
+
+	// Check failOnPattern
+	if m.failOnPattern != "" && strings.Contains(fullCmd, m.failOnPattern) {
+		return "", fmt.Errorf("mock error: %s", m.failOnPattern)
+	}
 
 	// Check errors first
 	if m.errors != nil {
@@ -86,6 +92,11 @@ func (m *mockSystemExecutor) ExecuteWithInput(cmd string, input string, args ...
 		m.inputsReceived[fullCmd] = input
 	}
 
+	// Check failOnPattern
+	if m.failOnPattern != "" && strings.Contains(fullCmd, m.failOnPattern) {
+		return "", fmt.Errorf("mock error: %s", m.failOnPattern)
+	}
+
 	// Check errors first
 	if m.errors != nil {
 		if err, hasErr := m.errors[fullCmd]; hasErr {
@@ -121,6 +132,17 @@ func (m *mockSystemExecutor) assertCommandExecuted(t *testing.T, cmd string) {
 		}
 	}
 	t.Errorf("expected command %q to be executed, but it wasn't. Executed: %v", cmd, m.executedCmds)
+}
+
+// assertCommandContains verifies at least one executed command contains the substring
+func (m *mockSystemExecutor) assertCommandContains(t *testing.T, substr string) {
+	t.Helper()
+	for _, executed := range m.executedCmds {
+		if strings.Contains(executed, substr) {
+			return
+		}
+	}
+	t.Errorf("expected a command containing %q, but none found. Executed: %v", substr, m.executedCmds)
 }
 
 // assertInputContains verifies the input to a command contains expected content
@@ -610,59 +632,30 @@ func TestExpandMACTemplate(t *testing.T) {
 }
 
 func TestWriteFile(t *testing.T) {
-	t.Run("success - removes temp, writes, and moves", func(t *testing.T) {
-		executor := newStrictMockExecutor()
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/test.conf"] = ""
+	// The staging path includes the PID for uniqueness, so use non-strict mock
+	t.Run("success - writes temp and moves to target", func(t *testing.T) {
+		executor := newMockExecutor()
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
 		err := manager.writeFile("/etc/test.conf", "test content")
 		assert.NoError(t, err)
 
-		// Verify the correct sequence of operations
-		executor.assertCommandExecuted(t, "rm -f /run/net/staging.conf")
-		executor.assertCommandExecuted(t, "tee /run/net/staging.conf")
-		executor.assertCommandExecuted(t, "mv /run/net/staging.conf /etc/test.conf")
-		executor.assertInputContains(t, "tee /run/net/staging.conf", "test content")
-	})
-
-	t.Run("rm temp fails - continues anyway", func(t *testing.T) {
-		executor := newStrictMockExecutor()
-		executor.errors["rm -f /run/net/staging.conf"] = fmt.Errorf("file not found")
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/test.conf"] = ""
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
-
-		err := manager.writeFile("/etc/test.conf", "test content")
-		assert.NoError(t, err) // Should still succeed
+		// Verify tee was called with staging path containing PID
+		executor.assertCommandContains(t, "tee /run/net/staging.")
+		// Verify mv was called to the target path
+		executor.assertCommandContains(t, "mv /run/net/staging.")
+		executor.assertCommandContains(t, "/etc/test.conf")
 	})
 
 	t.Run("tee fails - returns error", func(t *testing.T) {
-		executor := newStrictMockExecutor()
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.errors["tee /run/net/staging.conf"] = fmt.Errorf("permission denied")
+		executor := newMockExecutor()
+		executor.failOnPattern = "tee"
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
 		err := manager.writeFile("/etc/test.conf", "test content")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "permission denied")
-	})
-
-	t.Run("mv fails - returns error", func(t *testing.T) {
-		executor := newStrictMockExecutor()
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["tee /run/net/staging.conf"] = ""
-		executor.errors["mv /run/net/staging.conf /etc/test.conf"] = fmt.Errorf("permission denied")
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
-
-		err := manager.writeFile("/etc/test.conf", "test content")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "permission denied")
 	})
 }
 

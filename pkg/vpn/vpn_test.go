@@ -293,20 +293,38 @@ func TestConnect(t *testing.T) {
 }
 
 func TestDisconnect(t *testing.T) {
-	executor := &mockSystemExecutor{
-		commands: map[string]string{
-			"pkill -f openvpn":      "",
-			"pkill -f wg":           "",
-			"ip link set tun0 down": "",
-			"ip link set wg0 down":  "",
-		},
-	}
-	logger := &mockLogger{}
-	configMgr := &mockConfigManager{}
-	manager := NewManager(executor, logger, configMgr)
+	t.Run("with tracked state", func(t *testing.T) {
+		tempDir := t.TempDir()
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip link delete wg0": "",
+				"ip route show":     "",
+			},
+		}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{}
+		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
 
-	err := manager.Disconnect("test")
-	assert.NoError(t, err)
+		// Create a state file so Disconnect has something to act on
+		os.WriteFile(filepath.Join(tempDir, "active-vpn"), []byte("test|wg0|wireguard|192.168.1.1|eth0"), 0600)
+
+		err := manager.Disconnect("test")
+		assert.NoError(t, err)
+	})
+
+	t.Run("no active VPN returns error", func(t *testing.T) {
+		tempDir := t.TempDir()
+		executor := &mockSystemExecutor{
+			commands: map[string]string{},
+		}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{}
+		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+		err := manager.Disconnect("test")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no active VPN")
+	})
 }
 
 func TestListVPNs(t *testing.T) {
@@ -551,23 +569,40 @@ func TestConnect_ErrorCases(t *testing.T) {
 }
 
 func TestDisconnect_ErrorCases(t *testing.T) {
-	t.Run("disconnect with all failures", func(t *testing.T) {
+	t.Run("disconnect with no active VPN returns error", func(t *testing.T) {
+		tempDir := t.TempDir()
 		executor := &mockSystemExecutor{
 			commands: map[string]string{},
+		}
+		logger := &mockLogger{}
+		configMgr := &mockConfigManager{}
+		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+		err := manager.Disconnect("test")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no active VPN")
+	})
+
+	t.Run("disconnect with tracked state returns disconnect error", func(t *testing.T) {
+		tempDir := t.TempDir()
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"ip route show": "",
+			},
 			errors: map[string]error{
-				"pkill -f openvpn":     assert.AnError,
-				"pkill -f wg":          assert.AnError,
-				"ip link set tun0 down": assert.AnError,
-				"ip link set wg0 down":  assert.AnError,
+				"ip link delete wg0": assert.AnError,
 			},
 		}
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
-		manager := NewManager(executor, logger, configMgr)
+		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+		// Create state file
+		os.WriteFile(filepath.Join(tempDir, "active-vpn"), []byte("test|wg0|wireguard||"), 0600)
 
 		err := manager.Disconnect("test")
-		// Disconnect should not return error even if processes don't exist
-		assert.NoError(t, err)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to delete WireGuard")
 	})
 }
 

@@ -87,6 +87,9 @@ func (d *dhcpManagerImpl) Stop() error {
 	d.logger.Info("Stopping DHCP server")
 
 	if !d.IsRunning() {
+		// Clean up stale PID/config files even if the process isn't running
+		// (e.g., dnsmasq was killed externally)
+		d.cleanupStaleFiles()
 		return fmt.Errorf("DHCP server is not running")
 	}
 
@@ -256,6 +259,20 @@ func (d *dhcpManagerImpl) generateDnsmasqConfig(config *types.DHCPServerConfig) 
 	return nil
 }
 
+// cleanupStaleFiles removes PID, config, and lease files left behind when
+// dnsmasq was killed externally (e.g., by the OOM killer or manual kill).
+func (d *dhcpManagerImpl) cleanupStaleFiles() {
+	removed := false
+	for _, f := range []string{d.dnsmasqPidFile, d.dnsmasqConfFile, d.leasesFile} {
+		if err := os.Remove(f); err == nil {
+			removed = true
+		}
+	}
+	if removed {
+		d.logger.Debug("Cleaned up stale DHCP server files")
+	}
+}
+
 // dnsmasqRunning checks if dnsmasq is running by verifying PID and process name
 func (d *dhcpManagerImpl) dnsmasqRunning() bool {
 	data, err := os.ReadFile(d.dnsmasqPidFile)
@@ -285,6 +302,11 @@ func (d *dhcpManagerImpl) stopDnsmasq() error {
 	}
 
 	pid := strings.TrimSpace(string(data))
+	// Validate PID is a positive integer before passing to kill
+	if n, err := strconv.Atoi(pid); err != nil || n <= 0 {
+		os.Remove(d.dnsmasqPidFile)
+		return fmt.Errorf("invalid PID in %s: %q", d.dnsmasqPidFile, pid)
+	}
 	if _, err := d.executor.Execute("kill", pid); err != nil {
 		return fmt.Errorf("failed to kill dnsmasq: %w", err)
 	}

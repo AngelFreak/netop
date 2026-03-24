@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 )
@@ -126,75 +127,8 @@ func ValidateDNSServer(server string) error {
 	if server == "" {
 		return fmt.Errorf("DNS server cannot be empty")
 	}
-	// Already validated by net.ParseIP in the caller, but double-check
-	if ip := parseIP(server); ip == nil {
+	if net.ParseIP(server) == nil {
 		return fmt.Errorf("invalid DNS server IP address: %s", server)
 	}
 	return nil
-}
-
-// parseIP is a helper to parse IP addresses
-func parseIP(s string) []byte {
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '.':
-			return parseIPv4(s)
-		case ':':
-			return parseIPv6(s)
-		}
-	}
-	return nil
-}
-
-func parseIPv4(s string) []byte {
-	var p [4]byte
-	for i := 0; i < 4; i++ {
-		if len(s) == 0 {
-			return nil
-		}
-		if i > 0 {
-			if s[0] != '.' {
-				return nil
-			}
-			s = s[1:]
-		}
-		n, c, ok := dtoi(s)
-		if !ok || n > 255 {
-			return nil
-		}
-		s = s[c:]
-		p[i] = byte(n)
-	}
-	if len(s) != 0 {
-		return nil
-	}
-	return p[:]
-}
-
-func parseIPv6(s string) []byte {
-	// Simplified - just check if it looks valid
-	if len(s) < 2 {
-		return nil
-	}
-	// Accept any IPv6-looking string for now
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':') {
-			return nil
-		}
-	}
-	return []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1} // placeholder
-}
-
-func dtoi(s string) (n int, i int, ok bool) {
-	n = 0
-	for i = 0; i < len(s) && '0' <= s[i] && s[i] <= '9'; i++ {
-		n = n*10 + int(s[i]-'0')
-		if n >= 0xFFFFFF {
-			return 0, i, false
-		}
-	}
-	if i == 0 {
-		return 0, 0, false
-	}
-	return n, i, true
 }

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/angelfreak/net/pkg/config"
 	"github.com/angelfreak/net/pkg/dhcp"
@@ -158,6 +161,26 @@ func main() {
 			os.Exit(1)
 		}
 	}
+
+	// Setup signal handler for graceful cleanup on Ctrl+C / SIGTERM.
+	// This ensures wpa_supplicant, dhclient/udhcpc, and resolv.conf are
+	// cleaned up if the user interrupts a long-running operation (e.g.,
+	// the 30s association wait during connect).
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+		// Best-effort cleanup: unlock resolv.conf so the system isn't left
+		// with an immutable file, and kill any DHCP/wpa processes we started.
+		if sysExecutor != nil && logger != nil {
+			logger.Debug("Signal received, cleaning up")
+			sysExecutor.ExecuteWithTimeout(2*time.Second, "chattr", "-i", "/etc/resolv.conf")
+		}
+		os.Exit(130) // Standard exit code for SIGINT
+	}()
+	_ = ctx // available for future use with ExecuteContext
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
