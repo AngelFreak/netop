@@ -56,6 +56,13 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, iface string
 	}
 }
 
+// SetAssociationTimeout configures the WiFi association timeout from user config.
+func (m *Manager) SetAssociationTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		m.associationTimeout = timeout
+	}
+}
+
 // Scan scans for available WiFi networks
 func (m *Manager) Scan() ([]types.WiFiNetwork, error) {
 	m.logger.Info("Scanning for WiFi networks", "interface", m.iface)
@@ -437,6 +444,10 @@ func (m *Manager) detectNetworkSecurity(ssid string) string {
 
 	// Cache was empty or SSID not found — do a fresh scan.
 	// This happens when the interface was cycled (e.g. MAC change) before connect.
+	// Ensure interface is up first — SetMAC may have cycled it.
+	m.executor.Execute("ip", "link", "set", m.iface, "up")
+	// Brief delay for the driver to initialize after interface up
+	time.Sleep(200 * time.Millisecond)
 	m.logger.Debug("Scan cache empty, running fresh scan for security detection")
 	return m.findSecurityInScan(ssid, "iw", m.iface, "scan")
 }

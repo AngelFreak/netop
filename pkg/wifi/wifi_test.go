@@ -355,18 +355,26 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	assert.Contains(t, executor.calledCommands, "ip route flush dev wlan0",
 		"should flush stale routes before connecting")
 
-	// Verify flush happens after terminateWpaSupplicant and before interface up
+	// Verify flush happens after terminateWpaSupplicant and before the main interface up.
+	// Note: detectNetworkSecurity may call "ip link set up" earlier for a fresh scan,
+	// so we find the interface-up that comes AFTER the flush.
 	flushAddrIdx := indexOf(executor.calledCommands, "ip addr flush dev wlan0")
 	flushRouteIdx := indexOf(executor.calledCommands, "ip route flush dev wlan0")
 	terminateIdx := indexOf(executor.calledCommands, "wpa_cli -i wlan0 terminate")
-	ifaceUpIdx := indexOf(executor.calledCommands, "ip link set wlan0 up")
 
-	// Find the interface-up that comes AFTER the flush (there may be an earlier one
-	// from other logic, but the one after flush is the pre-wpa_supplicant one)
 	assert.True(t, terminateIdx < flushAddrIdx, "flush addr should come after terminate")
 	assert.True(t, terminateIdx < flushRouteIdx, "flush route should come after terminate")
-	assert.True(t, flushAddrIdx < ifaceUpIdx, "flush addr should come before interface up")
-	assert.True(t, flushRouteIdx < ifaceUpIdx, "flush route should come before interface up")
+
+	// Find the interface-up AFTER the flush (the pre-wpa_supplicant one)
+	ifaceUpAfterFlush := -1
+	for i := flushAddrIdx + 1; i < len(executor.calledCommands); i++ {
+		if executor.calledCommands[i] == "ip link set wlan0 up" {
+			ifaceUpAfterFlush = i
+			break
+		}
+	}
+	assert.True(t, ifaceUpAfterFlush > flushAddrIdx, "interface up should come after flush addr")
+	assert.True(t, ifaceUpAfterFlush > flushRouteIdx, "interface up should come after flush route")
 }
 
 func TestDisconnect(t *testing.T) {

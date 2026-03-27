@@ -331,8 +331,10 @@ func (m *Manager) restoreDefaultRoute() {
 			}
 		}
 
-		// Skip VPN interfaces
-		if strings.HasPrefix(routeIface, "wg") || strings.HasPrefix(routeIface, "tun") {
+		// Skip VPN interfaces (WireGuard, OpenVPN, Tailscale, NetBird)
+		if strings.HasPrefix(routeIface, "wg") || strings.HasPrefix(routeIface, "tun") ||
+			strings.HasPrefix(routeIface, "tailscale") || strings.HasPrefix(routeIface, "wt") ||
+			strings.HasPrefix(routeIface, "utun") {
 			continue
 		}
 
@@ -722,7 +724,10 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 			}
 		}
 
-		// Set default route via WireGuard interface
+		// Set default route via WireGuard interface.
+		// The original gateway was already saved by Connect() before calling connectWireGuard,
+		// so disconnect can restore it. If there was no original gateway, warn but proceed —
+		// the user explicitly enabled gateway mode.
 		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", "default", "dev", iface)
 		if err != nil {
 			m.logger.Warn("Failed to set default route", "error", err)

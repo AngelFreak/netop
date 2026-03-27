@@ -185,11 +185,17 @@ func main() {
 	go func() {
 		<-sigCh
 		cancel()
-		// Best-effort cleanup: unlock resolv.conf so the system isn't left
-		// with an immutable file, and kill any DHCP/wpa processes we started.
+		// Best-effort cleanup so the system isn't left in a dirty state.
 		if sysExecutor != nil && logger != nil {
 			logger.Debug("Signal received, cleaning up")
+			// Unlock resolv.conf so DNS isn't permanently broken
 			sysExecutor.ExecuteWithTimeout(2*time.Second, "chattr", "-i", "/etc/resolv.conf")
+			// Kill any wpa_supplicant/dhclient we may have started
+			if iface != "" {
+				sysExecutor.ExecuteWithTimeout(1*time.Second, "wpa_cli", "-i", iface, "terminate")
+				sysExecutor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-f", "dhclient.*"+iface)
+				sysExecutor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-f", "udhcpc.*"+iface)
+			}
 		}
 		os.Exit(130) // Standard exit code for SIGINT
 	}()
@@ -227,8 +233,17 @@ func initializeManagers() {
 	// Initialize DHCP client manager (used by wifi and network managers)
 	dhcpClientMgr := dhcpclient.NewManager(sysExecutor, logger)
 
+	// Apply timeout config from YAML if available
+	if config != nil {
+		dhcpClientMgr.SetDHCPTimeout(config.Common.Timeouts.GetDHCPTimeout())
+	}
+
 	// Initialize managers
-	wifiMgr = wifi.NewManager(sysExecutor, logger, iface, dhcpClientMgr)
+	wifiManager := wifi.NewManager(sysExecutor, logger, iface, dhcpClientMgr)
+	if config != nil {
+		wifiManager.SetAssociationTimeout(config.Common.Timeouts.GetAssociationTimeout())
+	}
+	wifiMgr = wifiManager
 	vpnMgr = vpn.NewManager(sysExecutor, logger, cfgManager)
 	netMgr = network.NewManager(sysExecutor, logger, dhcpClientMgr)
 	hotspotMgr = hotspot.NewHotspotManager(sysExecutor, logger)

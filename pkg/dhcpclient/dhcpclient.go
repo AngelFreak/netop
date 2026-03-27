@@ -30,8 +30,9 @@ const (
 
 // Manager implements the DHCPClientManager interface
 type Manager struct {
-	executor types.SystemExecutor
-	logger   types.Logger
+	executor    types.SystemExecutor
+	logger      types.Logger
+	dhcpTimeout time.Duration // Configurable overall DHCP timeout (0 = use defaults)
 }
 
 // NewManager creates a new DHCP client manager
@@ -40,6 +41,30 @@ func NewManager(executor types.SystemExecutor, logger types.Logger) *Manager {
 		executor: executor,
 		logger:   logger,
 	}
+}
+
+// SetDHCPTimeout configures the DHCP acquisition timeout from user config.
+// If set, overrides the default UdhcpcTimeout and DhclientTimeout constants.
+func (m *Manager) SetDHCPTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		m.dhcpTimeout = timeout
+	}
+}
+
+// getUdhcpcTimeout returns the configured timeout or the default
+func (m *Manager) getUdhcpcTimeout() time.Duration {
+	if m.dhcpTimeout > 0 {
+		return m.dhcpTimeout
+	}
+	return UdhcpcTimeout
+}
+
+// getDhclientTimeout returns the configured timeout or the default
+func (m *Manager) getDhclientTimeout() time.Duration {
+	if m.dhcpTimeout > 0 {
+		return m.dhcpTimeout
+	}
+	return DhclientTimeout
 }
 
 // Acquire obtains a DHCP lease for the interface.
@@ -141,7 +166,7 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 		args = append(args, "-x", "hostname:"+hostname)
 	}
 
-	_, err := m.executor.ExecuteWithTimeout(UdhcpcTimeout, "udhcpc", args...)
+	_, err := m.executor.ExecuteWithTimeout(m.getUdhcpcTimeout(), "udhcpc", args...)
 	if err != nil {
 		// Clean up any partial state on failure
 		m.Release(iface)
@@ -161,7 +186,8 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	// Use -1 (one attempt) to prevent dhclient from retrying indefinitely,
 	// and -nw so it goes to background after obtaining a lease (keeping the
 	// renewal daemon alive for lease renewal).
-	args := []string{fmt.Sprintf("%d", int(DhclientTimeout.Seconds())), "dhclient", "-v", "-1"}
+	dhclientTimeout := m.getDhclientTimeout()
+	args := []string{fmt.Sprintf("%d", int(dhclientTimeout.Seconds())), "dhclient", "-v", "-1"}
 	if hostname != "" {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
 		// Create interface-specific dhclient.conf to avoid race conditions
