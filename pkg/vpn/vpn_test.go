@@ -337,7 +337,7 @@ func TestListVPNs(t *testing.T) {
 		}
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{} // No config
-		manager := NewManager(executor, logger, configMgr)
+		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -358,7 +358,7 @@ func TestListVPNs(t *testing.T) {
 		}
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{} // No config
-		manager := NewManager(executor, logger, configMgr)
+		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -378,7 +378,7 @@ func TestListVPNs(t *testing.T) {
 		}
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
-		manager := NewManager(executor, logger, configMgr)
+		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -405,7 +405,7 @@ func TestListVPNs(t *testing.T) {
 				},
 			},
 		}
-		manager := NewManager(executor, logger, configMgr)
+		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -447,7 +447,7 @@ func TestListVPNs(t *testing.T) {
 				},
 			},
 		}
-		manager := NewManager(executor, logger, configMgr)
+		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
