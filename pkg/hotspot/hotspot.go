@@ -484,9 +484,11 @@ func (h *hotspotManagerImpl) generateDnsmasqConfig(config *types.HotspotConfig) 
 	return nil
 }
 
-// isRunning checks if the hotspot is currently running
+// isRunning checks if the hotspot is currently running.
+// Returns true if either daemon is running (not just both), so Stop can
+// clean up partial failures where one daemon died but the other is alive.
 func (h *hotspotManagerImpl) isRunning() bool {
-	return h.hostapdRunning() && h.dnsmasqRunning()
+	return h.hostapdRunning() || h.dnsmasqRunning()
 }
 
 // hostapdRunning checks if hostapd is running by verifying PID and process name

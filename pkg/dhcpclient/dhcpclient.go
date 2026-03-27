@@ -66,6 +66,9 @@ func (m *Manager) Acquire(iface string, hostname string) error {
 	}
 
 	// Fall back to dhclient
+	if !m.executor.HasCommand("dhclient") {
+		return fmt.Errorf("no DHCP client found: install udhcpc (recommended) or dhclient")
+	}
 	m.logger.Debug("Using dhclient for DHCP")
 	return m.acquireDhclient(iface, hostname)
 }

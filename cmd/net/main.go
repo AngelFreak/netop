@@ -95,13 +95,26 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug logging")
 }
 
-// commandNeedsRoot returns false for commands that can run without root privileges
+// commandNeedsRoot returns false for commands that can run without root privileges.
+// Only checks the subcommand (first non-flag arg) and global flags, not positional
+// arguments — otherwise a network named "status" would skip the sudo elevation.
 func commandNeedsRoot() bool {
 	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" || arg == "help" ||
-			arg == "completion" || arg == "--version" || arg == "-v" ||
-			arg == "status" || arg == "show" || arg == "list" {
+		// Global flags that don't need root
+		if arg == "-h" || arg == "--help" || arg == "--version" || arg == "-v" {
 			return false
+		}
+		// Skip flag arguments (start with -)
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		// First positional arg is the subcommand — check if it's root-exempt
+		switch arg {
+		case "help", "completion", "status", "show", "list":
+			return false
+		default:
+			// First positional arg is not exempt, needs root
+			return true
 		}
 	}
 	return true

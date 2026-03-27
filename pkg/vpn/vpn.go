@@ -61,6 +61,19 @@ func (m *Manager) Connect(name string) error {
 
 	m.logger.Info("Connecting to VPN", "name", name)
 
+	// If already connected to a VPN, disconnect first to avoid corrupting
+	// the saved gateway state. Without this, origGW would capture the VPN's
+	// gateway instead of the physical one, making disconnect unable to
+	// restore the correct route.
+	existingState := m.getActiveVPNState()
+	if existingState != nil && existingState.Type != "" {
+		m.logger.Info("Disconnecting existing VPN before connecting new one", "existing", existingState.Name)
+		m.disconnectTracked(existingState)
+		// Restore original route from the existing state before saving new state
+		m.restoreDefaultRouteFromState(existingState)
+		m.clearActiveVPN()
+	}
+
 	// Load VPN config from ConfigManager
 	config, err := m.configMgr.GetVPNConfig(name)
 	if err != nil {
@@ -808,11 +821,6 @@ func (m *Manager) activeVPNFilePath() string {
 	return filepath.Join(m.runtimeDir, "active-vpn")
 }
 
-// setActiveVPN records the currently active VPN state to the state file
-// Enhanced format: vpn-name|interface|type|originalGateway|originalInterface
-func (m *Manager) setActiveVPN(name string) error {
-	return m.setActiveVPNState(vpnState{Name: name})
-}
 
 // setActiveVPNState records the full VPN state to the state file
 func (m *Manager) setActiveVPNState(state vpnState) error {

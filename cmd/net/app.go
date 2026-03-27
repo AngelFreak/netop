@@ -181,10 +181,13 @@ func (a *App) RunConnect(name, password string) error {
 	a.Logger.Debug("Connect command called", "name", name)
 
 	// Disconnect any active VPN before connecting to new network
-	// This prevents stale VPN routes/interfaces from interfering
-	a.Logger.Debug("Disconnecting any active VPN before connecting")
-	if err := a.VPNMgr.Disconnect(""); err != nil {
-		a.Logger.Debug("No active VPN to disconnect", "error", err)
+	// This prevents stale VPN routes/interfaces from interfering.
+	// Skip if --no-vpn is set — user wants to keep their VPN alive.
+	if !a.NoVPN {
+		a.Logger.Debug("Disconnecting any active VPN before connecting")
+		if err := a.VPNMgr.Disconnect(""); err != nil {
+			a.Logger.Debug("No active VPN to disconnect", "error", err)
+		}
 	}
 
 	// Check if it's a configured network
@@ -247,13 +250,14 @@ func (a *App) RunConnect(name, password string) error {
 
 // printConnectionInfo displays connection details
 func (a *App) printConnectionInfo(iface string) {
+	a.println("Connected!")
+
 	conn, err := a.NetworkMgr.GetConnectionInfo(iface)
 	if err != nil {
 		a.Logger.Debug("Failed to get connection info", "error", err)
 		return
 	}
 
-	a.println("Connected!")
 	if conn.IP != nil {
 		a.printf("  IP:      %s\n", conn.IP.String())
 	}
@@ -579,7 +583,7 @@ func (a *App) RunStatus() error {
 		config := a.ConfigMgr.GetConfig()
 		if config != nil {
 			commonMAC := config.Common.MAC
-			if commonMAC == "" || commonMAC == "random" {
+			if commonMAC == "random" {
 				macInfo = mac + " (random)"
 			} else if commonMAC == "default" {
 				macInfo = mac + " (randomized Apple OUI)"

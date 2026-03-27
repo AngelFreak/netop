@@ -28,6 +28,7 @@ var (
 		"dns":      true,
 		"hostname": true,
 		"vpn":      true,
+		"timeouts": true,
 	}
 
 	// Valid fields for IgnoredConfig

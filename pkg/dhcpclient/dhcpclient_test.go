@@ -227,6 +227,7 @@ func TestAcquire_UsesUdhcpcWhenAvailable(t *testing.T) {
 func TestAcquire_UsesDhclientAsFallback(t *testing.T) {
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
@@ -261,6 +262,7 @@ func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
 func TestAcquire_WithHostname_Dhclient(t *testing.T) {
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
@@ -280,6 +282,7 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 	// Verify different interfaces use different config files (no race condition)
 	executor1 := newMockExecutor()
 	executor1.hasCommands["udhcpc"] = false
+	executor1.hasCommands["dhclient"] = true
 	executor1.commands["pkill -9 -f udhcpc.*eth0"] = ""
 	executor1.commands["pkill -9 -f dhclient.*eth0"] = ""
 	executor1.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
@@ -292,6 +295,7 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 
 	executor2 := newMockExecutor()
 	executor2.hasCommands["udhcpc"] = false
+	executor2.hasCommands["dhclient"] = true
 	executor2.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor2.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor2.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
@@ -316,6 +320,7 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 func TestAcquire_DhcpClientFails(t *testing.T) {
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
@@ -410,6 +415,7 @@ func TestRelease_LogsCleanupErrors(t *testing.T) {
 func TestRenew_DelegatesToAcquire(t *testing.T) {
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
@@ -482,6 +488,7 @@ func TestParseIPAddress(t *testing.T) {
 func TestAcquire_DhclientConfigCreationFailure(t *testing.T) {
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
@@ -530,6 +537,7 @@ func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
 func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""

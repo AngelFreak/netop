@@ -57,6 +57,9 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
 
+	// Flush stale IP addresses (e.g., from a previous failed Stop)
+	d.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
+
 	// Set IP address on interface with configurable netmask
 	netmask := config.Netmask
 	if netmask == "" {

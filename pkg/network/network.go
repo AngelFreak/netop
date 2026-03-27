@@ -49,10 +49,18 @@ func (m *Manager) SetDNS(servers []string) error {
 
 	// Write to /etc/resolv.conf
 	var resolvConf strings.Builder
+	var validCount int
 	for _, server := range servers {
 		if net.ParseIP(server) != nil {
 			resolvConf.WriteString(fmt.Sprintf("nameserver %s\n", server))
+			validCount++
+		} else {
+			m.logger.Warn("Skipping invalid DNS server (not a valid IP)", "server", server)
 		}
+	}
+
+	if validCount == 0 {
+		return fmt.Errorf("no valid DNS servers: none of %v are valid IP addresses", servers)
 	}
 
 	if err := m.unlockResolvConf(); err != nil {

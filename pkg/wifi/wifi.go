@@ -274,10 +274,15 @@ func (m *Manager) ListConnections() ([]types.Connection, error) {
 		m.logger.Debug("Failed to get DNS servers", "error", err)
 	}
 
+	state := "disconnected"
+	if ip != nil {
+		state = "connected"
+	}
+
 	connection := types.Connection{
 		Interface: m.iface,
 		SSID:      ssid,
-		State:     "connected", // Assume connected if we have an IP
+		State:     state,
 		IP:        ip,
 		Gateway:   gateway,
 		DNS:       dns,
@@ -474,8 +479,8 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 	header := "ctrl_interface=/run/wpa_supplicant\n"
 
 	if password == "" {
-		// Open network
-		config := header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tkey_mgmt=NONE", escapedSSID)
+		// Open network — include scan_ssid=1 so hidden networks are probed
+		config := header + fmt.Sprintf("\nnetwork={\n\tssid=\"%s\"\n\tkey_mgmt=NONE\n\tscan_ssid=1", escapedSSID)
 		if validatedBSSID != "" {
 			config += fmt.Sprintf("\n\tbssid=%s", validatedBSSID)
 		}
@@ -659,14 +664,20 @@ func (m *Manager) waitForAssociation(expectedSSID string) error {
 	}
 
 	// Try event-based waiting first (faster)
+	start := time.Now()
 	err := m.waitForAssociationEvents(expectedSSID, timeout)
 	if err == nil {
 		return nil
 	}
 
-	// Event-based failed (likely wpa_cli doesn't support wait_event), fall back to polling
-	m.logger.Debug("Event-based association wait failed, using polling", "error", err)
-	return m.waitForAssociationPolling(expectedSSID, timeout)
+	// Event-based failed (likely wpa_cli doesn't support wait_event), fall back to polling.
+	// Subtract elapsed time so total wait doesn't exceed the configured timeout.
+	remaining := timeout - time.Since(start)
+	if remaining <= 0 {
+		return fmt.Errorf("timeout waiting for association with %q", expectedSSID)
+	}
+	m.logger.Debug("Event-based association wait failed, using polling", "error", err, "remaining", remaining)
+	return m.waitForAssociationPolling(expectedSSID, remaining)
 }
 
 // waitForAssociationEvents uses wpa_cli wait_event for instant notification
@@ -760,53 +771,3 @@ func (m *Manager) checkAssociationStatus(expectedSSID string) (bool, bool) {
 	return ssidMatch && stateCompleted, true
 }
 
-// isAssociatedWpaCli checks association status using wpa_cli (faster than iw)
-func (m *Manager) isAssociatedWpaCli(expectedSSID string) bool {
-	associated, _ := m.checkAssociationStatus(expectedSSID)
-	return associated
-}
-
-func (m *Manager) hasValidIP() bool {
-	// Check if interface has a valid IP address
-	output, err := m.executor.Execute("ip", "addr", "show", m.iface)
-	if err != nil {
-		return false
-	}
-
-	// Look for an inet address that's not localhost
-	ip := m.parseIPAddress(output)
-	if ip == nil {
-		return false
-	}
-
-	// Check it's not a link-local address (169.254.x.x)
-	if ip.IsLinkLocalUnicast() {
-		m.logger.Debug("Interface has link-local IP only (DHCP likely failed)", "ip", ip.String())
-		return false
-	}
-
-	// Check it's not loopback
-	if ip.IsLoopback() {
-		return false
-	}
-
-	return true
-}
-
-func (m *Manager) checkCaptivePortal() bool {
-	// Try to ping a known public DNS server
-	_, err := m.executor.Execute("ping", "-c", "1", "-W", "2", "8.8.8.8")
-	if err != nil {
-		// If ping fails, try to resolve a domain using getent (more portable than nslookup)
-		_, err = m.executor.Execute("getent", "hosts", "google.com")
-		if err != nil {
-			// Alternative: try with dig if getent is not available
-			_, err = m.executor.Execute("dig", "+short", "google.com")
-			if err != nil {
-				m.logger.Warn("Captive portal detected. To trigger the portal redirect, open a browser to http://neverssl.com")
-				return true // Likely captive portal
-			}
-		}
-	}
-	return false
-}
