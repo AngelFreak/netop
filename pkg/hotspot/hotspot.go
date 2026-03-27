@@ -20,6 +20,7 @@ type hotspotManagerImpl struct {
 	dnsmasqPidFile  string
 	hostapdConfFile string
 	dnsmasqConfFile string
+	stateFile       string // Persists hotspot interface and outInterface for crash recovery
 	currentConfig   *types.HotspotConfig
 	outInterface    string // Interface for NAT routing (e.g., eth0)
 }
@@ -33,6 +34,7 @@ func NewHotspotManager(executor types.SystemExecutor, logger types.Logger) types
 		dnsmasqPidFile:  types.RuntimeDir + "/dnsmasq-hotspot.pid",
 		hostapdConfFile: types.RuntimeDir + "/hostapd.conf",
 		dnsmasqConfFile: types.RuntimeDir + "/dnsmasq-hotspot.conf",
+		stateFile:       types.RuntimeDir + "/hotspot-state",
 	}
 }
 
@@ -97,6 +99,10 @@ func (h *hotspotManagerImpl) Start(config *types.HotspotConfig) error {
 	}
 
 	h.currentConfig = config
+
+	// Persist state for crash recovery (so Stop can clean up NAT even after restart)
+	h.saveState(config.Interface)
+
 	h.logger.Info("Hotspot started successfully", "ssid", config.SSID)
 	return nil
 }
@@ -203,17 +209,20 @@ func (h *hotspotManagerImpl) detectOutInterface(exclude string) string {
 	return ""
 }
 
-// cleanupNAT removes NAT rules
+// cleanupNAT removes NAT rules and disables IP forwarding
 func (h *hotspotManagerImpl) cleanupNAT(hotspotIface string) {
 	outIface := h.outInterface
-	if outIface == "" {
-		return
+	if outIface != "" {
+		// Remove NAT rules (ignore errors - rules may not exist)
+		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
+		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-i", hotspotIface, "-j", "ACCEPT")
+		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 	}
 
-	// Remove NAT rules (ignore errors - rules may not exist)
-	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
-	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-i", hotspotIface, "-j", "ACCEPT")
-	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	// Disable IP forwarding (was enabled in setupNAT)
+	if _, err := h.executor.ExecuteWithTimeout(2*time.Second, "sh", "-c", "echo 0 > /proc/sys/net/ipv4/ip_forward"); err != nil {
+		h.logger.Warn("Failed to disable IP forwarding", "error", err.Error())
+	}
 }
 
 // Stop stops the running hotspot
@@ -224,11 +233,19 @@ func (h *hotspotManagerImpl) Stop() error {
 		return fmt.Errorf("hotspot is not running")
 	}
 
+	// Recover state from file if currentConfig is nil (e.g., after crash/restart)
+	if h.currentConfig == nil || h.outInterface == "" {
+		h.loadState()
+	}
+
 	var errors []string
 
 	// Clean up NAT rules first
 	if h.currentConfig != nil {
 		h.cleanupNAT(h.currentConfig.Interface)
+	} else {
+		// Even without config, disable IP forwarding as a safety measure
+		h.cleanupNAT("")
 	}
 
 	// Stop dnsmasq
@@ -270,6 +287,7 @@ func (h *hotspotManagerImpl) Stop() error {
 
 	h.currentConfig = nil
 	h.outInterface = ""
+	os.Remove(h.stateFile)
 
 	if len(errors) > 0 {
 		return fmt.Errorf("errors stopping hotspot: %s", strings.Join(errors, "; "))
@@ -519,6 +537,10 @@ func (h *hotspotManagerImpl) stopHostapd() error {
 	}
 
 	pid := strings.TrimSpace(string(data))
+	if !isValidPID(pid) {
+		os.Remove(h.hostapdPidFile)
+		return fmt.Errorf("invalid PID in %s: %q", h.hostapdPidFile, pid)
+	}
 	if err := h.killProcess(pid); err != nil {
 		return fmt.Errorf("failed to kill hostapd: %w", err)
 	}
@@ -535,12 +557,49 @@ func (h *hotspotManagerImpl) stopDnsmasq() error {
 	}
 
 	pid := strings.TrimSpace(string(data))
+	if !isValidPID(pid) {
+		os.Remove(h.dnsmasqPidFile)
+		return fmt.Errorf("invalid PID in %s: %q", h.dnsmasqPidFile, pid)
+	}
 	if err := h.killProcess(pid); err != nil {
 		return fmt.Errorf("failed to kill dnsmasq: %w", err)
 	}
 
 	os.Remove(h.dnsmasqPidFile)
 	return nil
+}
+
+// isValidPID checks that a PID string is a positive integer
+func isValidPID(pid string) bool {
+	if pid == "" {
+		return false
+	}
+	n, err := strconv.Atoi(pid)
+	return err == nil && n > 0
+}
+
+// saveState persists hotspot interface and outInterface to a state file for crash recovery
+func (h *hotspotManagerImpl) saveState(hotspotIface string) {
+	// Format: hotspotInterface|outInterface
+	content := hotspotIface + "|" + h.outInterface
+	if err := os.WriteFile(h.stateFile, []byte(content), 0600); err != nil {
+		h.logger.Debug("Failed to save hotspot state", "error", err)
+	}
+}
+
+// loadState recovers hotspot state from the state file (e.g., after crash/restart)
+func (h *hotspotManagerImpl) loadState() {
+	data, err := os.ReadFile(h.stateFile)
+	if err != nil {
+		return
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 2)
+	if len(parts) >= 1 && parts[0] != "" {
+		h.currentConfig = &types.HotspotConfig{Interface: parts[0]}
+	}
+	if len(parts) >= 2 && parts[1] != "" {
+		h.outInterface = parts[1]
+	}
 }
 
 // killProcess kills a process with SIGTERM, falling back to SIGKILL if needed

@@ -144,7 +144,7 @@ func TestAcquire_ValidatesInterfaceName(t *testing.T) {
 			executor.commands["pkill -9 -f dhclient.*"+tt.iface] = ""
 			executor.commands["rm -f /var/lib/dhcp/dhclient."+tt.iface+".leases /run/net/dhclient."+tt.iface+".leases"] = ""
 			executor.commands["rm -f /run/net/dhclient."+tt.iface+".conf"] = ""
-			executor.commands["timeout 15 dhclient -v "+tt.iface] = ""
+			executor.commands["timeout 15 dhclient -v -1 "+tt.iface] = ""
 			executor.commands["ip addr show "+tt.iface] = "inet 192.168.1.50/24"
 			logger := &mockLogger{}
 			manager := NewManager(executor, logger)
@@ -185,8 +185,8 @@ func TestAcquire_ValidatesHostname(t *testing.T) {
 			executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 			executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 			executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-			executor.commands["timeout 15 dhclient -v wlan0"] = ""
-			executor.commands["timeout 15 dhclient -v -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+			executor.commands["timeout 15 dhclient -v -1 wlan0"] = ""
+			executor.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
 			executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 			logger := &mockLogger{}
 			manager := NewManager(executor, logger)
@@ -231,14 +231,14 @@ func TestAcquire_UsesDhclientAsFallback(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 15 dhclient -v wlan0"] = ""
+	executor.commands["timeout 15 dhclient -v -1 wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "dhclient -v wlan0")
+	executor.assertCommandExecuted(t, "dhclient -v -1 wlan0")
 }
 
 func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
@@ -266,7 +266,7 @@ func TestAcquire_WithHostname_Dhclient(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
 	executor.commands["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 15 dhclient -v -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+	executor.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
@@ -285,7 +285,7 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 	executor1.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
 	executor1.commands["rm -f /run/net/dhclient.eth0.conf"] = ""
 	executor1.commands["install -m 0600 /dev/stdin /run/net/dhclient.eth0.conf"] = ""
-	executor1.commands["timeout 15 dhclient -v -cf /run/net/dhclient.eth0.conf eth0"] = ""
+	executor1.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.eth0.conf eth0"] = ""
 	executor1.commands["ip addr show eth0"] = "inet 10.0.0.50/24"
 	logger1 := &mockLogger{}
 	manager1 := NewManager(executor1, logger1)
@@ -297,7 +297,7 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 	executor2.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor2.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
 	executor2.commands["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = ""
-	executor2.commands["timeout 15 dhclient -v -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+	executor2.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
 	executor2.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger2 := &mockLogger{}
 	manager2 := NewManager(executor2, logger2)
@@ -320,7 +320,7 @@ func TestAcquire_DhcpClientFails(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["timeout 15 dhclient -v wlan0"] = errors.New("dhclient: no lease obtained")
+	executor.errors["timeout 15 dhclient -v -1 wlan0"] = errors.New("dhclient: no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
@@ -414,14 +414,14 @@ func TestRenew_DelegatesToAcquire(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 15 dhclient -v wlan0"] = ""
+	executor.commands["timeout 15 dhclient -v -1 wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
 	err := manager.Renew("wlan0", "")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "dhclient -v wlan0")
+	executor.assertCommandExecuted(t, "dhclient -v -1 wlan0")
 }
 
 // Tests for parseIPAddress
@@ -535,7 +535,7 @@ func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["timeout 15 dhclient -v wlan0"] = errors.New("no lease obtained")
+	executor.errors["timeout 15 dhclient -v -1 wlan0"] = errors.New("no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 

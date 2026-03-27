@@ -155,7 +155,10 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	m.Release(iface)
 
 	// Build dhclient command with optional hostname via config file
-	args := []string{fmt.Sprintf("%d", int(DhclientTimeout.Seconds())), "dhclient", "-v"}
+	// Use -1 (one attempt) to prevent dhclient from retrying indefinitely,
+	// and -nw so it goes to background after obtaining a lease (keeping the
+	// renewal daemon alive for lease renewal).
+	args := []string{fmt.Sprintf("%d", int(DhclientTimeout.Seconds())), "dhclient", "-v", "-1"}
 	if hostname != "" {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
 		// Create interface-specific dhclient.conf to avoid race conditions
@@ -170,7 +173,9 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	}
 	args = append(args, iface)
 
-	// Start dhclient with timeout wrapper
+	// Start dhclient with timeout wrapper. The -1 flag ensures dhclient
+	// exits after the first attempt (success or fail) rather than retrying
+	// forever. The timeout wrapper is a safety net in case dhclient hangs.
 	_, err := m.executor.Execute("timeout", args...)
 	if err != nil {
 		// Clean up any partial state on failure

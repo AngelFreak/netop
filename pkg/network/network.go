@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -192,6 +193,11 @@ func (m *Manager) SetIP(iface, addr, gateway string) error {
 	m.logger.Info("Setting IP configuration", "interface", iface, "addr", addr, "gateway", gateway)
 	m.logger.Debug("SetIP using wireless interface", "interface", iface)
 
+	// Validate interface name
+	if err := types.ValidateInterfaceName(iface); err != nil {
+		return fmt.Errorf("invalid interface: %w", err)
+	}
+
 	// Flush existing addresses
 	_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "flush", "dev", iface)
 	if err != nil {
@@ -199,6 +205,18 @@ func (m *Manager) SetIP(iface, addr, gateway string) error {
 	}
 
 	if addr != "" {
+		// Validate CIDR notation (e.g., "10.0.0.1/24")
+		if !strings.Contains(addr, "/") {
+			return fmt.Errorf("invalid IP address %q: must be in CIDR notation (e.g., 10.0.0.1/24)", addr)
+		}
+		ip, _, err := net.ParseCIDR(addr)
+		if err != nil {
+			return fmt.Errorf("invalid IP address %q: %w", addr, err)
+		}
+		if ip == nil {
+			return fmt.Errorf("invalid IP address %q", addr)
+		}
+
 		// Add IP address
 		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", addr, "dev", iface)
 		if err != nil {
@@ -207,6 +225,11 @@ func (m *Manager) SetIP(iface, addr, gateway string) error {
 	}
 
 	if gateway != "" {
+		// Validate gateway is a valid IP
+		if net.ParseIP(gateway) == nil {
+			return fmt.Errorf("invalid gateway %q: must be a valid IP address", gateway)
+		}
+
 		// Add default route
 		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "add", "default", "via", gateway, "dev", iface)
 		if err != nil {
@@ -481,7 +504,7 @@ func (m *Manager) getPermanentMAC(iface string) (string, error) {
 	}
 	// Parse "Permanent address: aa:bb:cc:dd:ee:ff"
 	output = strings.TrimSpace(output)
-	parts := strings.Split(output, ": ")
+	parts := strings.SplitN(output, ": ", 2)
 	if len(parts) == 2 {
 		mac := strings.TrimSpace(parts[1])
 		// Validate the MAC format
@@ -494,25 +517,21 @@ func (m *Manager) getPermanentMAC(iface string) (string, error) {
 }
 
 func (m *Manager) writeFile(path, content string) error {
-	// Use a simple echo to file approach since we don't have direct file writing
-	// In a real implementation, you'd want proper file permissions handling
-	tempFile := types.RuntimeDir + "/staging.conf"
-	// Remove temp file before writing to prevent permission errors
-	_, err := m.executor.Execute("rm", "-f", tempFile)
-	if err != nil {
-		m.logger.Warn("Failed to remove temp file", "error", err)
-	}
-	err = m.writeFileDirect(tempFile, content)
+	// Use a unique temp file to avoid race conditions with concurrent writes
+	tempFile := fmt.Sprintf("%s/staging.%d.conf", types.RuntimeDir, os.Getpid())
+	err := m.writeFileDirect(tempFile, content)
 	if err != nil {
 		return err
 	}
 
 	_, err = m.executor.Execute("mv", tempFile, path)
+	if err != nil {
+		m.executor.Execute("rm", "-f", tempFile)
+	}
 	return err
 }
 
 func (m *Manager) writeFileDirect(path, content string) error {
-	// This is a simplified version. In production, use proper file I/O
 	_, err := m.executor.ExecuteWithInput("tee", content, path)
 	return err
 }

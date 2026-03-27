@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,15 +129,20 @@ func (m *Manager) Disconnect(name string) error {
 	// Read the VPN state to know exactly what to clean up
 	state := m.getActiveVPNState()
 
+	var disconnectErr error
+
 	// Disconnect based on tracked state (process isolation)
 	if state != nil && state.Type != "" {
 		m.logger.Debug("Using tracked VPN state for disconnect", "type", state.Type, "interface", state.Interface)
-		m.disconnectTracked(state)
-	} else {
-		// Fallback to legacy behavior for backwards compatibility
-		// (e.g., VPNs started outside of net or old state files)
-		m.logger.Debug("No tracked VPN state, using legacy disconnect")
+		disconnectErr = m.disconnectTracked(state)
+	} else if state != nil {
+		// State file exists but no type — legacy format
+		m.logger.Debug("Legacy VPN state, using legacy disconnect")
 		m.disconnectLegacy()
+	} else {
+		// No state file at all — no VPN was connected via net
+		m.logger.Debug("No active VPN to disconnect")
+		return fmt.Errorf("no active VPN connection")
 	}
 
 	// Remove the VPN endpoint route if we added one (no nested lock needed, already holding m.mu)
@@ -153,17 +159,18 @@ func (m *Manager) Disconnect(name string) error {
 	// Clear the active VPN state file
 	m.clearActiveVPN()
 
-	return nil
+	return disconnectErr
 }
 
 // disconnectTracked disconnects using tracked state (process isolation)
-func (m *Manager) disconnectTracked(state *vpnState) {
+func (m *Manager) disconnectTracked(state *vpnState) error {
 	switch state.Type {
 	case "openvpn":
 		// Kill only our OpenVPN process using PID file
 		pidFile := filepath.Join(m.runtimeDir, "openvpn.pid")
 		if err := system.KillProcessByPID(m.executor, m.logger, pidFile); err != nil {
-			m.logger.Debug("Failed to kill tracked OpenVPN", "error", err)
+			m.logger.Warn("Failed to kill tracked OpenVPN", "error", err)
+			return fmt.Errorf("failed to stop OpenVPN: %w", err)
 		}
 		// Bring down the tun interface
 		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", "tun0", "down"); err != nil {
@@ -176,17 +183,21 @@ func (m *Manager) disconnectTracked(state *vpnState) {
 			iface = "wg0"
 		}
 		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface); err != nil {
-			m.logger.Debug("Failed to delete WireGuard interface", "interface", iface, "error", err)
+			m.logger.Warn("Failed to delete WireGuard interface", "interface", iface, "error", err)
+			return fmt.Errorf("failed to delete WireGuard interface %s: %w", iface, err)
 		}
 	case "tailscale":
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
-			m.logger.Debug("Failed to disconnect Tailscale", "error", err)
+			m.logger.Warn("Failed to disconnect Tailscale", "error", err)
+			return fmt.Errorf("failed to disconnect Tailscale: %w", err)
 		}
 	case "netbird":
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
-			m.logger.Debug("Failed to disconnect NetBird", "error", err)
+			m.logger.Warn("Failed to disconnect NetBird", "error", err)
+			return fmt.Errorf("failed to disconnect NetBird: %w", err)
 		}
 	}
+	return nil
 }
 
 // disconnectLegacy disconnects using legacy behavior (kills all VPN processes)
@@ -682,7 +693,7 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 	if config.Gateway {
 		// Extract endpoint IP from config to route it via the original gateway
 		endpoint := m.extractEndpoint(config.Config)
-		if endpoint != "" {
+		if endpoint != "" && net.ParseIP(endpoint) != nil {
 			// Get current default gateway before we change it
 			gateway, gwIface := m.getCurrentGateway()
 			if gateway != "" && gwIface != "" {

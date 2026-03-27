@@ -224,8 +224,8 @@ func (m *Manager) Disconnect() error {
 	// Terminate wpa_supplicant for this interface only (not global)
 	m.terminateWpaSupplicant()
 
-	// Terminate dhclient for this interface only (not global)
-	m.terminateDhclient()
+	// Terminate all DHCP clients (dhclient and udhcpc) for this interface
+	m.terminateDhcpClients()
 
 	// Flush all IP addresses from interface
 	if _, err := m.executor.Execute("ip", "addr", "flush", "dev", m.iface); err != nil {
@@ -613,13 +613,16 @@ func (m *Manager) terminateWpaSupplicant() {
 	// This reaches both standalone and system (D-Bus) wpa_supplicant instances.
 	_, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "terminate")
 	if err != nil {
-		// Fallback: kill ALL wpa_supplicant processes.
-		// The system wpa_supplicant (started via -u -s for D-Bus) doesn't use
-		// -i flag, so interface-specific pkill won't match it.
-		// We must kill it to avoid nl80211 "Match already configured" conflicts
-		// that prevent our instance from creating its control socket.
-		m.executor.ExecuteWithTimeout(500*time.Millisecond,
-			"pkill", "-9", "wpa_supplicant")
+		// Fallback: try interface-specific kill first by matching the -i flag
+		_, err2 := m.executor.ExecuteWithTimeout(500*time.Millisecond,
+			"pkill", "-9", "-f", fmt.Sprintf("wpa_supplicant.*-i.*%s", m.iface))
+		if err2 != nil {
+			// Last resort: kill the system wpa_supplicant (started via -u -s for D-Bus)
+			// which doesn't use -i flag. Required to avoid nl80211 "Match already
+			// configured" conflicts that prevent our instance from creating its socket.
+			m.executor.ExecuteWithTimeout(500*time.Millisecond,
+				"pkill", "-9", "wpa_supplicant")
+		}
 	}
 
 	// Give the process time to fully exit and release nl80211 resources
@@ -631,12 +634,9 @@ func (m *Manager) terminateWpaSupplicant() {
 	m.executor.Execute("rm", "-f", fmt.Sprintf("/run/wpa_supplicant/%s", m.iface))
 }
 
-// terminateDhclient terminates dhclient for this interface only
-func (m *Manager) terminateDhclient() {
-	// Interface-specific pkill
-	// Pattern matches: dhclient ... <interface> (interface is typically last arg)
-	m.executor.ExecuteWithTimeout(500*time.Millisecond,
-		"pkill", "-9", "-f", fmt.Sprintf("dhclient.*%s", m.iface))
+// terminateDhcpClients terminates all DHCP clients (dhclient and udhcpc) for this interface
+func (m *Manager) terminateDhcpClients() {
+	m.dhcpClient.Release(m.iface)
 }
 
 // waitForWpaSupplicantReady polls until wpa_supplicant responds to wpa_cli

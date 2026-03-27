@@ -373,12 +373,11 @@ func TestDisconnect(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			// Interface-specific termination commands
-			"wpa_cli -i wlan0 terminate":                        "",
-			"rm -f /run/wpa_supplicant/wlan0":                   "",
-			"pkill -9 -f dhclient.*wlan0":                       "",
-			"ip addr flush dev wlan0":                           "",
-			"ip route flush dev wlan0":                          "",
-			"ip link set wlan0 down":                            "",
+			"wpa_cli -i wlan0 terminate":      "",
+			"rm -f /run/wpa_supplicant/wlan0": "",
+			"ip addr flush dev wlan0":         "",
+			"ip route flush dev wlan0":        "",
+			"ip link set wlan0 down":          "",
 		},
 	}
 	logger := &mockLogger{}
@@ -1164,7 +1163,7 @@ func TestDisconnect_AdditionalCases(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0", dhcpClient: &mockDHCPClient{}}
 
 		err := manager.Disconnect()
 		assert.NoError(t, err)
@@ -1180,7 +1179,7 @@ func TestDisconnect_AdditionalCases(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0", dhcpClient: &mockDHCPClient{}}
 
 		err := manager.Disconnect()
 		// Should return error if interface down fails
@@ -1346,44 +1345,23 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	})
 }
 
-func TestTerminateDhclient(t *testing.T) {
-	t.Run("kills dhclient for specific interface", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"pkill -9 -f dhclient.*wlan0": "",
-			},
-		}
+func TestTerminateDhcpClients(t *testing.T) {
+	t.Run("delegates to dhcpClient.Release", func(t *testing.T) {
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+		dhcpClient := &mockDHCPClient{}
+		manager := &Manager{logger: logger, iface: "wlan0", dhcpClient: dhcpClient}
 
 		// Should not panic
-		manager.terminateDhclient()
+		manager.terminateDhcpClients()
 	})
 
-	t.Run("uses correct interface pattern", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"pkill -9 -f dhclient.*eth0": "",
-			},
-		}
+	t.Run("handles Release error gracefully", func(t *testing.T) {
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "eth0"}
+		dhcpClient := &mockDHCPClient{releaseErr: assert.AnError}
+		manager := &Manager{logger: logger, iface: "wlan0", dhcpClient: dhcpClient}
 
-		manager.terminateDhclient()
-	})
-
-	t.Run("handles no matching process gracefully", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{},
-			errors: map[string]error{
-				"pkill -9 -f dhclient.*wlan0": assert.AnError, // No process found
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		// Should not panic even if no process found
-		manager.terminateDhclient()
+		// Should not panic even if Release fails
+		manager.terminateDhcpClients()
 	})
 }
 
@@ -1394,12 +1372,11 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				// Interface-specific commands for wlan0 only
-				"wpa_cli -i wlan0 terminate":             "OK",
-				"rm -f /run/wpa_supplicant/wlan0":        "",
-				"pkill -9 -f dhclient.*wlan0": "",
-				"ip addr flush dev wlan0":    "",
-				"ip route flush dev wlan0":   "",
-				"ip link set wlan0 down":     "",
+				"wpa_cli -i wlan0 terminate":      "OK",
+				"rm -f /run/wpa_supplicant/wlan0":  "",
+				"ip addr flush dev wlan0":          "",
+				"ip route flush dev wlan0":         "",
+				"ip link set wlan0 down":           "",
 			},
 		}
 		logger := &mockLogger{}
@@ -1408,8 +1385,8 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 		err := manager.Disconnect()
 		assert.NoError(t, err)
 
-		// Note: dhclient termination is still interface-specific to avoid
-		// killing dhclient on other interfaces
+		// DHCP client cleanup is now delegated to dhcpClient.Release()
+		// which kills both udhcpc and dhclient for the specific interface
 	})
 }
 
