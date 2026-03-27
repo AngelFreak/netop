@@ -469,11 +469,19 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 		return nil, fmt.Errorf("network configuration '%s' not found", name)
 	}
 
-	var netConfig types.NetworkConfig
+	// Handle aliases: if the value is a plain string (e.g., "work: home"),
+	// treat it as an alias pointing to another network config.
 	subV := m.viper.Sub(name)
 	if subV == nil {
+		aliasTarget := m.viper.GetString(name)
+		if aliasTarget != "" {
+			m.logger.Debug("Network alias detected", "alias", name, "target", aliasTarget)
+			return m.resolveAlias(aliasTarget, 5)
+		}
 		return nil, fmt.Errorf("failed to read network configuration '%s'", name)
 	}
+
+	var netConfig types.NetworkConfig
 
 	if err := subV.Unmarshal(&netConfig); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal network config '%s': %w", name, err)
@@ -483,6 +491,39 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 	m.config.Networks[name] = netConfig
 	m.logger.Debug("Loaded network config", "network", name, "ssid", netConfig.SSID)
 
+	return &netConfig, nil
+}
+
+// resolveAlias follows alias chains with a depth limit to prevent circular references.
+func (m *Manager) resolveAlias(name string, maxDepth int) (*types.NetworkConfig, error) {
+	if maxDepth <= 0 {
+		return nil, fmt.Errorf("alias chain too deep or circular (at '%s')", name)
+	}
+
+	// Check cache first
+	if config, exists := m.config.Networks[name]; exists {
+		return &config, nil
+	}
+
+	if !m.viper.IsSet(name) {
+		return nil, fmt.Errorf("alias target '%s' not found", name)
+	}
+
+	subV := m.viper.Sub(name)
+	if subV == nil {
+		// Another alias — follow the chain
+		aliasTarget := m.viper.GetString(name)
+		if aliasTarget != "" {
+			return m.resolveAlias(aliasTarget, maxDepth-1)
+		}
+		return nil, fmt.Errorf("failed to read network configuration '%s'", name)
+	}
+
+	// Found a real config — unmarshal it
+	var netConfig types.NetworkConfig
+	if err := subV.Unmarshal(&netConfig); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal network config '%s': %w", name, err)
+	}
 	return &netConfig, nil
 }
 
