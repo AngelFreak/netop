@@ -535,12 +535,14 @@ func (m *Manager) removeFile(path string) {
 func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to Tailscale")
 
-	// Switch profile if specified (for multi-account support)
+	// Switch profile if specified (for multi-account support).
+	// "tailscale switch" may return a non-zero exit code even on success
+	// (e.g. empty stderr), so we only warn when stderr contains a message.
 	if config.Profile != "" {
 		m.logger.Debug("Switching Tailscale profile", "profile", config.Profile)
 		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "switch", config.Profile)
-		if err != nil {
-			m.logger.Warn("Failed to switch Tailscale profile (may not exist yet)", "profile", config.Profile, "error", err)
+		if err != nil && !isEmptyStderrError(err) {
+			m.logger.Warn("Failed to switch Tailscale profile", "profile", config.Profile, "error", err)
 		}
 	}
 
@@ -581,6 +583,12 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	m.logger.Info("Tailscale connected")
 	return nil
+}
+
+// isEmptyStderrError returns true when the error is a command failure with
+// no meaningful stderr output (e.g. "command failed: exit status 1 (stderr: )").
+func isEmptyStderrError(err error) bool {
+	return err != nil && strings.HasSuffix(err.Error(), "(stderr: )")
 }
 
 // connectNetBird connects using the NetBird CLI
