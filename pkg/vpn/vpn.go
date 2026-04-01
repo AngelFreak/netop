@@ -544,8 +544,10 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 		}
 	}
 
-	// Build args: always disable DNS (netop manages resolv.conf)
-	args := []string{"up", "--accept-dns=false"}
+	// Build args: --reset ensures a clean slate when switching profiles
+	// (Tailscale refuses `up` with changed settings unless all non-default
+	// flags are repeated or --reset is passed).
+	args := []string{"up", "--reset", "--accept-dns=false"}
 
 	if config.AuthKey != "" {
 		args = append(args, "--authkey="+config.AuthKey)
