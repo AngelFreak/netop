@@ -544,24 +544,31 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 		}
 	}
 
-	// Build args: --reset ensures a clean slate when switching profiles
-	// (Tailscale refuses `up` with changed settings unless all non-default
-	// flags are repeated or --reset is passed).
-	args := []string{"up", "--reset", "--accept-dns=false"}
-
+	// Bring the interface up first. When an authkey is provided we pass it
+	// here so the node can register; otherwise a bare "up" just ensures the
+	// daemon is running (it won't block if already authenticated).
+	upArgs := []string{"up"}
 	if config.AuthKey != "" {
-		args = append(args, "--authkey="+config.AuthKey)
-	}
-	if config.ExitNode != "" {
-		args = append(args, "--exit-node="+config.ExitNode)
-	}
-	if config.AcceptRoutes {
-		args = append(args, "--accept-routes")
+		upArgs = append(upArgs, "--authkey="+config.AuthKey)
 	}
 
-	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", args...)
+	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", upArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to connect Tailscale: %w", err)
+	}
+
+	// Apply settings via "tailscale set" which changes individual prefs
+	// without requiring all non-default flags (unlike "up").
+	setArgs := []string{"set", "--accept-dns=false"}
+	if config.ExitNode != "" {
+		setArgs = append(setArgs, "--exit-node="+config.ExitNode)
+	}
+	if config.AcceptRoutes {
+		setArgs = append(setArgs, "--accept-routes")
+	}
+
+	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", setArgs...); err != nil {
+		return fmt.Errorf("failed to apply Tailscale settings: %w", err)
 	}
 
 	// Verify connection
