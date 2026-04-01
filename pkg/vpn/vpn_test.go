@@ -871,7 +871,7 @@ func TestActiveVPNStateFile(t *testing.T) {
 		assert.Equal(t, "", result)
 	})
 
-	t.Run("setActiveVPN and getActiveVPN roundtrip", func(t *testing.T) {
+	t.Run("setActiveVPNState and getActiveVPN roundtrip", func(t *testing.T) {
 		tempDir := t.TempDir()
 		executor := &mockSystemExecutor{}
 		logger := &mockLogger{}
@@ -879,7 +879,7 @@ func TestActiveVPNStateFile(t *testing.T) {
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
 
 		// Set active VPN
-		err := manager.setActiveVPN("test-vpn")
+		err := manager.setActiveVPNState(vpnState{Name: "test-vpn"})
 		assert.NoError(t, err)
 
 		// Read it back

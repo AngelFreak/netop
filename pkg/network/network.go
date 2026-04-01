@@ -49,10 +49,18 @@ func (m *Manager) SetDNS(servers []string) error {
 
 	// Write to /etc/resolv.conf
 	var resolvConf strings.Builder
+	var validCount int
 	for _, server := range servers {
 		if net.ParseIP(server) != nil {
 			resolvConf.WriteString(fmt.Sprintf("nameserver %s\n", server))
+			validCount++
+		} else {
+			m.logger.Warn("Skipping invalid DNS server (not a valid IP)", "server", server)
 		}
+	}
+
+	if validCount == 0 {
+		return fmt.Errorf("no valid DNS servers: none of %v are valid IP addresses", servers)
 	}
 
 	if err := m.unlockResolvConf(); err != nil {
@@ -627,6 +635,16 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		}
 	} else {
 		m.logger.Debug("No SSID specified in network config - treating as wired connection")
+
+		// Tear down any active WiFi connection first so its default route,
+		// DHCP client, and wpa_supplicant don't interfere with the wired link.
+		if wifiMgr != nil {
+			m.logger.Debug("Disconnecting WiFi before switching to wired")
+			if err := wifiMgr.Disconnect(); err != nil {
+				m.logger.Debug("No active WiFi to disconnect", "error", err)
+			}
+		}
+
 		// For wired connections, bring up the interface and get DHCP if no static IP
 		if config.Interface != "" {
 			// Flush stale IP addresses and routes — after suspend/resume the old

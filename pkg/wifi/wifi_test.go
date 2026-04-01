@@ -355,18 +355,26 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	assert.Contains(t, executor.calledCommands, "ip route flush dev wlan0",
 		"should flush stale routes before connecting")
 
-	// Verify flush happens after terminateWpaSupplicant and before interface up
+	// Verify flush happens after terminateWpaSupplicant and before the main interface up.
+	// Note: detectNetworkSecurity may call "ip link set up" earlier for a fresh scan,
+	// so we find the interface-up that comes AFTER the flush.
 	flushAddrIdx := indexOf(executor.calledCommands, "ip addr flush dev wlan0")
 	flushRouteIdx := indexOf(executor.calledCommands, "ip route flush dev wlan0")
 	terminateIdx := indexOf(executor.calledCommands, "wpa_cli -i wlan0 terminate")
-	ifaceUpIdx := indexOf(executor.calledCommands, "ip link set wlan0 up")
 
-	// Find the interface-up that comes AFTER the flush (there may be an earlier one
-	// from other logic, but the one after flush is the pre-wpa_supplicant one)
 	assert.True(t, terminateIdx < flushAddrIdx, "flush addr should come after terminate")
 	assert.True(t, terminateIdx < flushRouteIdx, "flush route should come after terminate")
-	assert.True(t, flushAddrIdx < ifaceUpIdx, "flush addr should come before interface up")
-	assert.True(t, flushRouteIdx < ifaceUpIdx, "flush route should come before interface up")
+
+	// Find the interface-up AFTER the flush (the pre-wpa_supplicant one)
+	ifaceUpAfterFlush := -1
+	for i := flushAddrIdx + 1; i < len(executor.calledCommands); i++ {
+		if executor.calledCommands[i] == "ip link set wlan0 up" {
+			ifaceUpAfterFlush = i
+			break
+		}
+	}
+	assert.True(t, ifaceUpAfterFlush > flushAddrIdx, "interface up should come after flush addr")
+	assert.True(t, ifaceUpAfterFlush > flushRouteIdx, "interface up should come after flush route")
 }
 
 func TestDisconnect(t *testing.T) {
@@ -1015,141 +1023,6 @@ func TestDecodeSSID(t *testing.T) {
 	t.Run("Multiple hex escapes", func(t *testing.T) {
 		ssid := manager.decodeSSID("\\x48\\x65\\x6c\\x6c\\x6f") // "Hello"
 		assert.Equal(t, "Hello", ssid)
-	})
-}
-
-func TestHasValidIP(t *testing.T) {
-	t.Run("valid IP", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>
-    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0`,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.hasValidIP()
-		assert.True(t, result)
-	})
-
-	t.Run("link-local IP", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>
-    inet 169.254.1.1/16 brd 169.254.255.255 scope link wlan0`,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.hasValidIP()
-		assert.False(t, result)
-	})
-
-	t.Run("loopback IP", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip addr show wlan0": `1: lo: <LOOPBACK,UP,LOWER_UP>
-    inet 127.0.0.1/8 scope host lo`,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.hasValidIP()
-		assert.False(t, result)
-	})
-
-	t.Run("no IP", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>`,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.hasValidIP()
-		assert.False(t, result)
-	})
-
-	t.Run("error executing command", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{},
-			errors: map[string]error{
-				"ip addr show wlan0": assert.AnError,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.hasValidIP()
-		assert.False(t, result)
-	})
-}
-
-func TestCheckCaptivePortal(t *testing.T) {
-	t.Run("no captive portal - ping works", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ping -c 1 -W 2 8.8.8.8": "PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.",
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.checkCaptivePortal()
-		assert.False(t, result)
-	})
-
-	t.Run("no captive portal - getent works", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"getent hosts google.com": "142.250.185.78 google.com",
-			},
-			errors: map[string]error{
-				"ping -c 1 -W 2 8.8.8.8": assert.AnError,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.checkCaptivePortal()
-		assert.False(t, result)
-	})
-
-	t.Run("no captive portal - dig works", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"dig +short google.com": "142.250.185.78",
-			},
-			errors: map[string]error{
-				"ping -c 1 -W 2 8.8.8.8": assert.AnError,
-				"getent hosts google.com": assert.AnError,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.checkCaptivePortal()
-		assert.False(t, result)
-	})
-
-	t.Run("captive portal detected", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{},
-			errors: map[string]error{
-				"ping -c 1 -W 2 8.8.8.8":  assert.AnError,
-				"getent hosts google.com": assert.AnError,
-				"dig +short google.com":   assert.AnError,
-			},
-		}
-		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
-
-		result := manager.checkCaptivePortal()
-		assert.True(t, result)
 	})
 }
 

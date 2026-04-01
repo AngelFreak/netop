@@ -61,6 +61,19 @@ func (m *Manager) Connect(name string) error {
 
 	m.logger.Info("Connecting to VPN", "name", name)
 
+	// If already connected to a VPN, disconnect first to avoid corrupting
+	// the saved gateway state. Without this, origGW would capture the VPN's
+	// gateway instead of the physical one, making disconnect unable to
+	// restore the correct route.
+	existingState := m.getActiveVPNState()
+	if existingState != nil && existingState.Type != "" {
+		m.logger.Info("Disconnecting existing VPN before connecting new one", "existing", existingState.Name)
+		m.disconnectTracked(existingState)
+		// Restore original route from the existing state before saving new state
+		m.restoreDefaultRouteFromState(existingState)
+		m.clearActiveVPN()
+	}
+
 	// Load VPN config from ConfigManager
 	config, err := m.configMgr.GetVPNConfig(name)
 	if err != nil {
@@ -318,8 +331,10 @@ func (m *Manager) restoreDefaultRoute() {
 			}
 		}
 
-		// Skip VPN interfaces
-		if strings.HasPrefix(routeIface, "wg") || strings.HasPrefix(routeIface, "tun") {
+		// Skip VPN interfaces (WireGuard, OpenVPN, Tailscale, NetBird)
+		if strings.HasPrefix(routeIface, "wg") || strings.HasPrefix(routeIface, "tun") ||
+			strings.HasPrefix(routeIface, "tailscale") || strings.HasPrefix(routeIface, "wt") ||
+			strings.HasPrefix(routeIface, "utun") {
 			continue
 		}
 
@@ -520,31 +535,42 @@ func (m *Manager) removeFile(path string) {
 func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to Tailscale")
 
-	// Switch profile if specified (for multi-account support)
+	// Switch profile if specified (for multi-account support).
+	// "tailscale switch" may return a non-zero exit code even on success
+	// (e.g. empty stderr), so we only warn when stderr contains a message.
 	if config.Profile != "" {
 		m.logger.Debug("Switching Tailscale profile", "profile", config.Profile)
 		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "switch", config.Profile)
-		if err != nil {
-			m.logger.Warn("Failed to switch Tailscale profile (may not exist yet)", "profile", config.Profile, "error", err)
+		if err != nil && !isEmptyStderrError(err) {
+			m.logger.Warn("Failed to switch Tailscale profile", "profile", config.Profile, "error", err)
 		}
 	}
 
-	// Build args: always disable DNS (netop manages resolv.conf)
-	args := []string{"up", "--accept-dns=false"}
-
+	// Bring the interface up first. When an authkey is provided we pass it
+	// here so the node can register; otherwise a bare "up" just ensures the
+	// daemon is running (it won't block if already authenticated).
+	upArgs := []string{"up"}
 	if config.AuthKey != "" {
-		args = append(args, "--authkey="+config.AuthKey)
-	}
-	if config.ExitNode != "" {
-		args = append(args, "--exit-node="+config.ExitNode)
-	}
-	if config.AcceptRoutes {
-		args = append(args, "--accept-routes")
+		upArgs = append(upArgs, "--authkey="+config.AuthKey)
 	}
 
-	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", args...)
+	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", upArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to connect Tailscale: %w", err)
+	}
+
+	// Apply settings via "tailscale set" which changes individual prefs
+	// without requiring all non-default flags (unlike "up").
+	setArgs := []string{"set", "--accept-dns=false"}
+	if config.ExitNode != "" {
+		setArgs = append(setArgs, "--exit-node="+config.ExitNode)
+	}
+	if config.AcceptRoutes {
+		setArgs = append(setArgs, "--accept-routes")
+	}
+
+	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", setArgs...); err != nil {
+		return fmt.Errorf("failed to apply Tailscale settings: %w", err)
 	}
 
 	// Verify connection
@@ -557,6 +583,12 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	m.logger.Info("Tailscale connected")
 	return nil
+}
+
+// isEmptyStderrError returns true when the error is a command failure with
+// no meaningful stderr output (e.g. "command failed: exit status 1 (stderr: )").
+func isEmptyStderrError(err error) bool {
+	return err != nil && strings.HasSuffix(err.Error(), "(stderr: )")
 }
 
 // connectNetBird connects using the NetBird CLI
@@ -709,7 +741,10 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 			}
 		}
 
-		// Set default route via WireGuard interface
+		// Set default route via WireGuard interface.
+		// The original gateway was already saved by Connect() before calling connectWireGuard,
+		// so disconnect can restore it. If there was no original gateway, warn but proceed —
+		// the user explicitly enabled gateway mode.
 		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", "default", "dev", iface)
 		if err != nil {
 			m.logger.Warn("Failed to set default route", "error", err)
@@ -808,11 +843,6 @@ func (m *Manager) activeVPNFilePath() string {
 	return filepath.Join(m.runtimeDir, "active-vpn")
 }
 
-// setActiveVPN records the currently active VPN state to the state file
-// Enhanced format: vpn-name|interface|type|originalGateway|originalInterface
-func (m *Manager) setActiveVPN(name string) error {
-	return m.setActiveVPNState(vpnState{Name: name})
-}
 
 // setActiveVPNState records the full VPN state to the state file
 func (m *Manager) setActiveVPNState(state vpnState) error {

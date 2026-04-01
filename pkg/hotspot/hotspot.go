@@ -125,7 +125,11 @@ func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 	}
 
 	// Set IP address on interface - cleanup on failure
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", config.Gateway+"/24", "dev", config.Interface); err != nil {
+	netmask := config.Netmask
+	if netmask == "" {
+		netmask = "24"
+	}
+	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", config.Gateway+"/"+netmask, "dev", config.Interface); err != nil {
 		h.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", config.Interface, "down")
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
@@ -169,6 +173,11 @@ func (h *hotspotManagerImpl) setupNAT(hotspotIface string) error {
 	}
 
 	h.logger.Debug("Setting up NAT", "outInterface", outIface, "hotspotInterface", hotspotIface)
+
+	// Remove existing rules first to prevent duplicates from repeated Start/Stop cycles
+	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
+	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-i", hotspotIface, "-j", "ACCEPT")
+	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 
 	// Setup NAT masquerade
 	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "iptables", "-t", "nat", "-A", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE"); err != nil {
@@ -484,9 +493,11 @@ func (h *hotspotManagerImpl) generateDnsmasqConfig(config *types.HotspotConfig) 
 	return nil
 }
 
-// isRunning checks if the hotspot is currently running
+// isRunning checks if the hotspot is currently running.
+// Returns true if either daemon is running (not just both), so Stop can
+// clean up partial failures where one daemon died but the other is alive.
 func (h *hotspotManagerImpl) isRunning() bool {
-	return h.hostapdRunning() && h.dnsmasqRunning()
+	return h.hostapdRunning() || h.dnsmasqRunning()
 }
 
 // hostapdRunning checks if hostapd is running by verifying PID and process name

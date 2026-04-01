@@ -95,13 +95,26 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug logging")
 }
 
-// commandNeedsRoot returns false for commands that can run without root privileges
+// commandNeedsRoot returns false for commands that can run without root privileges.
+// Only checks the subcommand (first non-flag arg) and global flags, not positional
+// arguments — otherwise a network named "status" would skip the sudo elevation.
 func commandNeedsRoot() bool {
 	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" || arg == "help" ||
-			arg == "completion" || arg == "--version" || arg == "-v" ||
-			arg == "status" || arg == "show" || arg == "list" {
+		// Global flags that don't need root
+		if arg == "-h" || arg == "--help" || arg == "--version" || arg == "-v" {
 			return false
+		}
+		// Skip flag arguments (start with -)
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		// First positional arg is the subcommand — check if it's root-exempt
+		switch arg {
+		case "help", "completion", "status", "show", "list":
+			return false
+		default:
+			// First positional arg is not exempt, needs root
+			return true
 		}
 	}
 	return true
@@ -172,11 +185,17 @@ func main() {
 	go func() {
 		<-sigCh
 		cancel()
-		// Best-effort cleanup: unlock resolv.conf so the system isn't left
-		// with an immutable file, and kill any DHCP/wpa processes we started.
+		// Best-effort cleanup so the system isn't left in a dirty state.
 		if sysExecutor != nil && logger != nil {
 			logger.Debug("Signal received, cleaning up")
+			// Unlock resolv.conf so DNS isn't permanently broken
 			sysExecutor.ExecuteWithTimeout(2*time.Second, "chattr", "-i", "/etc/resolv.conf")
+			// Kill any wpa_supplicant/dhclient we may have started
+			if iface != "" {
+				sysExecutor.ExecuteWithTimeout(1*time.Second, "wpa_cli", "-i", iface, "terminate")
+				sysExecutor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-f", "dhclient.*"+iface)
+				sysExecutor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-f", "udhcpc.*"+iface)
+			}
 		}
 		os.Exit(130) // Standard exit code for SIGINT
 	}()
@@ -214,8 +233,17 @@ func initializeManagers() {
 	// Initialize DHCP client manager (used by wifi and network managers)
 	dhcpClientMgr := dhcpclient.NewManager(sysExecutor, logger)
 
+	// Apply timeout config from YAML if available
+	if config != nil {
+		dhcpClientMgr.SetDHCPTimeout(config.Common.Timeouts.GetDHCPTimeout())
+	}
+
 	// Initialize managers
-	wifiMgr = wifi.NewManager(sysExecutor, logger, iface, dhcpClientMgr)
+	wifiManager := wifi.NewManager(sysExecutor, logger, iface, dhcpClientMgr)
+	if config != nil {
+		wifiManager.SetAssociationTimeout(config.Common.Timeouts.GetAssociationTimeout())
+	}
+	wifiMgr = wifiManager
 	vpnMgr = vpn.NewManager(sysExecutor, logger, cfgManager)
 	netMgr = network.NewManager(sysExecutor, logger, dhcpClientMgr)
 	hotspotMgr = hotspot.NewHotspotManager(sysExecutor, logger)

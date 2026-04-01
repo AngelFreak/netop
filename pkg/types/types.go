@@ -140,6 +140,7 @@ type HotspotConfig struct {
 	Channel   int      `yaml:"channel" mapstructure:"channel"`
 	IPRange   string   `yaml:"ip_range" mapstructure:"ip_range"`     // DHCP range, e.g., "192.168.50.50,192.168.50.150"
 	Gateway   string   `yaml:"gateway" mapstructure:"gateway"`       // e.g., "192.168.50.1"
+	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`      // CIDR prefix length, e.g., "24" (default: "24")
 	DNS       []string `yaml:"dns" mapstructure:"dns"`
 }
 

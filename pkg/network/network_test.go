@@ -267,20 +267,14 @@ func TestSetDNS(t *testing.T) {
 		assert.NotContains(t, input, "not-an-ip")
 	})
 
-	t.Run("all invalid IPs results in empty file", func(t *testing.T) {
-		executor := newStrictMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["tee /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
+	t.Run("all invalid IPs returns error", func(t *testing.T) {
+		executor := newMockExecutor()
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"invalid", "not-an-ip"})
-		assert.NoError(t, err)
-
-		// File should be written but empty (no valid nameservers)
-		input := executor.inputsReceived["tee /etc/resolv.conf"]
-		assert.NotContains(t, input, "nameserver")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no valid DNS servers")
 	})
 
 	t.Run("tee failure returns error", func(t *testing.T) {

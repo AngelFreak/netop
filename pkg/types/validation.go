@@ -41,8 +41,8 @@ func ValidateMAC(mac string) error {
 	if mac == "" {
 		return nil // Empty is allowed (means don't change)
 	}
-	// Special values
-	if mac == "random" || mac == "permanent" {
+	// Special values accepted by SetMAC
+	if mac == "random" || mac == "default" || mac == "permanent" {
 		return nil
 	}
 	if !macRegex.MatchString(mac) {
@@ -65,7 +65,10 @@ func ValidateSSID(ssid string) error {
 	return nil
 }
 
-// ValidatePSK validates a WiFi password/PSK
+// ValidatePSK validates a WiFi password/PSK.
+// WPA2-PSK allows 8-63 characters. WPA3-SAE allows 8-128 characters.
+// We accept up to 128 to support both modes — wpa_supplicant handles the
+// mode-specific validation.
 func ValidatePSK(psk string) error {
 	if psk == "" {
 		return nil // Open network
@@ -73,8 +76,8 @@ func ValidatePSK(psk string) error {
 	if len(psk) < 8 {
 		return fmt.Errorf("PSK too short (minimum 8 characters)")
 	}
-	if len(psk) > 63 {
-		return fmt.Errorf("PSK too long (maximum 63 characters)")
+	if len(psk) > 128 {
+		return fmt.Errorf("PSK too long (maximum 128 characters)")
 	}
 	return nil
 }
