@@ -145,6 +145,44 @@ func TestConnectTailscale_WithProfile(t *testing.T) {
 	executor.assertCommandExecuted(t, "tailscale set --accept-dns=false --exit-node=us-east-1")
 }
 
+func TestConnectTailscale_ProfileSwitchEmptyStderr(t *testing.T) {
+	// tailscale switch exits non-zero with empty stderr on success;
+	// the connect should still succeed without warnings blocking it.
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":                  "default via 192.168.1.1 dev eth0",
+			"tailscale up":                           "",
+			"tailscale set --accept-dns=false":       "",
+			"tailscale status --json":                `{"BackendState":"Running"}`,
+		},
+		errors: map[string]error{
+			"tailscale switch work@company.com": fmt.Errorf("command failed: exit status 1 (stderr: )"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"work-ts": {
+				Type:    "tailscale",
+				Profile: "work@company.com",
+			},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("work-ts")
+	assert.NoError(t, err)
+
+	executor.assertCommandExecuted(t, "tailscale switch work@company.com")
+	executor.assertCommandExecuted(t, "tailscale up")
+}
+
+func TestIsEmptyStderrError(t *testing.T) {
+	assert.True(t, isEmptyStderrError(fmt.Errorf("command failed: exit status 1 (stderr: )")))
+	assert.False(t, isEmptyStderrError(fmt.Errorf("command failed: exit status 1 (stderr: profile not found)")))
+	assert.False(t, isEmptyStderrError(nil))
+}
+
 func TestListVPNs_TailscaleRunning(t *testing.T) {
 	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{
