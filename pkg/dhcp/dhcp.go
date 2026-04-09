@@ -19,7 +19,9 @@ type dhcpManagerImpl struct {
 	dnsmasqPidFile  string
 	dnsmasqConfFile string
 	leasesFile      string
+	stateFile       string // Persists interface and outInterface for crash recovery
 	currentConfig   *types.DHCPServerConfig
+	outInterface    string // Interface for NAT routing (e.g., wlan0)
 }
 
 // NewDHCPManager creates a new DHCP server manager
@@ -30,6 +32,7 @@ func NewDHCPManager(executor types.SystemExecutor, logger types.Logger) types.DH
 		dnsmasqPidFile:  types.RuntimeDir + "/dnsmasq-dhcp.pid",
 		dnsmasqConfFile: types.RuntimeDir + "/dnsmasq-dhcp.conf",
 		leasesFile:      types.RuntimeDir + "/dnsmasq-dhcp.leases",
+		stateFile:       types.RuntimeDir + "/dhcp-state",
 	}
 }
 
@@ -80,7 +83,14 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 		return fmt.Errorf("failed to start dnsmasq: %w", err)
 	}
 
+	// Setup NAT/IP forwarding for internet sharing
+	if err := d.setupNAT(config.Interface); err != nil {
+		d.logger.Warn("Failed to setup NAT", "error", err.Error())
+		// Continue anyway - DHCP will work but without internet sharing
+	}
+
 	d.currentConfig = config
+	d.saveState(config.Interface)
 	d.logger.Info("DHCP server started successfully", "interface", config.Interface)
 	return nil
 }
@@ -94,6 +104,18 @@ func (d *dhcpManagerImpl) Stop() error {
 		// (e.g., dnsmasq was killed externally)
 		d.cleanupStaleFiles()
 		return fmt.Errorf("DHCP server is not running")
+	}
+
+	// Recover state from file if needed (e.g., after crash/restart)
+	if d.currentConfig == nil || d.outInterface == "" {
+		d.loadState()
+	}
+
+	// Clean up NAT rules first
+	if d.currentConfig != nil {
+		d.cleanupNAT(d.currentConfig.Interface)
+	} else {
+		d.cleanupNAT("")
 	}
 
 	// Stop dnsmasq
@@ -119,6 +141,8 @@ func (d *dhcpManagerImpl) Stop() error {
 	os.Remove(d.leasesFile)
 
 	d.currentConfig = nil
+	d.outInterface = ""
+	os.Remove(d.stateFile)
 	d.logger.Info("DHCP server stopped successfully")
 	return nil
 }
@@ -260,6 +284,103 @@ func (d *dhcpManagerImpl) generateDnsmasqConfig(config *types.DHCPServerConfig) 
 	}
 
 	return nil
+}
+
+// setupNAT configures IP forwarding and NAT masquerade for internet sharing
+func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
+	// Enable IP forwarding
+	if _, err := d.executor.Execute("sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"); err != nil {
+		return fmt.Errorf("failed to enable IP forwarding: %w", err)
+	}
+
+	// Find outbound interface (excluding the DHCP server interface)
+	outIface := d.detectOutInterface(dhcpIface)
+	if outIface == "" {
+		d.logger.Warn("No outbound interface detected, skipping NAT setup")
+		return nil
+	}
+
+	d.logger.Debug("Setting up NAT", "outInterface", outIface, "dhcpInterface", dhcpIface)
+
+	// Remove existing rules first to prevent duplicates from repeated Start/Stop cycles
+	d.executor.Execute("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
+	d.executor.Execute("iptables", "-D", "FORWARD", "-i", dhcpIface, "-j", "ACCEPT")
+	d.executor.Execute("iptables", "-D", "FORWARD", "-o", dhcpIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+
+	// Setup NAT masquerade
+	if _, err := d.executor.Execute("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE"); err != nil {
+		return fmt.Errorf("failed to setup masquerade: %w", err)
+	}
+
+	// Allow forwarding from DHCP interface
+	if _, err := d.executor.Execute("iptables", "-A", "FORWARD", "-i", dhcpIface, "-j", "ACCEPT"); err != nil {
+		d.logger.Warn("Failed to setup forward rule", "error", err.Error())
+	}
+
+	// Allow established connections back
+	if _, err := d.executor.Execute("iptables", "-A", "FORWARD", "-o", dhcpIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+		d.logger.Warn("Failed to setup established forward rule", "error", err.Error())
+	}
+
+	d.outInterface = outIface
+	return nil
+}
+
+// detectOutInterface finds the default route interface (excluding the given interface)
+func (d *dhcpManagerImpl) detectOutInterface(exclude string) string {
+	output, err := d.executor.Execute("ip", "route", "show", "default")
+	if err != nil {
+		return ""
+	}
+
+	fields := strings.Fields(output)
+	for i, field := range fields {
+		if field == "dev" && i+1 < len(fields) {
+			iface := fields[i+1]
+			if iface != exclude {
+				return iface
+			}
+		}
+	}
+	return ""
+}
+
+// cleanupNAT removes NAT rules and disables IP forwarding
+func (d *dhcpManagerImpl) cleanupNAT(dhcpIface string) {
+	if d.outInterface != "" {
+		d.executor.Execute("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", d.outInterface, "-j", "MASQUERADE")
+		if dhcpIface != "" {
+			d.executor.Execute("iptables", "-D", "FORWARD", "-i", dhcpIface, "-j", "ACCEPT")
+			d.executor.Execute("iptables", "-D", "FORWARD", "-o", dhcpIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		}
+	}
+
+	if _, err := d.executor.Execute("sh", "-c", "echo 0 > /proc/sys/net/ipv4/ip_forward"); err != nil {
+		d.logger.Warn("Failed to disable IP forwarding", "error", err.Error())
+	}
+}
+
+// saveState persists DHCP interface and outInterface to a state file for crash recovery
+func (d *dhcpManagerImpl) saveState(dhcpIface string) {
+	content := dhcpIface + "|" + d.outInterface
+	if err := os.WriteFile(d.stateFile, []byte(content), 0600); err != nil {
+		d.logger.Debug("Failed to save DHCP state", "error", err)
+	}
+}
+
+// loadState recovers DHCP state from the state file (e.g., after crash/restart)
+func (d *dhcpManagerImpl) loadState() {
+	data, err := os.ReadFile(d.stateFile)
+	if err != nil {
+		return
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 2)
+	if len(parts) >= 1 && parts[0] != "" && d.currentConfig == nil {
+		d.currentConfig = &types.DHCPServerConfig{Interface: parts[0]}
+	}
+	if len(parts) >= 2 && parts[1] != "" {
+		d.outInterface = parts[1]
+	}
 }
 
 // cleanupStaleFiles removes PID, config, and lease files left behind when

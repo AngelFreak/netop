@@ -45,6 +45,7 @@ func startFakeProcess(name string) (string, func()) {
 type mockExecutor struct {
 	commands map[string]string
 	errors   map[string]error
+	called   []string // records all commands executed, in order
 }
 
 func newMockExecutor() *mockExecutor {
@@ -59,6 +60,8 @@ func (m *mockExecutor) Execute(cmd string, args ...string) (string, error) {
 	for _, arg := range args {
 		fullCmd += " " + arg
 	}
+
+	m.called = append(m.called, fullCmd)
 
 	// Check for errors first
 	if err, hasErr := m.errors[fullCmd]; hasErr {
@@ -112,6 +115,7 @@ func setupTestManager() (*dhcpManagerImpl, *mockExecutor) {
 	tmpDir := os.TempDir()
 	mgr.dnsmasqPidFile = filepath.Join(tmpDir, "test_dnsmasq_dhcp.pid")
 	mgr.dnsmasqConfFile = filepath.Join(tmpDir, "test_dnsmasq_dhcp.conf")
+	mgr.stateFile = filepath.Join(tmpDir, "test_dhcp_state")
 
 	return mgr, executor
 }
@@ -119,6 +123,7 @@ func setupTestManager() (*dhcpManagerImpl, *mockExecutor) {
 func cleanup(mgr *dhcpManagerImpl) {
 	os.Remove(mgr.dnsmasqPidFile)
 	os.Remove(mgr.dnsmasqConfFile)
+	os.Remove(mgr.stateFile)
 }
 
 // Tests
@@ -762,6 +767,174 @@ func TestValidateConfig_InvalidDNS(t *testing.T) {
 	err := mgr.Start(config)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid DNS")
+}
+
+// Tests for NAT/IP forwarding (internet sharing)
+
+func TestStart_SetsUpNAT(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+
+	// Mock standard commands
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	// Mock NAT commands - outbound via wlan0
+	executor.commands["ip route show default"] = "default via 192.168.1.1 dev wlan0 proto dhcp"
+	executor.commands["sh -c echo 1 > /proc/sys/net/ipv4/ip_forward"] = ""
+
+	err := mgr.Start(config)
+	assert.NoError(t, err)
+
+	// Verify NAT commands were called
+	assert.Contains(t, executor.called, "sh -c echo 1 > /proc/sys/net/ipv4/ip_forward")
+	assert.Contains(t, executor.called, "iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE")
+	assert.Contains(t, executor.called, "iptables -A FORWARD -i eth0 -j ACCEPT")
+	assert.Contains(t, executor.called, "iptables -A FORWARD -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+}
+
+func TestStart_NATSkippedWhenNoOutboundInterface(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	// No default route - NAT can't be set up but Start should still succeed
+	executor.commands["ip route show default"] = ""
+	executor.commands["sh -c echo 1 > /proc/sys/net/ipv4/ip_forward"] = ""
+
+	err := mgr.Start(config)
+	assert.NoError(t, err)
+
+	// Masquerade should NOT have been called (no outbound interface)
+	for _, cmd := range executor.called {
+		assert.NotContains(t, cmd, "MASQUERADE")
+	}
+}
+
+func TestStart_NATExcludesDHCPInterface(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	// DHCP server on eth0, but default route is also via eth0
+	// Should not use eth0 as outbound — look for the next dev entry
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	// Default route only via eth0 (same as DHCP interface) — no other route
+	executor.commands["ip route show default"] = "default via 192.168.1.1 dev eth0"
+	executor.commands["sh -c echo 1 > /proc/sys/net/ipv4/ip_forward"] = ""
+
+	err := mgr.Start(config)
+	assert.NoError(t, err)
+
+	// Should NOT masquerade to itself
+	for _, cmd := range executor.called {
+		assert.NotContains(t, cmd, "MASQUERADE")
+	}
+}
+
+func TestStop_CleansUpNAT(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	mgr.currentConfig = &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+	}
+	mgr.outInterface = "wlan0"
+
+	// Create fake process
+	dnsmasqPid, cleanDnsmasq := startFakeProcess("dnsmasq")
+	defer cleanDnsmasq()
+	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
+
+	executor.commands["kill "+dnsmasqPid] = ""
+	executor.commands["ip addr flush dev eth0"] = ""
+	executor.commands["ip link set eth0 down"] = ""
+
+	err := mgr.Stop()
+	assert.NoError(t, err)
+
+	// Verify NAT cleanup commands were issued
+	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE")
+	assert.Contains(t, executor.called, "iptables -D FORWARD -i eth0 -j ACCEPT")
+	assert.Contains(t, executor.called, "iptables -D FORWARD -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+	assert.Contains(t, executor.called, "sh -c echo 0 > /proc/sys/net/ipv4/ip_forward")
+}
+
+func TestStop_RecoverStateFromFile(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	// Write state file (simulating crash recovery — no currentConfig or outInterface in memory)
+	os.WriteFile(mgr.stateFile, []byte("eth0|wlan0"), 0600)
+
+	// Create fake process
+	dnsmasqPid, cleanDnsmasq := startFakeProcess("dnsmasq")
+	defer cleanDnsmasq()
+	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
+
+	executor.commands["kill "+dnsmasqPid] = ""
+	executor.commands["ip addr flush dev eth0"] = ""
+	executor.commands["ip link set eth0 down"] = ""
+
+	err := mgr.Stop()
+	assert.NoError(t, err)
+
+	// Should have recovered outInterface from state file and cleaned up NAT
+	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE")
+}
+
+func TestStart_PersistsStateFile(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+
+	executor.commands["ip link set eth0 down"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+	executor.commands["ip route show default"] = "default via 192.168.1.1 dev wlan0"
+	executor.commands["sh -c echo 1 > /proc/sys/net/ipv4/ip_forward"] = ""
+
+	err := mgr.Start(config)
+	assert.NoError(t, err)
+
+	// State file should exist with interface and outbound interface
+	data, err := os.ReadFile(mgr.stateFile)
+	assert.NoError(t, err)
+	assert.Equal(t, "eth0|wlan0", string(data))
 }
 
 func TestStart_WithDifferentNetmasks(t *testing.T) {
