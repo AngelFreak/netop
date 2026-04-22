@@ -207,6 +207,10 @@ func (n *testNetworkManager) ClearDNS() error {
 	return nil
 }
 
+func (n *testNetworkManager) ClearDNSIfOwned() (bool, error) {
+	return false, nil
+}
+
 func (n *testNetworkManager) LockDNS() {
 }
 

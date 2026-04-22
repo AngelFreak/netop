@@ -325,12 +325,14 @@ func (a *App) RunStop(interfaces []string) error {
 			stoppedServices = append(stoppedServices, "Network")
 		}
 
-		// Clear DNS configuration
+		// Clear DNS configuration, but only if netop set it. If DHCP wrote
+		// resolv.conf and we never locked it, leave it alone — stopping the
+		// network shouldn't wipe out the system's pre-existing DNS state.
 		a.Logger.Debug("Clearing DNS configuration")
-		err = a.NetworkMgr.ClearDNS()
+		cleared, err := a.NetworkMgr.ClearDNSIfOwned()
 		if err != nil {
 			a.Logger.Debug("Failed to clear DNS", "error", err)
-		} else {
+		} else if cleared {
 			stoppedServices = append(stoppedServices, "DNS")
 		}
 

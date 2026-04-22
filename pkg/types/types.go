@@ -221,6 +221,8 @@ type VPNManager interface {
 type NetworkManager interface {
 	SetDNS(servers []string) error
 	ClearDNS() error
+	// ClearDNSIfOwned clears DNS only if netop set it. Returns (cleared, err).
+	ClearDNSIfOwned() (bool, error)
 	LockDNS()
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)

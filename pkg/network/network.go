@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,23 +15,53 @@ import (
 
 // Manager implements the NetworkManager interface
 type Manager struct {
-	executor   types.SystemExecutor
-	logger     types.Logger
-	dhcpClient types.DHCPClientManager
+	executor         types.SystemExecutor
+	logger           types.Logger
+	dhcpClient       types.DHCPClientManager
+	dnsOwnershipPath string // overridable for tests; defaults to types.RuntimeDir/dns-owned
 }
 
 // NewManager creates a new network manager
 func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient types.DHCPClientManager) *Manager {
 	return &Manager{
-		executor:   executor,
-		logger:     logger,
-		dhcpClient: dhcpClient,
+		executor:         executor,
+		logger:           logger,
+		dhcpClient:       dhcpClient,
+		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
 	}
 }
 
 // killProcess kills processes matching a pattern with SIGKILL (fast, no graceful shutdown)
 func (m *Manager) killProcess(pattern string) {
 	system.KillProcessFast(m.executor, m.logger, pattern)
+}
+
+// dnsOwnedPath returns the marker file indicating netop owns /etc/resolv.conf.
+// When present, ClearDNS will clear resolv.conf on disconnect; when absent
+// (DNS came from DHCP and we never locked it), ClearDNS is a no-op so we
+// don't nuke DNS that was there before netop started.
+func (m *Manager) dnsOwnedPath() string {
+	if m.dnsOwnershipPath != "" {
+		return m.dnsOwnershipPath
+	}
+	return types.RuntimeDir + "/dns-owned"
+}
+
+func (m *Manager) markDNSOwned() {
+	path := m.dnsOwnedPath()
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.WriteFile(path, []byte{}, 0644); err != nil {
+		m.logger.Debug("Failed to mark DNS ownership", "error", err)
+	}
+}
+
+func (m *Manager) clearDNSOwnership() {
+	_ = os.Remove(m.dnsOwnedPath())
+}
+
+func (m *Manager) isDNSOwned() bool {
+	_, err := os.Stat(m.dnsOwnedPath())
+	return err == nil
 }
 
 // SetDNS configures DNS servers
@@ -41,6 +72,7 @@ func (m *Manager) SetDNS(servers []string) error {
 		if err != nil {
 			m.logger.Debug("Failed to remove immutable flag (may not be set)", "error", err)
 		}
+		m.clearDNSOwnership()
 		m.logger.Info("Using DHCP for DNS configuration")
 		return nil
 	}
@@ -77,26 +109,50 @@ func (m *Manager) SetDNS(servers []string) error {
 	if err != nil {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
+	m.markDNSOwned()
 
 	return nil
 }
 
-// ClearDNS clears the DNS configuration by removing /etc/resolv.conf
+// ClearDNS clears /etc/resolv.conf, but only if netop wrote it. If DNS was
+// provided by DHCP and never locked by us, we leave it alone so `net stop`
+// doesn't wipe out DNS that the user had before netop ran.
 func (m *Manager) ClearDNS() error {
+	cleared, err := m.clearDNS()
+	if err != nil {
+		return err
+	}
+	if !cleared {
+		m.logger.Debug("DNS not owned by netop, leaving resolv.conf alone")
+	}
+	return nil
+}
+
+// ClearDNSIfOwned clears resolv.conf only if netop set it, returning whether
+// anything was actually changed. Used by `net stop` to avoid printing a
+// misleading "DNS cleared" line when netop never owned DNS in the first place.
+func (m *Manager) ClearDNSIfOwned() (bool, error) {
+	return m.clearDNS()
+}
+
+func (m *Manager) clearDNS() (bool, error) {
 	m.logger.Debug("Clearing DNS configuration")
+
+	if !m.isDNSOwned() {
+		return false, nil
+	}
 
 	if err := m.unlockResolvConf(); err != nil {
 		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
-	// Clear the file by writing an empty configuration
-	err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n")
-	if err != nil {
-		return fmt.Errorf("failed to clear resolv.conf: %w", err)
+	if err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n"); err != nil {
+		return false, fmt.Errorf("failed to clear resolv.conf: %w", err)
 	}
+	m.clearDNSOwnership()
 
 	m.logger.Debug("DNS configuration cleared")
-	return nil
+	return true, nil
 }
 
 // LockDNS sets the immutable flag on /etc/resolv.conf to prevent external
@@ -105,6 +161,7 @@ func (m *Manager) LockDNS() {
 	if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
+	m.markDNSOwned()
 }
 
 // unlockResolvConf removes the immutable flag from /etc/resolv.conf.

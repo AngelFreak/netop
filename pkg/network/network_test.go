@@ -1135,12 +1135,18 @@ func (m *mockWiFiManagerImpl) GetInterface() string {
 // ============================================================================
 
 func TestClearDNS(t *testing.T) {
-	t.Run("success - removes immutable attribute", func(t *testing.T) {
+	t.Run("success - removes immutable attribute when netop owns DNS", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := &Manager{
+			executor:         executor,
+			logger:           logger,
+			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+		}
+
+		manager.markDNSOwned()
 
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
@@ -1152,11 +1158,33 @@ func TestClearDNS(t *testing.T) {
 		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := &Manager{
+			executor:         executor,
+			logger:           logger,
+			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+		}
+
+		manager.markDNSOwned()
 
 		// Should still succeed - chattr failure is expected on some filesystems
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
+	})
+
+	t.Run("no-op when netop does not own DNS", func(t *testing.T) {
+		executor := newMockExecutor()
+		logger := &mockLogger{}
+		manager := &Manager{
+			executor:         executor,
+			logger:           logger,
+			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+		}
+
+		// No markDNSOwned() call — DNS is not owned by netop
+		err := manager.ClearDNS()
+		assert.NoError(t, err)
+		// Should NOT have touched resolv.conf
+		executor.assertCommandNotExecuted(t, "chattr -i /etc/resolv.conf")
 	})
 }
 
