@@ -5,6 +5,7 @@ package dhcpclient
 import (
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -114,7 +115,23 @@ func (m *Manager) Release(iface string) error {
 	// Escape regex special characters in interface name (e.g., eth-0 has '-' which is a regex char)
 	escapedIface := regexp.QuoteMeta(iface)
 
-	// Kill both DHCP clients to ensure cleanup
+	// Prefer graceful shutdown via pidfile: SIGTERM lets udhcpc send a
+	// DHCPRELEASE (via -R) and clean up the lease on the server side. Fall
+	// back to pkill -9 if pidfile is missing or the process is already dead.
+	pidFile := udhcpcPidFile(iface)
+	if data, err := os.ReadFile(pidFile); err == nil {
+		pid := strings.TrimSpace(string(data))
+		if pid != "" {
+			if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "kill", pid); err != nil {
+				m.logger.Debug("Failed to SIGTERM udhcpc via pidfile", "pid", pid, "error", err)
+			}
+		}
+		_ = os.Remove(pidFile)
+	}
+
+	// Backstop: kill any udhcpc/dhclient still matching the interface. This
+	// catches daemons started outside of netop or leftover processes from a
+	// crashed run.
 	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "pkill", "-9", "-f", "udhcpc.*"+escapedIface); err != nil {
 		m.logger.Debug("No udhcpc process to kill", "interface", iface)
 	}
@@ -153,14 +170,28 @@ func (m *Manager) Renew(iface string, hostname string) error {
 	return m.Acquire(iface, hostname)
 }
 
-// acquireUdhcpc uses udhcpc (BusyBox) for faster DHCP acquisition
+// udhcpcPidFile returns the pidfile path for udhcpc on the given interface.
+func udhcpcPidFile(iface string) string {
+	return types.RuntimeDir + "/udhcpc." + iface + ".pid"
+}
+
+// acquireUdhcpc uses udhcpc (BusyBox) for faster DHCP acquisition.
+// udhcpc daemonizes after obtaining the lease and stays alive to handle
+// renewals. The PID is written to /run/net/udhcpc.<iface>.pid so Release
+// can terminate it cleanly (which sends a DHCPRELEASE via -R).
 func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 	// Release any existing clients first
 	m.Release(iface)
 
-	// Build udhcpc command
-	// -i: interface, -n: fail if no lease (don't go to background), -q: quit after obtaining lease
-	args := []string{"-i", iface, "-n", "-q"}
+	// -i: interface
+	// -n: exit if no lease acquired (so Acquire returns error on failure)
+	// -p: pidfile so Release can find and kill the daemon
+	// -R: send DHCPRELEASE when terminated (clean disconnect)
+	// -B: set the broadcast flag in DISCOVER. Some embedded DHCP servers
+	//     (e.g. IP radios, WISP gear) only reply via broadcast and silently
+	//     drop clients that ask for unicast.
+	// NOTE: no -q — udhcpc must stay running to renew the lease.
+	args := []string{"-i", iface, "-n", "-p", udhcpcPidFile(iface), "-R", "-B"}
 	if hostname != "" {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
 		args = append(args, "-x", "hostname:"+hostname)
