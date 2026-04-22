@@ -249,6 +249,14 @@ func (n *testNetworkManager) GetConnectionInfo(iface string) (*types.Connection,
 	return &types.Connection{Interface: iface, State: "connected"}, nil
 }
 
+func (n *testNetworkManager) Disconnect(iface string) error {
+	return nil
+}
+
+func (n *testNetworkManager) DisconnectAll() []string {
+	return nil
+}
+
 // testHotspotManager implements types.HotspotManager for testing
 type testHotspotManager struct {
 	status    *types.HotspotStatus

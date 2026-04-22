@@ -487,6 +487,7 @@ func TestSetIP(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["ip addr flush dev wlan0"] = ""
 		executor.commands["ip addr add 192.168.1.100/24 dev wlan0"] = ""
+		executor.commands["ip route del default dev wlan0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev wlan0"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
@@ -494,11 +495,12 @@ func TestSetIP(t *testing.T) {
 		err := manager.SetIP("wlan0", "192.168.1.100/24", "192.168.1.1")
 		assert.NoError(t, err)
 
-		// Verify commands executed in order: flush, add addr, add route
-		assert.Len(t, executor.executedCmds, 3)
+		// Verify commands executed in order: flush addr, add addr, del default (idempotent), add route
+		assert.Len(t, executor.executedCmds, 4)
 		assert.Equal(t, "ip addr flush dev wlan0", executor.executedCmds[0])
 		assert.Equal(t, "ip addr add 192.168.1.100/24 dev wlan0", executor.executedCmds[1])
-		assert.Equal(t, "ip route add default via 192.168.1.1 dev wlan0", executor.executedCmds[2])
+		assert.Equal(t, "ip route del default dev wlan0", executor.executedCmds[2])
+		assert.Equal(t, "ip route add default via 192.168.1.1 dev wlan0", executor.executedCmds[3])
 	})
 }
 

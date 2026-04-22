@@ -215,6 +215,13 @@ type NetworkManager interface {
 	DHCPRenew(iface string, hostname string) error
 	ConnectToConfiguredNetwork(config *NetworkConfig, password string, wifiMgr WiFiManager) error
 	GetConnectionInfo(iface string) (*Connection, error)
+	// Disconnect releases DHCP, flushes addresses/routes, and brings the link down
+	// for a single interface. Safe to call on an already-down interface.
+	Disconnect(iface string) error
+	// DisconnectAll tears down every non-loopback/non-virtual interface that has
+	// an IPv4 address assigned. Used by `net stop` to clean up both wired and WiFi.
+	// Returns the list of interfaces that were torn down.
+	DisconnectAll() []string
 }
 
 // ConfigManager handles configuration loading and management

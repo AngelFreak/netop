@@ -238,6 +238,11 @@ func (m *Manager) SetIP(iface, addr, gateway string) error {
 			return fmt.Errorf("invalid gateway %q: must be a valid IP address", gateway)
 		}
 
+		// Remove any pre-existing default route on this interface so `ip route
+		// add` doesn't fail with "File exists" on reconnects. Errors here are
+		// expected (often no route to delete) and ignored.
+		m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "del", "default", "dev", iface)
+
 		// Add default route
 		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "add", "default", "via", gateway, "dev", iface)
 		if err != nil {
@@ -767,6 +772,67 @@ func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 		Gateway:   gateway,
 		DNS:       dns,
 	}, nil
+}
+
+// Disconnect releases DHCP, flushes addresses and routes, and brings the link
+// down for a single interface. Safe to call on interfaces that are already
+// down or have no configuration.
+func (m *Manager) Disconnect(iface string) error {
+	if err := types.ValidateInterfaceName(iface); err != nil {
+		return fmt.Errorf("invalid interface: %w", err)
+	}
+	m.logger.Info("Disconnecting interface", "interface", iface)
+
+	if m.dhcpClient != nil {
+		_ = m.dhcpClient.Release(iface)
+	}
+	m.executor.Execute("ip", "addr", "flush", "dev", iface)
+	m.executor.Execute("ip", "route", "flush", "dev", iface)
+	if _, err := m.executor.Execute("ip", "link", "set", iface, "down"); err != nil {
+		return fmt.Errorf("failed to bring interface down: %w", err)
+	}
+	return nil
+}
+
+// DisconnectAll tears down every physical interface (wired or wireless) that
+// currently has an IPv4 address. Virtual interfaces (lo, docker*, veth*, br*,
+// wg*, tun*, tailscale*) are skipped. Returns the list of interfaces torn down.
+func (m *Manager) DisconnectAll() []string {
+	var torn []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		m.logger.Debug("Failed to list interfaces", "error", err)
+		return torn
+	}
+	for _, iface := range ifaces {
+		name := iface.Name
+		if name == "lo" || strings.HasPrefix(name, "docker") ||
+			strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "br") ||
+			strings.HasPrefix(name, "wg") || strings.HasPrefix(name, "tun") ||
+			strings.HasPrefix(name, "tailscale") || strings.HasPrefix(name, "virbr") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		hasIPv4 := false
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLinkLocalUnicast() {
+				hasIPv4 = true
+				break
+			}
+		}
+		if !hasIPv4 {
+			continue
+		}
+		if err := m.Disconnect(name); err != nil {
+			m.logger.Warn("Failed to disconnect interface", "interface", name, "error", err)
+			continue
+		}
+		torn = append(torn, name)
+	}
+	return torn
 }
 
 // parseGateway extracts the default gateway from ip route output
