@@ -196,9 +196,10 @@ func (m *Manager) GetMAC(iface string) (string, error) {
 	return "", fmt.Errorf("MAC address not found in interface output")
 }
 
-// SetIP sets IP address and gateway
-func (m *Manager) SetIP(iface, addr, gateway string) error {
-	m.logger.Info("Setting IP configuration", "interface", iface, "addr", addr, "gateway", gateway)
+// SetIP sets IP address and gateway. If metric > 0, it is applied to the default
+// route; otherwise the kernel default is used.
+func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
+	m.logger.Info("Setting IP configuration", "interface", iface, "addr", addr, "gateway", gateway, "metric", metric)
 	m.logger.Debug("SetIP using wireless interface", "interface", iface)
 
 	// Validate interface name
@@ -243,8 +244,13 @@ func (m *Manager) SetIP(iface, addr, gateway string) error {
 		// expected (often no route to delete) and ignored.
 		m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "del", "default", "dev", iface)
 
-		// Add default route
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "add", "default", "via", gateway, "dev", iface)
+		// Add default route, with metric when set so multiple links coexist
+		// deterministically (lower metric wins).
+		args := []string{"route", "add", "default", "via", gateway, "dev", iface}
+		if metric > 0 {
+			args = append(args, "metric", fmt.Sprintf("%d", metric))
+		}
+		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", args...)
 		if err != nil {
 			return fmt.Errorf("failed to set gateway: %w", err)
 		}
@@ -638,6 +644,9 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				return fmt.Errorf("failed to connect to WiFi: %w", err)
 			}
 		}
+		// WiFi DHCP installs a default route without a metric; re-add with metric
+		// so a concurrently-connected wired interface (lower metric) takes priority.
+		m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 	} else {
 		m.logger.Debug("No SSID specified in network config - treating as wired connection")
 
@@ -674,6 +683,8 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				err := m.StartDHCP(config.Interface, config.Hostname)
 				if err != nil {
 					m.logger.Warn("Failed to obtain DHCP on wired interface", "interface", config.Interface, "error", err)
+				} else {
+					m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 				}
 			}
 		}
@@ -682,7 +693,7 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 	// Set static IP if configured
 	if config.Addr != "" {
 		m.logger.Debug("Setting static IP from config", "addr", config.Addr, "gateway", config.Gateway)
-		err := m.SetIP(config.Interface, config.Addr, config.Gateway)
+		err := m.SetIP(config.Interface, config.Addr, config.Gateway, config.DefaultRouteMetric())
 		if err != nil {
 			return fmt.Errorf("failed to set IP: %w", err)
 		}
@@ -772,6 +783,45 @@ func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 		Gateway:   gateway,
 		DNS:       dns,
 	}, nil
+}
+
+// applyDefaultRouteMetric finds the DHCP-installed default route on iface and
+// re-adds it with the given metric. DHCP clients (udhcpc/dhclient) install
+// default routes without metrics, so when two interfaces are up simultaneously
+// the kernel picks by insertion order instead of a deterministic priority.
+// This re-installs with metric so wired wins over WiFi (or vice versa per config).
+func (m *Manager) applyDefaultRouteMetric(iface string, metric int) {
+	if metric <= 0 {
+		return
+	}
+	output, err := m.executor.Execute("ip", "route", "show", "default", "dev", iface)
+	if err != nil || strings.TrimSpace(output) == "" {
+		return
+	}
+	// Parse "default via 10.1.0.1 dev enx... [metric N]" — grab the gateway.
+	fields := strings.Fields(output)
+	var gateway string
+	for i, f := range fields {
+		if f == "via" && i+1 < len(fields) {
+			gateway = fields[i+1]
+			break
+		}
+	}
+	if gateway == "" {
+		m.logger.Debug("No gateway in default route, skipping metric", "iface", iface, "route", output)
+		return
+	}
+	// Check if metric is already set to the desired value — avoid churn.
+	for i, f := range fields {
+		if f == "metric" && i+1 < len(fields) && fields[i+1] == fmt.Sprintf("%d", metric) {
+			return
+		}
+	}
+	m.logger.Debug("Applying default route metric", "iface", iface, "gateway", gateway, "metric", metric)
+	m.executor.Execute("ip", "route", "del", "default", "dev", iface)
+	if _, err := m.executor.Execute("ip", "route", "add", "default", "via", gateway, "dev", iface, "metric", fmt.Sprintf("%d", metric)); err != nil {
+		m.logger.Warn("Failed to reinstall default route with metric", "iface", iface, "error", err)
+	}
 }
 
 // Disconnect releases DHCP, flushes addresses and routes, and brings the link

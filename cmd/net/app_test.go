@@ -238,7 +238,7 @@ func (n *testNetworkManager) StartDHCP(iface string, hostname string) error {
 	return nil
 }
 
-func (n *testNetworkManager) SetIP(iface, addr, gateway string) error {
+func (n *testNetworkManager) SetIP(iface, addr, gateway string, metric int) error {
 	return nil
 }
 
