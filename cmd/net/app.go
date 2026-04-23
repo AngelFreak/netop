@@ -317,21 +317,28 @@ func (a *App) RunStop(interfaces []string) error {
 			stoppedServices = append(stoppedServices, "VPN")
 		}
 
-		// Stop network (WiFi/wired)
+		// Stop network (WiFi and wired). WiFi first so wpa_supplicant is
+		// terminated cleanly, then DisconnectAll catches any other active
+		// interfaces (e.g. a wired NIC with a live lease).
 		a.Logger.Debug("Stopping network connection")
-		err = a.WiFiMgr.Disconnect()
-		if err != nil {
-			a.Logger.Error("Failed to disconnect network", "error", err)
+		if err := a.WiFiMgr.Disconnect(); err != nil {
+			a.Logger.Debug("No active WiFi to disconnect", "error", err)
+		}
+		torn := a.NetworkMgr.DisconnectAll()
+		if len(torn) > 0 {
+			stoppedServices = append(stoppedServices, "Network ("+strings.Join(torn, ", ")+")")
 		} else {
 			stoppedServices = append(stoppedServices, "Network")
 		}
 
-		// Clear DNS configuration
+		// Clear DNS configuration, but only if netop set it. If DHCP wrote
+		// resolv.conf and we never locked it, leave it alone — stopping the
+		// network shouldn't wipe out the system's pre-existing DNS state.
 		a.Logger.Debug("Clearing DNS configuration")
-		err = a.NetworkMgr.ClearDNS()
+		cleared, err := a.NetworkMgr.ClearDNSIfOwned()
 		if err != nil {
 			a.Logger.Debug("Failed to clear DNS", "error", err)
-		} else {
+		} else if cleared {
 			stoppedServices = append(stoppedServices, "DNS")
 		}
 
@@ -345,12 +352,13 @@ func (a *App) RunStop(interfaces []string) error {
 			a.println("No active services to stop")
 		}
 	} else {
-		// Stop specific interfaces
+		// Stop specific interfaces. Use NetworkMgr.Disconnect so DHCP clients
+		// are killed, addresses/routes flushed, and the link brought down —
+		// otherwise a zombie udhcpc keeps renewing on a down interface.
 		var lastErr error
 		for _, iface := range interfaces {
 			a.Logger.Debug("Stopping interface", "interface", iface)
-			_, err := a.Executor.Execute("ip", "link", "set", iface, "down")
-			if err != nil {
+			if err := a.NetworkMgr.Disconnect(iface); err != nil {
 				a.Logger.Error("Failed to stop interface", "interface", iface, "error", err)
 				a.errorf("✗ Failed to stop %s\n", iface)
 				lastErr = err

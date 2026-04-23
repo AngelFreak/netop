@@ -211,14 +211,14 @@ func TestAcquire_UsesUdhcpcWhenAvailable(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["udhcpc -i wlan0 -n -q"] = ""
+	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -q")
+	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B")
 	// Note: pkill for dhclient is still called during Release() cleanup,
 	// but actual dhclient command (timeout 15 dhclient -v) is not executed
 	executor.assertCommandNotExecuted(t, "timeout 15 dhclient")
@@ -249,7 +249,7 @@ func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["udhcpc -i wlan0 -n -q -x hostname:myhost"] = ""
+	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -x hostname:myhost"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
@@ -515,7 +515,7 @@ func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["udhcpc -i wlan0 -n -q"] = errors.New("no lease obtained")
+	executor.errors["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B"] = errors.New("no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 

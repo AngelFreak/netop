@@ -487,18 +487,20 @@ func TestSetIP(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["ip addr flush dev wlan0"] = ""
 		executor.commands["ip addr add 192.168.1.100/24 dev wlan0"] = ""
+		executor.commands["ip route del default dev wlan0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev wlan0"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
-		err := manager.SetIP("wlan0", "192.168.1.100/24", "192.168.1.1")
+		err := manager.SetIP("wlan0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.NoError(t, err)
 
-		// Verify commands executed in order: flush, add addr, add route
-		assert.Len(t, executor.executedCmds, 3)
+		// Verify commands executed in order: flush addr, add addr, del default (idempotent), add route
+		assert.Len(t, executor.executedCmds, 4)
 		assert.Equal(t, "ip addr flush dev wlan0", executor.executedCmds[0])
 		assert.Equal(t, "ip addr add 192.168.1.100/24 dev wlan0", executor.executedCmds[1])
-		assert.Equal(t, "ip route add default via 192.168.1.1 dev wlan0", executor.executedCmds[2])
+		assert.Equal(t, "ip route del default dev wlan0", executor.executedCmds[2])
+		assert.Equal(t, "ip route add default via 192.168.1.1 dev wlan0", executor.executedCmds[3])
 	})
 }
 
@@ -912,7 +914,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip link set eth0 up"] = ""
 		executor.commands["ip addr flush dev eth0"] = ""
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
-		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
+		executor.commands["ip route del default dev eth0"] = ""
+		executor.commands["ip route add default via 192.168.1.1 dev eth0 metric 100"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
@@ -925,7 +928,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		err := manager.ConnectToConfiguredNetwork(config, "", nil)
 		assert.NoError(t, err)
 		executor.assertCommandExecuted(t, "ip addr add 192.168.1.100/24 dev eth0")
-		executor.assertCommandExecuted(t, "ip route add default via 192.168.1.1 dev eth0")
+		executor.assertCommandExecuted(t, "ip route add default via 192.168.1.1 dev eth0 metric 100")
 	})
 
 	t.Run("with custom routes", func(t *testing.T) {
@@ -1132,12 +1135,18 @@ func (m *mockWiFiManagerImpl) GetInterface() string {
 // ============================================================================
 
 func TestClearDNS(t *testing.T) {
-	t.Run("success - removes immutable attribute", func(t *testing.T) {
+	t.Run("success - removes immutable attribute when netop owns DNS", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := &Manager{
+			executor:         executor,
+			logger:           logger,
+			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+		}
+
+		manager.markDNSOwned()
 
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
@@ -1149,11 +1158,33 @@ func TestClearDNS(t *testing.T) {
 		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := &Manager{
+			executor:         executor,
+			logger:           logger,
+			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+		}
+
+		manager.markDNSOwned()
 
 		// Should still succeed - chattr failure is expected on some filesystems
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
+	})
+
+	t.Run("no-op when netop does not own DNS", func(t *testing.T) {
+		executor := newMockExecutor()
+		logger := &mockLogger{}
+		manager := &Manager{
+			executor:         executor,
+			logger:           logger,
+			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+		}
+
+		// No markDNSOwned() call — DNS is not owned by netop
+		err := manager.ClearDNS()
+		assert.NoError(t, err)
+		// Should NOT have touched resolv.conf
+		executor.assertCommandNotExecuted(t, "chattr -i /etc/resolv.conf")
 	})
 }
 
@@ -1280,7 +1311,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
-		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1")
+		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.NoError(t, err) // Flush failure is just logged, not returned
 	})
 
@@ -1296,7 +1327,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
-		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1")
+		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to set IP address")
 	})
@@ -1314,7 +1345,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
-		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1")
+		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to set gateway")
 	})
@@ -1329,7 +1360,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
-		err := manager.SetIP("eth0", "192.168.1.100/24", "")
+		err := manager.SetIP("eth0", "192.168.1.100/24", "", 0)
 		assert.NoError(t, err)
 	})
 
@@ -1343,7 +1374,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 		logger := &mockLogger{}
 		manager := &Manager{executor: executor, logger: logger}
 
-		err := manager.SetIP("eth0", "", "192.168.1.1")
+		err := manager.SetIP("eth0", "", "192.168.1.1", 0)
 		assert.NoError(t, err)
 	})
 }

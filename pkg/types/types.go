@@ -102,6 +102,22 @@ type NetworkConfig struct {
 	MAC       string   `yaml:"mac" mapstructure:"mac"`
 	Hostname  string   `yaml:"hostname" mapstructure:"hostname"`
 	VPN       string   `yaml:"vpn" mapstructure:"vpn"`
+	// Metric is the default-route metric (lower = preferred). 0 means use the
+	// built-in default (100 for wired, 600 for WiFi) so wired wins when both
+	// are up simultaneously. Matches NetworkManager's default convention.
+	Metric int `yaml:"metric" mapstructure:"metric"`
+}
+
+// DefaultRouteMetric returns the default-route metric for this network,
+// falling back to type-appropriate defaults when Metric is 0.
+func (n *NetworkConfig) DefaultRouteMetric() int {
+	if n.Metric > 0 {
+		return n.Metric
+	}
+	if n.SSID != "" {
+		return 600
+	}
+	return 100
 }
 
 // WiFiNetwork represents a discovered WiFi network
@@ -205,16 +221,25 @@ type VPNManager interface {
 type NetworkManager interface {
 	SetDNS(servers []string) error
 	ClearDNS() error
+	// ClearDNSIfOwned clears DNS only if netop set it. Returns (cleared, err).
+	ClearDNSIfOwned() (bool, error)
 	LockDNS()
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
-	SetIP(iface, addr, gateway string) error
+	SetIP(iface, addr, gateway string, metric int) error
 	AddRoute(iface, destination, gateway string) error
 	FlushRoutes(iface string) error
 	StartDHCP(iface string, hostname string) error
 	DHCPRenew(iface string, hostname string) error
 	ConnectToConfiguredNetwork(config *NetworkConfig, password string, wifiMgr WiFiManager) error
 	GetConnectionInfo(iface string) (*Connection, error)
+	// Disconnect releases DHCP, flushes addresses/routes, and brings the link down
+	// for a single interface. Safe to call on an already-down interface.
+	Disconnect(iface string) error
+	// DisconnectAll tears down every non-loopback/non-virtual interface that has
+	// an IPv4 address assigned. Used by `net stop` to clean up both wired and WiFi.
+	// Returns the list of interfaces that were torn down.
+	DisconnectAll() []string
 }
 
 // ConfigManager handles configuration loading and management

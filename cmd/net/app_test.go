@@ -207,6 +207,10 @@ func (n *testNetworkManager) ClearDNS() error {
 	return nil
 }
 
+func (n *testNetworkManager) ClearDNSIfOwned() (bool, error) {
+	return false, nil
+}
+
 func (n *testNetworkManager) LockDNS() {
 }
 
@@ -238,7 +242,7 @@ func (n *testNetworkManager) StartDHCP(iface string, hostname string) error {
 	return nil
 }
 
-func (n *testNetworkManager) SetIP(iface, addr, gateway string) error {
+func (n *testNetworkManager) SetIP(iface, addr, gateway string, metric int) error {
 	return nil
 }
 
@@ -247,6 +251,14 @@ func (n *testNetworkManager) GetConnectionInfo(iface string) (*types.Connection,
 		return n.connectionInfo, nil
 	}
 	return &types.Connection{Interface: iface, State: "connected"}, nil
+}
+
+func (n *testNetworkManager) Disconnect(iface string) error {
+	return nil
+}
+
+func (n *testNetworkManager) DisconnectAll() []string {
+	return nil
 }
 
 // testHotspotManager implements types.HotspotManager for testing

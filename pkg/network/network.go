@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,23 +15,53 @@ import (
 
 // Manager implements the NetworkManager interface
 type Manager struct {
-	executor   types.SystemExecutor
-	logger     types.Logger
-	dhcpClient types.DHCPClientManager
+	executor         types.SystemExecutor
+	logger           types.Logger
+	dhcpClient       types.DHCPClientManager
+	dnsOwnershipPath string // overridable for tests; defaults to types.RuntimeDir/dns-owned
 }
 
 // NewManager creates a new network manager
 func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient types.DHCPClientManager) *Manager {
 	return &Manager{
-		executor:   executor,
-		logger:     logger,
-		dhcpClient: dhcpClient,
+		executor:         executor,
+		logger:           logger,
+		dhcpClient:       dhcpClient,
+		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
 	}
 }
 
 // killProcess kills processes matching a pattern with SIGKILL (fast, no graceful shutdown)
 func (m *Manager) killProcess(pattern string) {
 	system.KillProcessFast(m.executor, m.logger, pattern)
+}
+
+// dnsOwnedPath returns the marker file indicating netop owns /etc/resolv.conf.
+// When present, ClearDNS will clear resolv.conf on disconnect; when absent
+// (DNS came from DHCP and we never locked it), ClearDNS is a no-op so we
+// don't nuke DNS that was there before netop started.
+func (m *Manager) dnsOwnedPath() string {
+	if m.dnsOwnershipPath != "" {
+		return m.dnsOwnershipPath
+	}
+	return types.RuntimeDir + "/dns-owned"
+}
+
+func (m *Manager) markDNSOwned() {
+	path := m.dnsOwnedPath()
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.WriteFile(path, []byte{}, 0644); err != nil {
+		m.logger.Debug("Failed to mark DNS ownership", "error", err)
+	}
+}
+
+func (m *Manager) clearDNSOwnership() {
+	_ = os.Remove(m.dnsOwnedPath())
+}
+
+func (m *Manager) isDNSOwned() bool {
+	_, err := os.Stat(m.dnsOwnedPath())
+	return err == nil
 }
 
 // SetDNS configures DNS servers
@@ -41,6 +72,7 @@ func (m *Manager) SetDNS(servers []string) error {
 		if err != nil {
 			m.logger.Debug("Failed to remove immutable flag (may not be set)", "error", err)
 		}
+		m.clearDNSOwnership()
 		m.logger.Info("Using DHCP for DNS configuration")
 		return nil
 	}
@@ -77,26 +109,50 @@ func (m *Manager) SetDNS(servers []string) error {
 	if err != nil {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
+	m.markDNSOwned()
 
 	return nil
 }
 
-// ClearDNS clears the DNS configuration by removing /etc/resolv.conf
+// ClearDNS clears /etc/resolv.conf, but only if netop wrote it. If DNS was
+// provided by DHCP and never locked by us, we leave it alone so `net stop`
+// doesn't wipe out DNS that the user had before netop ran.
 func (m *Manager) ClearDNS() error {
+	cleared, err := m.clearDNS()
+	if err != nil {
+		return err
+	}
+	if !cleared {
+		m.logger.Debug("DNS not owned by netop, leaving resolv.conf alone")
+	}
+	return nil
+}
+
+// ClearDNSIfOwned clears resolv.conf only if netop set it, returning whether
+// anything was actually changed. Used by `net stop` to avoid printing a
+// misleading "DNS cleared" line when netop never owned DNS in the first place.
+func (m *Manager) ClearDNSIfOwned() (bool, error) {
+	return m.clearDNS()
+}
+
+func (m *Manager) clearDNS() (bool, error) {
 	m.logger.Debug("Clearing DNS configuration")
+
+	if !m.isDNSOwned() {
+		return false, nil
+	}
 
 	if err := m.unlockResolvConf(); err != nil {
 		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
-	// Clear the file by writing an empty configuration
-	err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n")
-	if err != nil {
-		return fmt.Errorf("failed to clear resolv.conf: %w", err)
+	if err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n"); err != nil {
+		return false, fmt.Errorf("failed to clear resolv.conf: %w", err)
 	}
+	m.clearDNSOwnership()
 
 	m.logger.Debug("DNS configuration cleared")
-	return nil
+	return true, nil
 }
 
 // LockDNS sets the immutable flag on /etc/resolv.conf to prevent external
@@ -105,6 +161,7 @@ func (m *Manager) LockDNS() {
 	if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
+	m.markDNSOwned()
 }
 
 // unlockResolvConf removes the immutable flag from /etc/resolv.conf.
@@ -196,9 +253,10 @@ func (m *Manager) GetMAC(iface string) (string, error) {
 	return "", fmt.Errorf("MAC address not found in interface output")
 }
 
-// SetIP sets IP address and gateway
-func (m *Manager) SetIP(iface, addr, gateway string) error {
-	m.logger.Info("Setting IP configuration", "interface", iface, "addr", addr, "gateway", gateway)
+// SetIP sets IP address and gateway. If metric > 0, it is applied to the default
+// route; otherwise the kernel default is used.
+func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
+	m.logger.Info("Setting IP configuration", "interface", iface, "addr", addr, "gateway", gateway, "metric", metric)
 	m.logger.Debug("SetIP using wireless interface", "interface", iface)
 
 	// Validate interface name
@@ -238,8 +296,18 @@ func (m *Manager) SetIP(iface, addr, gateway string) error {
 			return fmt.Errorf("invalid gateway %q: must be a valid IP address", gateway)
 		}
 
-		// Add default route
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "add", "default", "via", gateway, "dev", iface)
+		// Remove any pre-existing default route on this interface so `ip route
+		// add` doesn't fail with "File exists" on reconnects. Errors here are
+		// expected (often no route to delete) and ignored.
+		m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "del", "default", "dev", iface)
+
+		// Add default route, with metric when set so multiple links coexist
+		// deterministically (lower metric wins).
+		args := []string{"route", "add", "default", "via", gateway, "dev", iface}
+		if metric > 0 {
+			args = append(args, "metric", fmt.Sprintf("%d", metric))
+		}
+		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", args...)
 		if err != nil {
 			return fmt.Errorf("failed to set gateway: %w", err)
 		}
@@ -633,6 +701,9 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				return fmt.Errorf("failed to connect to WiFi: %w", err)
 			}
 		}
+		// WiFi DHCP installs a default route without a metric; re-add with metric
+		// so a concurrently-connected wired interface (lower metric) takes priority.
+		m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 	} else {
 		m.logger.Debug("No SSID specified in network config - treating as wired connection")
 
@@ -675,6 +746,8 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				err := m.StartDHCP(config.Interface, config.Hostname)
 				if err != nil {
 					m.logger.Warn("Failed to obtain DHCP on wired interface", "interface", config.Interface, "error", err)
+				} else {
+					m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 				}
 			}
 		}
@@ -683,7 +756,7 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 	// Set static IP if configured
 	if config.Addr != "" {
 		m.logger.Debug("Setting static IP from config", "addr", config.Addr, "gateway", config.Gateway)
-		err := m.SetIP(config.Interface, config.Addr, config.Gateway)
+		err := m.SetIP(config.Interface, config.Addr, config.Gateway, config.DefaultRouteMetric())
 		if err != nil {
 			return fmt.Errorf("failed to set IP: %w", err)
 		}
@@ -773,6 +846,106 @@ func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 		Gateway:   gateway,
 		DNS:       dns,
 	}, nil
+}
+
+// applyDefaultRouteMetric finds the DHCP-installed default route on iface and
+// re-adds it with the given metric. DHCP clients (udhcpc/dhclient) install
+// default routes without metrics, so when two interfaces are up simultaneously
+// the kernel picks by insertion order instead of a deterministic priority.
+// This re-installs with metric so wired wins over WiFi (or vice versa per config).
+func (m *Manager) applyDefaultRouteMetric(iface string, metric int) {
+	if metric <= 0 {
+		return
+	}
+	output, err := m.executor.Execute("ip", "route", "show", "default", "dev", iface)
+	if err != nil || strings.TrimSpace(output) == "" {
+		return
+	}
+	// Parse "default via 10.1.0.1 dev enx... [metric N]" — grab the gateway.
+	fields := strings.Fields(output)
+	var gateway string
+	for i, f := range fields {
+		if f == "via" && i+1 < len(fields) {
+			gateway = fields[i+1]
+			break
+		}
+	}
+	if gateway == "" {
+		m.logger.Debug("No gateway in default route, skipping metric", "iface", iface, "route", output)
+		return
+	}
+	// Check if metric is already set to the desired value — avoid churn.
+	for i, f := range fields {
+		if f == "metric" && i+1 < len(fields) && fields[i+1] == fmt.Sprintf("%d", metric) {
+			return
+		}
+	}
+	m.logger.Debug("Applying default route metric", "iface", iface, "gateway", gateway, "metric", metric)
+	m.executor.Execute("ip", "route", "del", "default", "dev", iface)
+	if _, err := m.executor.Execute("ip", "route", "add", "default", "via", gateway, "dev", iface, "metric", fmt.Sprintf("%d", metric)); err != nil {
+		m.logger.Warn("Failed to reinstall default route with metric", "iface", iface, "error", err)
+	}
+}
+
+// Disconnect releases DHCP, flushes addresses and routes, and brings the link
+// down for a single interface. Safe to call on interfaces that are already
+// down or have no configuration.
+func (m *Manager) Disconnect(iface string) error {
+	if err := types.ValidateInterfaceName(iface); err != nil {
+		return fmt.Errorf("invalid interface: %w", err)
+	}
+	m.logger.Info("Disconnecting interface", "interface", iface)
+
+	if m.dhcpClient != nil {
+		_ = m.dhcpClient.Release(iface)
+	}
+	m.executor.Execute("ip", "addr", "flush", "dev", iface)
+	m.executor.Execute("ip", "route", "flush", "dev", iface)
+	if _, err := m.executor.Execute("ip", "link", "set", iface, "down"); err != nil {
+		return fmt.Errorf("failed to bring interface down: %w", err)
+	}
+	return nil
+}
+
+// DisconnectAll tears down every physical interface (wired or wireless) that
+// currently has an IPv4 address. Virtual interfaces (lo, docker*, veth*, br*,
+// wg*, tun*, tailscale*) are skipped. Returns the list of interfaces torn down.
+func (m *Manager) DisconnectAll() []string {
+	var torn []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		m.logger.Debug("Failed to list interfaces", "error", err)
+		return torn
+	}
+	for _, iface := range ifaces {
+		name := iface.Name
+		if name == "lo" || strings.HasPrefix(name, "docker") ||
+			strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "br") ||
+			strings.HasPrefix(name, "wg") || strings.HasPrefix(name, "tun") ||
+			strings.HasPrefix(name, "tailscale") || strings.HasPrefix(name, "virbr") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		hasIPv4 := false
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLinkLocalUnicast() {
+				hasIPv4 = true
+				break
+			}
+		}
+		if !hasIPv4 {
+			continue
+		}
+		if err := m.Disconnect(name); err != nil {
+			m.logger.Warn("Failed to disconnect interface", "interface", name, "error", err)
+			continue
+		}
+		torn = append(torn, name)
+	}
+	return torn
 }
 
 // parseGateway extracts the default gateway from ip route output
