@@ -168,14 +168,12 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 
 	// Flush stale IP addresses and routes — after suspend/resume the old
 	// network state remains on the interface even though the connection is dead.
-	// Without this, DHCP may add a new IP but the default route won't be set.
+	// `route flush dev <iface>` already drops any default route bound to
+	// this interface, so we don't need a separate global `route del default`
+	// (which would silently delete a VPN's default route — e.g. a
+	// `gateway: true` WireGuard tunnel — when the user reconnects WiFi).
 	m.executor.Execute("ip", "addr", "flush", "dev", m.iface)
 	m.executor.Execute("ip", "route", "flush", "dev", m.iface)
-
-	// Delete any existing default route so DHCP can set a fresh one
-	// after connecting. Stale default routes from a previous location
-	// or interface prevent the new gateway from being set.
-	m.executor.Execute("ip", "route", "del", "default")
 
 	// Bring interface up before starting wpa_supplicant
 	_, err = m.executor.Execute("ip", "link", "set", m.iface, "up")
@@ -786,4 +784,3 @@ func (m *Manager) checkAssociationStatus(expectedSSID string) (bool, bool) {
 
 	return ssidMatch && stateCompleted, true
 }
-

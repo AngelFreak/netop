@@ -719,16 +719,14 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		// For wired connections, bring up the interface and get DHCP if no static IP
 		if config.Interface != "" {
 			// Flush stale IP addresses and routes — after suspend/resume the old
-			// network state remains on the interface even though the link was down.
-			// Without this, DHCP may add a new IP but the default route won't be set.
+			// network state remains on the interface even though the link was
+			// down. `route flush dev <iface>` already drops any default route
+			// bound to this interface, so we don't need a separate global
+			// `route del default` (which would silently delete a VPN's default
+			// route — e.g. a `gateway: true` WireGuard tunnel — when the user
+			// reconnects wired).
 			m.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
 			m.executor.Execute("ip", "route", "flush", "dev", config.Interface)
-
-			// Delete any existing default route (regardless of interface) so
-			// DHCP can set a fresh one. Without this, udhcpc/dhclient's
-			// "ip route add default" fails when a stale default route exists
-			// from a previous location or interface.
-			m.executor.Execute("ip", "route", "del", "default")
 
 			m.logger.Info("Bringing up wired interface", "interface", config.Interface)
 			_, err := m.executor.Execute("ip", "link", "set", config.Interface, "up")
