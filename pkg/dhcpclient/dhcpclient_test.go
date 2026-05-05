@@ -185,8 +185,8 @@ func TestAcquire_ValidatesHostname(t *testing.T) {
 			executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 			executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 			executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-			executor.commands["timeout 15 dhclient -v -1 wlan0"] = ""
-			executor.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+			executor.commands["timeout 60 dhclient -v -1 wlan0"] = ""
+			executor.commands["timeout 60 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
 			executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 			logger := &mockLogger{}
 			manager := NewManager(executor, logger)
@@ -211,14 +211,14 @@ func TestAcquire_UsesUdhcpcWhenAvailable(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B"] = ""
+	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B")
+	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10")
 	// Note: pkill for dhclient is still called during Release() cleanup,
 	// but actual dhclient command (timeout 15 dhclient -v) is not executed
 	executor.assertCommandNotExecuted(t, "timeout 15 dhclient")
@@ -232,7 +232,7 @@ func TestAcquire_UsesDhclientAsFallback(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 15 dhclient -v -1 wlan0"] = ""
+	executor.commands["timeout 60 dhclient -v -1 wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
@@ -249,7 +249,7 @@ func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -x hostname:myhost"] = ""
+	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -x hostname:myhost"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
@@ -268,7 +268,7 @@ func TestAcquire_WithHostname_Dhclient(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
 	executor.commands["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+	executor.commands["timeout 60 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
@@ -288,7 +288,7 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 	executor1.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
 	executor1.commands["rm -f /run/net/dhclient.eth0.conf"] = ""
 	executor1.commands["install -m 0600 /dev/stdin /run/net/dhclient.eth0.conf"] = ""
-	executor1.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.eth0.conf eth0"] = ""
+	executor1.commands["timeout 60 dhclient -v -1 -cf /run/net/dhclient.eth0.conf eth0"] = ""
 	executor1.commands["ip addr show eth0"] = "inet 10.0.0.50/24"
 	logger1 := &mockLogger{}
 	manager1 := NewManager(executor1, logger1)
@@ -325,7 +325,7 @@ func TestAcquire_DhcpClientFails(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["timeout 15 dhclient -v -1 wlan0"] = errors.New("dhclient: no lease obtained")
+	executor.errors["timeout 60 dhclient -v -1 wlan0"] = errors.New("dhclient: no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
@@ -420,7 +420,7 @@ func TestRenew_DelegatesToAcquire(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 15 dhclient -v -1 wlan0"] = ""
+	executor.commands["timeout 60 dhclient -v -1 wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
@@ -515,7 +515,7 @@ func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B"] = errors.New("no lease obtained")
+	executor.errors["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10"] = errors.New("no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
@@ -523,15 +523,16 @@ func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "udhcpc failed")
 
-	// Count how many times Release was called (pkill commands)
-	// Should be called twice: once before acquire attempt, once after failure
+	// Count how many times Release was called (pkill commands).
+	// Acquire retries once on failure, so each attempt calls Release twice
+	// (before and after), giving 4 calls total across 2 attempts.
 	pkillCount := 0
 	for _, cmd := range executor.executedCmds {
 		if strings.Contains(cmd, "pkill") && strings.Contains(cmd, "udhcpc") {
 			pkillCount++
 		}
 	}
-	assert.Equal(t, 2, pkillCount, "Release should be called both before and after udhcpc failure")
+	assert.Equal(t, 4, pkillCount, "Release should be called before+after each of the 2 attempts")
 }
 
 func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
@@ -543,7 +544,7 @@ func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["timeout 15 dhclient -v -1 wlan0"] = errors.New("no lease obtained")
+	executor.errors["timeout 60 dhclient -v -1 wlan0"] = errors.New("no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
 
@@ -551,15 +552,16 @@ func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dhclient failed")
 
-	// Count how many times Release was called (pkill commands)
-	// Should be called twice: once before acquire attempt, once after failure
+	// Count how many times Release was called (pkill commands).
+	// Acquire retries once on failure, so each attempt calls Release twice
+	// (before and after), giving 4 calls total across 2 attempts.
 	pkillCount := 0
 	for _, cmd := range executor.executedCmds {
 		if strings.Contains(cmd, "pkill") && strings.Contains(cmd, "dhclient") {
 			pkillCount++
 		}
 	}
-	assert.Equal(t, 2, pkillCount, "Release should be called both before and after dhclient failure")
+	assert.Equal(t, 4, pkillCount, "Release should be called before+after each of the 2 attempts")
 }
 
 // Tests for regex escape in pkill patterns
@@ -585,11 +587,40 @@ func TestRelease_UsesRegexpQuoteMeta(t *testing.T) {
 	executor.assertCommandExecuted(t, "dhclient.*wlan-0")
 }
 
+// Tests for isWiredInterface
+
+func TestIsWiredInterface(t *testing.T) {
+	tests := []struct {
+		iface string
+		want  bool
+	}{
+		{"eth0", true},
+		{"enp3s0", true},
+		{"enx6c1ff75f366b", true}, // USB ethernet (the user's adapter)
+		{"eno1", true},
+		{"ens33", true},
+		{"em0", true},
+		{"usb0", true},
+		{"wlan0", false},
+		{"wlp1s0", false},
+		{"wg0", false},
+		{"tun0", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.iface, func(t *testing.T) {
+			assert.Equal(t, tt.want, isWiredInterface(tt.iface))
+		})
+	}
+}
+
 // Tests for timeout constants
 
 func TestTimeoutConstants(t *testing.T) {
-	assert.Equal(t, 10*time.Second, UdhcpcTimeout)
-	assert.Equal(t, 15*time.Second, DhclientTimeout)
+	assert.Equal(t, 30*time.Second, UdhcpcTimeout)
+	assert.Equal(t, 60*time.Second, DhclientTimeout)
 	assert.Equal(t, 500*time.Millisecond, CleanupTimeout)
 	assert.Equal(t, 2*time.Second, IPCheckTimeout)
+	assert.Equal(t, 2*time.Second, RetryDelay)
+	assert.Equal(t, 6, UdhcpcDiscoverRetries)
+	assert.Equal(t, 3, UdhcpcDiscoverTimeout)
 }
