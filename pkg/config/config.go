@@ -440,7 +440,36 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 	// Warn about plain text credentials after successful load
 	m.WarnAboutPlainTextCredentials()
 
+	// Warn about vpn: references that don't match any defined VPN — these
+	// would otherwise only surface as a connect-time failure
+	m.warnAboutDanglingVPNRefs()
+
 	return &config, nil
+}
+
+// warnAboutDanglingVPNRefs warns when common.vpn or a network's vpn: field
+// references a VPN name that is not defined under the top-level vpn: map.
+// Lookups are case-insensitive to match GetVPNConfig (viper lowercases keys).
+func (m *Manager) warnAboutDanglingVPNRefs() {
+	if m.config == nil || m.logger == nil {
+		return
+	}
+	check := func(section, ref string) {
+		if ref == "" {
+			return
+		}
+		if _, ok := m.config.VPN[ref]; ok {
+			return
+		}
+		if _, ok := m.config.VPN[strings.ToLower(ref)]; ok {
+			return
+		}
+		m.logger.Warn("Config references a VPN that is not defined", "section", section, "vpn", ref)
+	}
+	check("common", m.config.Common.VPN)
+	for name, network := range m.config.Networks {
+		check("network '"+name+"'", network.VPN)
+	}
 }
 
 // GetNetworkConfig returns the configuration for a specific network
@@ -460,7 +489,9 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 
 	// Check if already loaded in cache
 	if config, exists := m.config.Networks[name]; exists {
-		m.logger.Debug("Network config from cache", "network", name, "ssid", config.SSID)
+		if m.logger != nil {
+			m.logger.Debug("Network config from cache", "network", name, "ssid", config.SSID)
+		}
 		return &config, nil
 	}
 
@@ -475,7 +506,9 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 	if subV == nil {
 		aliasTarget := m.viper.GetString(name)
 		if aliasTarget != "" {
-			m.logger.Debug("Network alias detected", "alias", name, "target", aliasTarget)
+			if m.logger != nil {
+				m.logger.Debug("Network alias detected", "alias", name, "target", aliasTarget)
+			}
 			return m.resolveAlias(aliasTarget, 5)
 		}
 		return nil, fmt.Errorf("failed to read network configuration '%s'", name)
@@ -489,7 +522,9 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 
 	// Cache it for next time
 	m.config.Networks[name] = netConfig
-	m.logger.Debug("Loaded network config", "network", name, "ssid", netConfig.SSID)
+	if m.logger != nil {
+		m.logger.Debug("Loaded network config", "network", name, "ssid", netConfig.SSID)
+	}
 
 	return &netConfig, nil
 }
@@ -534,6 +569,12 @@ func (m *Manager) GetVPNConfig(name string) (*types.VPNConfig, error) {
 	}
 
 	config, exists := m.config.VPN[name]
+	if !exists {
+		// Viper lowercases all map keys when unmarshalling, so a VPN defined
+		// as "Work-VPN" is stored under "work-vpn" while references to it
+		// (common.vpn, a network's vpn: field) keep their original case.
+		config, exists = m.config.VPN[strings.ToLower(name)]
+	}
 	if !exists {
 		return nil, fmt.Errorf("VPN configuration '%s' not found", name)
 	}

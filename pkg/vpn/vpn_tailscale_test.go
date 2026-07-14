@@ -42,10 +42,10 @@ func TestConnectTailscale_MissingBinary(t *testing.T) {
 func TestConnectTailscale_Success(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":                              "default via 192.168.1.1 dev eth0",
-			"tailscale up --authkey=tskey-auth-xxxxx":            "",
-			"tailscale set --accept-dns=false --exit-node=us-1":  "",
-			"tailscale status --json": `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
+			"ip route show default":                             "default via 192.168.1.1 dev eth0",
+			"tailscale up --authkey=tskey-auth-xxxxx":           "",
+			"tailscale set --accept-dns=false --exit-node=us-1": "",
+			"tailscale status --json":                           `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -71,10 +71,10 @@ func TestConnectTailscale_Success(t *testing.T) {
 func TestConnectTailscale_NoAuthKey(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":           "default via 192.168.1.1 dev eth0",
-			"tailscale up":                    "",
+			"ip route show default":            "default via 192.168.1.1 dev eth0",
+			"tailscale up":                     "",
 			"tailscale set --accept-dns=false": "",
-			"tailscale status --json":         `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
+			"tailscale status --json":          `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -94,10 +94,10 @@ func TestConnectTailscale_NoAuthKey(t *testing.T) {
 func TestConnectTailscale_WithAcceptRoutes(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":                                "default via 192.168.1.1 dev eth0",
-			"tailscale up":                                        "",
-			"tailscale set --accept-dns=false --accept-routes":    "",
-			"tailscale status --json":                             `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			"tailscale up":          "",
+			"tailscale set --accept-dns=false --accept-routes": "",
+			"tailscale status --json":                          `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -117,11 +117,11 @@ func TestConnectTailscale_WithAcceptRoutes(t *testing.T) {
 func TestConnectTailscale_WithProfile(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":                                    "default via 192.168.1.1 dev eth0",
-			"tailscale switch work@company.com":                        "",
-			"tailscale up":                                             "",
-			"tailscale set --accept-dns=false --exit-node=us-east-1":   "",
-			"tailscale status --json": `{"BackendState":"Running"}`,
+			"ip route show default":                                  "default via 192.168.1.1 dev eth0",
+			"tailscale switch work@company.com":                      "",
+			"tailscale up":                                           "",
+			"tailscale set --accept-dns=false --exit-node=us-east-1": "",
+			"tailscale status --json":                                `{"BackendState":"Running"}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -150,10 +150,10 @@ func TestConnectTailscale_ProfileSwitchEmptyStderr(t *testing.T) {
 	// the connect should still succeed without warnings blocking it.
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":                  "default via 192.168.1.1 dev eth0",
-			"tailscale up":                           "",
-			"tailscale set --accept-dns=false":       "",
-			"tailscale status --json":                `{"BackendState":"Running"}`,
+			"ip route show default":            "default via 192.168.1.1 dev eth0",
+			"tailscale up":                     "",
+			"tailscale set --accept-dns=false": "",
+			"tailscale status --json":          `{"BackendState":"Running"}`,
 		},
 		errors: map[string]error{
 			"tailscale switch work@company.com": fmt.Errorf("command failed: exit status 1 (stderr: )"),
@@ -181,6 +181,62 @@ func TestIsEmptyStderrError(t *testing.T) {
 	assert.True(t, isEmptyStderrError(fmt.Errorf("command failed: exit status 1 (stderr: )")))
 	assert.False(t, isEmptyStderrError(fmt.Errorf("command failed: exit status 1 (stderr: profile not found)")))
 	assert.False(t, isEmptyStderrError(nil))
+}
+
+func TestConnectTailscale_ProfileSwitchFailureIsFatal(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":            "default via 192.168.1.1 dev eth0",
+			"tailscale up":                     "",
+			"tailscale set --accept-dns=false": "",
+			"tailscale status --json":          `{"BackendState":"Running"}`,
+		},
+		errors: map[string]error{
+			"tailscale switch missing@example.com": fmt.Errorf("command failed: exit status 1 (stderr: unknown profile)"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"work-ts": {
+				Type:    "tailscale",
+				Profile: "missing@example.com",
+			},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("work-ts")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "profile")
+
+	// Connecting without the requested profile would silently use the wrong
+	// account, so "up" must not run after a failed switch.
+	executor.assertCommandNotExecuted(t, "tailscale up")
+}
+
+func TestConnectTailscale_FailsWhenBackendNeverRuns(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":            "default via 192.168.1.1 dev eth0",
+			"tailscale up":                     "",
+			"tailscale set --accept-dns=false": "",
+			"tailscale status --json":          `{"BackendState":"NeedsLogin"}`,
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"ts": {Type: "tailscale"},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+	manager.verifyAttempts = 2
+	manager.verifyDelay = 0
+
+	err := manager.Connect("ts")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "did not come up")
 }
 
 func TestListVPNs_TailscaleRunning(t *testing.T) {

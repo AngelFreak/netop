@@ -195,6 +195,14 @@ func (a *App) RunConnect(name, password string) error {
 	networkConfig, err := a.ConfigMgr.GetNetworkConfig(name)
 	var connectedIface string
 	if err != nil {
+		// A config that failed to load (parse/validation error) is different
+		// from a name that simply isn't configured: don't silently degrade to
+		// treating the name as an SSID — that skips MAC/DNS/VPN settings the
+		// user thinks are applied. GetConfig() is nil only on load failure.
+		if a.ConfigMgr.GetConfig() == nil {
+			a.errorf("Error: configuration failed to load, refusing to treat '%s' as a plain SSID. Fix the config file and retry.\n", name)
+			return fmt.Errorf("configuration not loaded: %w", err)
+		}
 		// Not configured, treat as SSID
 		a.Logger.Debug("Network config not found, treating as direct SSID", "name", name, "error", err)
 		a.Logger.Info("Connecting to SSID", "ssid", name)

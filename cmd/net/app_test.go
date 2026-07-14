@@ -435,7 +435,8 @@ func TestApp_RunScan_Error(t *testing.T) {
 
 func TestApp_RunConnect_DirectSSID(t *testing.T) {
 	app, stdout, _ := newTestApp()
-	app.ConfigMgr = &testConfigManager{networkErr: errors.New("not found")}
+	// Config loaded fine (non-nil) but the name isn't a configured network
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
 	app.WiFiMgr = &testWiFiManager{
 		connections: []types.Connection{
 			{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")},
@@ -446,6 +447,18 @@ func TestApp_RunConnect_DirectSSID(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, stdout.String(), "Connecting to WiFi...")
 	assert.Contains(t, stdout.String(), "Connected!")
+}
+
+func TestApp_RunConnect_FailsWhenConfigNotLoaded(t *testing.T) {
+	app, _, stderr := newTestApp()
+	// GetConfig() returns nil — the config file failed to load. Connect must
+	// not silently fall back to treating the name as a plain SSID.
+	app.ConfigMgr = &testConfigManager{config: nil, networkErr: errors.New("config not loaded")}
+	app.WiFiMgr = &testWiFiManager{}
+
+	err := app.RunConnect("home", "")
+	assert.Error(t, err)
+	assert.Contains(t, stderr.String(), "configuration failed to load")
 }
 
 func TestApp_RunConnect_ConfiguredNetwork(t *testing.T) {
@@ -1178,7 +1191,7 @@ func (v *trackingVPNManager) Disconnect(name string) error {
 
 func TestApp_RunConnect_DisconnectsActiveVPNFirst(t *testing.T) {
 	app, _, _ := newTestApp()
-	app.ConfigMgr = &testConfigManager{networkErr: errors.New("not found")}
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
 	// Create a custom VPN manager that tracks disconnect calls
 	vpnMgr := &trackingVPNManager{}
 	app.VPNMgr = vpnMgr

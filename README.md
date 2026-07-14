@@ -439,7 +439,7 @@ vpn:
     profile: home                          # Switch to home account
 ```
 
-> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled). Multi-account support uses `tailscale switch` and `netbird up --profile` under the hood.
+> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled). Multi-account support uses `tailscale switch` and `netbird profile select` under the hood. Profiles are per-OS-user and `net` runs as root, so create them for root (e.g. `sudo netbird profile add`) — a profile that can't be selected fails the connection rather than silently using the wrong account.
 
 </details>
 

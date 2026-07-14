@@ -3,6 +3,7 @@ package vpn
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -27,16 +28,23 @@ type Manager struct {
 	endpointRoute string     // Stores the VPN endpoint IP for cleanup on disconnect
 	runtimeDir    string     // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex // Protects endpointRoute and serializes Connect/Disconnect/state file operations
+
+	// Status verification polling for daemon-based VPNs (tailscale, netbird).
+	// Their "up" command can return before the tunnel is established, so we
+	// poll status until it reports connected. Overridable in tests.
+	verifyAttempts int
+	verifyDelay    time.Duration
 }
 
 // vpnState holds the state information stored in the active-vpn file
-// Format: vpn-name|interface|type|originalGateway|originalInterface
+// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
 type vpnState struct {
 	Name              string
 	Interface         string
 	Type              string
 	OriginalGateway   string
 	OriginalInterface string
+	EndpointRoute     string
 }
 
 // NewManager creates a new VPN manager with the default runtime directory
@@ -47,10 +55,12 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, configMgr ty
 // NewManagerWithDir creates a new VPN manager with a custom runtime directory
 func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, configMgr types.ConfigManager, runtimeDir string) *Manager {
 	return &Manager{
-		executor:   executor,
-		logger:     logger,
-		configMgr:  configMgr,
-		runtimeDir: runtimeDir,
+		executor:       executor,
+		logger:         logger,
+		configMgr:      configMgr,
+		runtimeDir:     runtimeDir,
+		verifyAttempts: 30,
+		verifyDelay:    time.Second,
 	}
 }
 
@@ -84,14 +94,18 @@ func (m *Manager) Connect(name string) error {
 	// This will be used to restore the route after disconnect
 	origGW, origIface := m.getCurrentGateway()
 
+	// Reset the endpoint route tracker; connectWireGuard sets it when it
+	// adds a protective route to the VPN endpoint.
+	m.endpointRoute = ""
+
 	var connectErr error
 	var vpnIface string
 	switch config.Type {
 	case "openvpn":
 		connectErr = m.connectOpenVPN(config)
-		vpnIface = "tun0"
+		vpnIface = openVPNDevice(config.Config)
 	case "wireguard":
-		connectErr = m.connectWireGuard(config)
+		connectErr = m.connectWireGuard(config, origGW, origIface)
 		vpnIface = config.Interface
 		if vpnIface == "" {
 			vpnIface = "wg0"
@@ -116,13 +130,17 @@ func (m *Manager) Connect(name string) error {
 		return connectErr
 	}
 
-	// Record the active VPN state for status tracking and proper disconnect
+	// Record the active VPN state for status tracking and proper disconnect.
+	// The endpoint route is persisted because the CLI is one-shot: the process
+	// that disconnects is not the one that connected, so in-memory state alone
+	// would leak the protective endpoint route.
 	state := vpnState{
 		Name:              name,
 		Interface:         vpnIface,
 		Type:              config.Type,
 		OriginalGateway:   origGW,
 		OriginalInterface: origIface,
+		EndpointRoute:     m.endpointRoute,
 	}
 	if err := m.setActiveVPNState(state); err != nil {
 		m.logger.Debug("Failed to record active VPN state", "error", err)
@@ -142,6 +160,11 @@ func (m *Manager) Disconnect(name string) error {
 	// Read the VPN state to know exactly what to clean up
 	state := m.getActiveVPNState()
 
+	// When a specific VPN is named, only disconnect if it is the active one
+	if name != "" && state != nil && state.Name != "" && state.Name != name {
+		return fmt.Errorf("VPN '%s' is not the active VPN (currently active: '%s')", name, state.Name)
+	}
+
 	var disconnectErr error
 
 	// Disconnect based on tracked state (process isolation)
@@ -158,8 +181,13 @@ func (m *Manager) Disconnect(name string) error {
 		return fmt.Errorf("no active VPN connection")
 	}
 
-	// Remove the VPN endpoint route if we added one (no nested lock needed, already holding m.mu)
+	// Remove the VPN endpoint route if we added one. Prefer the persisted
+	// route from the state file — the connecting process is usually not the
+	// disconnecting one, so the in-memory value is only a same-process fallback.
 	endpointRoute := m.endpointRoute
+	if state != nil && state.EndpointRoute != "" {
+		endpointRoute = state.EndpointRoute
+	}
 	m.endpointRoute = ""
 	if endpointRoute != "" {
 		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
@@ -185,9 +213,13 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 			m.logger.Warn("Failed to kill tracked OpenVPN", "error", err)
 			return fmt.Errorf("failed to stop OpenVPN: %w", err)
 		}
-		// Bring down the tun interface
-		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", "tun0", "down"); err != nil {
-			m.logger.Debug("Failed to bring down tun0", "error", err)
+		// Bring down the tunnel interface recorded at connect time
+		iface := state.Interface
+		if iface == "" {
+			iface = "tun0"
+		}
+		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", iface, "down"); err != nil {
+			m.logger.Debug("Failed to bring down OpenVPN interface", "interface", iface, "error", err)
 		}
 	case "wireguard":
 		// Delete only our WireGuard interface
@@ -412,15 +444,34 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	// Check Tailscale status
 	runningTailscale := false
 	tsOutput, tsErr := m.executor.ExecuteWithTimeout(2*time.Second, "tailscale", "status", "--json")
-	if tsErr == nil && strings.Contains(tsOutput, `"Running"`) {
+	if tsErr == nil && tailscaleStatusRunning(tsOutput) {
 		runningTailscale = true
 	}
 
 	// Check NetBird status
 	runningNetBird := false
 	nbOutput, nbErr := m.executor.ExecuteWithTimeout(2*time.Second, "netbird", "status", "--json")
-	if nbErr == nil && strings.Contains(nbOutput, `"Connected"`) {
+	if nbErr == nil && netBirdStatusConnected(nbOutput) {
 		runningNetBird = true
+	}
+
+	// liveConnected reports whether a VPN of the given type is actually up
+	// right now, based on the probes above.
+	liveConnected := func(vpnType, iface string) bool {
+		switch vpnType {
+		case "openvpn":
+			return runningOpenVPN
+		case "wireguard":
+			if iface == "" {
+				iface = "wg0"
+			}
+			return runningWireGuard[iface]
+		case "tailscale":
+			return runningTailscale
+		case "netbird":
+			return runningNetBird
+		}
+		return false
 	}
 
 	var vpns []types.VPNStatus
@@ -437,25 +488,18 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 			}
 
 			// Determine connection status:
-			// 1. If we have an active VPN recorded, use that as authoritative
-			// 2. Otherwise fall back to interface detection (for VPNs started outside net)
+			// 1. If we have an active VPN recorded, it names which VPN net
+			//    connected — but verify it is actually still up, since daemons
+			//    crash and sessions expire after the state file was written.
+			// 2. Otherwise fall back to live detection (for VPNs started outside net)
+			iface := vpnConfig.Interface
+			if state != nil && name == activeVPN && state.Interface != "" {
+				iface = state.Interface
+			}
 			if activeVPN != "" {
-				// Use state file as authoritative source
-				status.Connected = (name == activeVPN)
+				status.Connected = name == activeVPN && liveConnected(vpnConfig.Type, iface)
 			} else {
-				// Fall back to interface detection
-				switch vpnConfig.Type {
-				case "openvpn":
-					status.Connected = runningOpenVPN
-				case "wireguard":
-					if vpnConfig.Interface != "" {
-						status.Connected = runningWireGuard[vpnConfig.Interface]
-					}
-				case "tailscale":
-					status.Connected = runningTailscale
-				case "netbird":
-					status.Connected = runningNetBird
-				}
+				status.Connected = liveConnected(vpnConfig.Type, iface)
 			}
 
 			if status.Interface == "" {
@@ -531,18 +575,74 @@ func (m *Manager) removeFile(path string) {
 	}
 }
 
+// tailscaleStatusRunning reports whether "tailscale status --json" output
+// shows the backend in the Running state.
+func tailscaleStatusRunning(output string) bool {
+	var st struct {
+		BackendState string `json:"BackendState"`
+	}
+	if err := json.Unmarshal([]byte(output), &st); err != nil {
+		return strings.Contains(output, `"BackendState":"Running"`)
+	}
+	return st.BackendState == "Running"
+}
+
+// netBirdStatusConnected reports whether "netbird status --json" output shows
+// the daemon connected to the management service. The peer entries also carry
+// "Connected"/"Connecting" status strings, so a plain substring match would
+// report the wrong thing — daemonStatus is the client-level signal.
+func netBirdStatusConnected(output string) bool {
+	var st struct {
+		DaemonStatus string `json:"daemonStatus"`
+	}
+	if err := json.Unmarshal([]byte(output), &st); err != nil {
+		return strings.Contains(output, `"daemonStatus":"Connected"`)
+	}
+	return st.DaemonStatus == "Connected"
+}
+
+// waitForVPNStatus polls a VPN CLI's status command until connected(output)
+// reports true, retrying up to verifyAttempts times with verifyDelay between
+// checks. Daemon-based VPNs (tailscale, netbird) establish the tunnel
+// asynchronously after "up" returns, so a single immediate check races the daemon.
+func (m *Manager) waitForVPNStatus(cli string, statusArgs []string, connected func(string) bool) error {
+	var lastOutput string
+	var lastErr error
+	attempts := m.verifyAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(m.verifyDelay)
+		}
+		output, err := m.executor.ExecuteWithTimeout(5*time.Second, cli, statusArgs...)
+		if err == nil && connected(output) {
+			return nil
+		}
+		lastOutput = output
+		lastErr = err
+	}
+	if lastErr != nil {
+		return fmt.Errorf("%s status check failed: %w", cli, lastErr)
+	}
+	return fmt.Errorf("%s tunnel did not come up (last status: %s)", cli, strings.TrimSpace(lastOutput))
+}
+
 // connectTailscale connects using the Tailscale CLI
 func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to Tailscale")
 
 	// Switch profile if specified (for multi-account support).
 	// "tailscale switch" may return a non-zero exit code even on success
-	// (e.g. empty stderr), so we only warn when stderr contains a message.
+	// (e.g. empty stderr), so only a failure with a real message counts.
+	// A real failure is fatal: proceeding would bring up the tunnel on
+	// whatever account is currently active — silently wrong for multi-account.
 	if config.Profile != "" {
 		m.logger.Debug("Switching Tailscale profile", "profile", config.Profile)
 		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "switch", config.Profile)
 		if err != nil && !isEmptyStderrError(err) {
-			m.logger.Warn("Failed to switch Tailscale profile", "profile", config.Profile, "error", err)
+			return fmt.Errorf("failed to switch Tailscale profile %q: %w (check 'tailscale switch --list'; net runs as root, so the profile must be visible to root)", config.Profile, err)
 		}
 	}
 
@@ -573,12 +673,9 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 		return fmt.Errorf("failed to apply Tailscale settings: %w", err)
 	}
 
-	// Verify connection
-	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "tailscale", "status", "--json")
-	if err != nil {
-		m.logger.Warn("Could not verify Tailscale status", "error", err)
-	} else if !strings.Contains(output, "Running") {
-		m.logger.Warn("Tailscale may not be fully connected", "status", output)
+	// Verify the tunnel actually came up before reporting success
+	if err := m.waitForVPNStatus("tailscale", []string{"status", "--json"}, tailscaleStatusRunning); err != nil {
+		return err
 	}
 
 	m.logger.Info("Tailscale connected")
@@ -595,12 +692,24 @@ func isEmptyStderrError(err error) bool {
 func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to NetBird")
 
-	// Build args
+	// Switch profile if specified (for multi-account support).
+	// Mirrors the Tailscale flow: select the profile before "up" so the
+	// daemon uses the right account. A failed select is fatal: a bare "up"
+	// would connect whatever profile was last active — silently the wrong
+	// account. NetBird profiles are per-OS-user, and net runs as root, so
+	// the profile must have been created for root (sudo netbird profile add).
+	if config.Profile != "" {
+		m.logger.Debug("Switching NetBird profile", "profile", config.Profile)
+		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "profile", "select", config.Profile)
+		if err != nil {
+			return fmt.Errorf("failed to switch NetBird profile %q: %w (check 'sudo netbird profile list' — profiles are per-user and net runs as root)", config.Profile, err)
+		}
+	}
+
+	// Profile is applied via "profile select" above, so it is intentionally
+	// omitted from "up" here.
 	args := []string{"up"}
 
-	if config.Profile != "" {
-		args = append(args, "--profile", config.Profile)
-	}
 	if config.SetupKey != "" {
 		args = append(args, "--setup-key", config.SetupKey)
 	}
@@ -616,16 +725,34 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 		return fmt.Errorf("failed to connect NetBird: %w", err)
 	}
 
-	// Verify connection
-	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "netbird", "status")
-	if err != nil {
-		m.logger.Warn("Could not verify NetBird status", "error", err)
-	} else if !strings.Contains(output, "Connected") {
-		m.logger.Warn("NetBird may not be fully connected", "status", output)
+	// Verify the tunnel actually came up before reporting success
+	if err := m.waitForVPNStatus("netbird", []string{"status", "--json"}, netBirdStatusConnected); err != nil {
+		return err
 	}
 
 	m.logger.Info("NetBird connected")
 	return nil
+}
+
+// openVPNDevice extracts the tunnel device name from an OpenVPN config.
+// A bare device type ("dev tun" / "dev tap") means the kernel assigns the
+// first free unit, which is 0 on a clean system, so those default to
+// tun0/tap0 — same as when no dev directive is present.
+func openVPNDevice(config string) string {
+	for _, line := range strings.Split(config, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 && fields[0] == "dev" {
+			switch fields[1] {
+			case "tun":
+				return "tun0"
+			case "tap":
+				return "tap0"
+			default:
+				return fields[1]
+			}
+		}
+	}
+	return "tun0"
 }
 
 // connectOpenVPN connects to an OpenVPN server
@@ -652,11 +779,12 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 		return fmt.Errorf("failed to start OpenVPN: %w", err)
 	}
 
-	// Wait for tun interface to appear (up to 30s)
-	m.logger.Debug("Waiting for OpenVPN tunnel to establish")
+	// Wait for the tunnel interface from the config to appear (up to 30s)
+	device := openVPNDevice(config.Config)
+	m.logger.Debug("Waiting for OpenVPN tunnel to establish", "device", device)
 	for i := 0; i < 30; i++ {
-		if _, err := m.executor.ExecuteWithTimeout(1*time.Second, "ip", "link", "show", "tun0"); err == nil {
-			m.logger.Info("OpenVPN tunnel established")
+		if _, err := m.executor.ExecuteWithTimeout(1*time.Second, "ip", "link", "show", device); err == nil {
+			m.logger.Info("OpenVPN tunnel established", "device", device)
 			return nil
 		}
 		time.Sleep(time.Second)
@@ -666,8 +794,11 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 	return fmt.Errorf("openvpn failed to establish tunnel within 30s")
 }
 
-// connectWireGuard connects to a WireGuard VPN
-func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
+// connectWireGuard connects to a WireGuard VPN. origGW/origIface are the
+// default gateway snapshot taken by Connect before any routing changes; they
+// are passed in rather than re-queried so the endpoint route and the saved
+// restore state can never diverge.
+func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface string) error {
 	m.logger.Info("Connecting to WireGuard VPN")
 
 	// Default interface name if not specified
@@ -723,21 +854,30 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig) error {
 
 	// Add routes if gateway is enabled
 	if config.Gateway {
-		// Extract endpoint IP from config to route it via the original gateway
+		// Route the VPN endpoint via the original gateway so the tunnel's own
+		// traffic survives the default-route flip below.
 		endpoint := m.extractEndpoint(config.Config)
-		if endpoint != "" && net.ParseIP(endpoint) != nil {
-			// Get current default gateway before we change it
-			gateway, gwIface := m.getCurrentGateway()
-			if gateway != "" && gwIface != "" {
-				// Add route to VPN endpoint via original gateway
-				m.logger.Debug("Adding route to VPN endpoint", "endpoint", endpoint, "gateway", gateway, "interface", gwIface)
-				_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", endpoint, "via", gateway, "dev", gwIface)
-				if err != nil {
-					m.logger.Warn("Failed to add route to VPN endpoint", "error", err)
-				} else {
-					// Store endpoint for cleanup on disconnect (already holding m.mu from Connect)
-					m.endpointRoute = endpoint
-				}
+		endpointIP := endpoint
+		if endpoint != "" && net.ParseIP(endpoint) == nil {
+			// Hostname endpoint — resolve it now, while the physical default
+			// route is still in place, so it can be protected like an IP.
+			addrs, lookupErr := net.LookupHost(endpoint)
+			if lookupErr != nil || len(addrs) == 0 {
+				m.logger.Warn("Failed to resolve WireGuard endpoint hostname; tunnel may drop after default route change", "endpoint", endpoint, "error", lookupErr)
+				endpointIP = ""
+			} else {
+				endpointIP = addrs[0]
+			}
+		}
+		if endpointIP != "" && origGW != "" && origIface != "" {
+			// Add route to VPN endpoint via original gateway
+			m.logger.Debug("Adding route to VPN endpoint", "endpoint", endpointIP, "gateway", origGW, "interface", origIface)
+			_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", endpointIP, "via", origGW, "dev", origIface)
+			if err != nil {
+				m.logger.Warn("Failed to add route to VPN endpoint", "error", err)
+			} else {
+				// Store endpoint for cleanup on disconnect (already holding m.mu from Connect)
+				m.endpointRoute = endpointIP
 			}
 		}
 
@@ -843,7 +983,6 @@ func (m *Manager) activeVPNFilePath() string {
 	return filepath.Join(m.runtimeDir, "active-vpn")
 }
 
-
 // setActiveVPNState records the full VPN state to the state file
 func (m *Manager) setActiveVPNState(state vpnState) error {
 	activeVPNFile := m.activeVPNFilePath()
@@ -853,10 +992,10 @@ func (m *Manager) setActiveVPNState(state vpnState) error {
 		// Non-fatal: status will fall back to interface detection
 		return err
 	}
-	// Format: vpn-name|interface|type|originalGateway|originalInterface
-	content := fmt.Sprintf("%s|%s|%s|%s|%s",
+	// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
+	content := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
 		state.Name, state.Interface, state.Type,
-		state.OriginalGateway, state.OriginalInterface)
+		state.OriginalGateway, state.OriginalInterface, state.EndpointRoute)
 	// Use 0600 for consistency with other runtime files (e.g., wg.conf, openvpn.conf)
 	return os.WriteFile(activeVPNFile, []byte(content), 0600)
 }
@@ -872,7 +1011,7 @@ func (m *Manager) getActiveVPNState() *vpnState {
 		return nil
 	}
 
-	// Parse enhanced format: vpn-name|interface|type|originalGateway|originalInterface
+	// Parse enhanced format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
 	parts := strings.Split(content, "|")
 	state := &vpnState{Name: parts[0]}
 	if len(parts) >= 2 {
@@ -886,6 +1025,9 @@ func (m *Manager) getActiveVPNState() *vpnState {
 	}
 	if len(parts) >= 5 {
 		state.OriginalInterface = parts[4]
+	}
+	if len(parts) >= 6 {
+		state.EndpointRoute = parts[5]
 	}
 	return state
 }
