@@ -360,8 +360,10 @@ func (h *hotspotManagerImpl) validateConfig(config *types.HotspotConfig) error {
 	if config.SSID == "" {
 		return fmt.Errorf("SSID is required")
 	}
-	if config.Password != "" && len(config.Password) < 8 {
-		return fmt.Errorf("password must be at least 8 characters")
+	if config.Password != "" && (len(config.Password) < 8 || len(config.Password) > 63) {
+		// hostapd requires WPA2 passphrases to be 8..63 characters; anything
+		// outside that range makes it fail to start with a cryptic error.
+		return fmt.Errorf("password must be 8-63 characters")
 	}
 	if !isValidChannel(config.Channel) {
 		return fmt.Errorf("invalid channel %d (valid: 1-14 for 2.4GHz, 36-165 for 5GHz)", config.Channel)

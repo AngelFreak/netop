@@ -4,9 +4,27 @@ import (
 	"net"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/angelfreak/net/pkg/types"
 )
+
+// SanitizeForTerminal makes an untrusted string safe to print to a terminal by
+// replacing control characters (ANSI escapes, backspaces, etc.) with '?'. This
+// prevents terminal-escape injection from attacker-controlled values such as
+// scanned SSIDs (over-the-air) and DHCP lease hostnames (from LAN clients).
+// Ordinary printable characters, including spaces, are left unchanged.
+func SanitizeForTerminal(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, s)
+}
 
 // KillProcessFast kills processes immediately with SIGKILL (for daemons where graceful shutdown isn't needed).
 // This is faster than graceful shutdown (~200-500ms saved) and appropriate for network daemons

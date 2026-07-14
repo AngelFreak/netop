@@ -1344,3 +1344,32 @@ func (c *countingExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string,
 	// For wait_event, use the error map
 	return c.mockSystemExecutor.Execute(cmd, args...)
 }
+
+func TestOtherInterfaceAssociated(t *testing.T) {
+	iwDev := `phy#0
+	Interface wlan0
+		type managed
+		ssid HomeNet
+	Interface wlan1
+		type managed`
+
+	t.Run("another interface associated", func(t *testing.T) {
+		// From wlan1's view, wlan0 has an ssid line -> associated.
+		executor := &mockSystemExecutor{commands: map[string]string{"iw dev": iwDev}}
+		m := &Manager{iface: "wlan1", executor: executor, logger: &mockLogger{}}
+		assert.True(t, m.otherInterfaceAssociated())
+	})
+
+	t.Run("only our interface associated", func(t *testing.T) {
+		// From wlan0's view, only wlan0 has an ssid -> no OTHER interface up.
+		executor := &mockSystemExecutor{commands: map[string]string{"iw dev": iwDev}}
+		m := &Manager{iface: "wlan0", executor: executor, logger: &mockLogger{}}
+		assert.False(t, m.otherInterfaceAssociated())
+	})
+
+	t.Run("iw error fails safe to true", func(t *testing.T) {
+		executor := &mockSystemExecutor{errors: map[string]error{"iw dev": assert.AnError}}
+		m := &Manager{iface: "wlan0", executor: executor, logger: &mockLogger{}}
+		assert.True(t, m.otherInterfaceAssociated())
+	})
+}

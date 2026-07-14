@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 )
 
@@ -168,8 +169,10 @@ func (a *App) RunScan(showOpen bool) error {
 		if showOpen && network.Security != "Open" {
 			continue
 		}
+		// Scanned SSIDs are attacker-controlled over the air; sanitize before
+		// printing to prevent terminal-escape injection.
 		a.printf("%s (%s) - Signal: %d dBm - Security: %s\n",
-			network.SSID, network.BSSID, network.Signal, network.Security)
+			system.SanitizeForTerminal(network.SSID), network.BSSID, network.Signal, network.Security)
 	}
 	return nil
 }
@@ -833,7 +836,9 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 		} else {
 			a.printf("\n%-17s  %-15s  %-20s  %s\n", "MAC", "IP", "HOSTNAME", "EXPIRES")
 			for _, l := range leases {
-				hostname := l.Hostname
+				// Lease hostnames come from LAN DHCP clients; sanitize before
+				// printing to prevent terminal-escape injection.
+				hostname := system.SanitizeForTerminal(l.Hostname)
 				if hostname == "" {
 					hostname = "-"
 				}
