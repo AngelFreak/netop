@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -224,7 +225,12 @@ func TestStart_InvalidConfig(t *testing.T) {
 		{
 			name:   "short password",
 			config: &types.HotspotConfig{Interface: "wlan0", SSID: "Test", Password: "short", Channel: 6, Gateway: "192.168.1.1", IPRange: "192.168.1.50,192.168.1.150"},
-			errMsg: "password must be at least 8 characters",
+			errMsg: "password must be 8-63 characters",
+		},
+		{
+			name:   "over-long password",
+			config: &types.HotspotConfig{Interface: "wlan0", SSID: "Test", Password: strings.Repeat("a", 64), Channel: 6, Gateway: "192.168.1.1", IPRange: "192.168.1.50,192.168.1.150"},
+			errMsg: "password must be 8-63 characters",
 		},
 		{
 			name:   "invalid channel low",

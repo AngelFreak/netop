@@ -411,3 +411,15 @@ nameserver 2001:4860:4860::8888`
 		assert.Len(t, dns, 2)
 	})
 }
+
+func TestSanitizeForTerminal(t *testing.T) {
+	// Control chars (ANSI escape, bell, LF, backspace) become '?'
+	assert.Equal(t, "?[31mred", SanitizeForTerminal("\x1b[31mred"))
+	assert.Equal(t, "abc?def", SanitizeForTerminal("abc\x07def"))
+	assert.Equal(t, "line1?line2", SanitizeForTerminal("line1\nline2"))
+	assert.Equal(t, "no?back", SanitizeForTerminal("no\x08back"))
+	// Tabs normalize to spaces; ordinary printable text (incl. spaces, #, unicode) is untouched
+	assert.Equal(t, "a b", SanitizeForTerminal("a\tb"))
+	assert.Equal(t, "My #Net café", SanitizeForTerminal("My #Net café"))
+	assert.Equal(t, "", SanitizeForTerminal(""))
+}
