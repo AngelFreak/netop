@@ -683,6 +683,34 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		// Verify cleanup was called
 		executor.assertCommandExecuted(t, "rm -f /run/net/openvpn.conf")
 	})
+
+	t.Run("stale device with dead daemon fails", func(t *testing.T) {
+		executor := &mockSystemExecutor{
+			commands: map[string]string{
+				"install -m 0600 /dev/stdin /run/net/openvpn.conf":                                "",
+				"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
+				"ip link show tun0":           "",      // stale interface still exists
+				"cat /run/net/openvpn.pid":    "12345", // PID file exists
+				"rm -f /run/net/openvpn.conf": "",
+				"rm -f /run/net/openvpn.pid":  "",
+			},
+			errors: map[string]error{
+				"kill -0 12345": assert.AnError, // daemon already dead
+			},
+		}
+		logger := &mockLogger{}
+		manager := &Manager{executor: executor, logger: logger, runtimeDir: types.RuntimeDir}
+
+		config := &types.VPNConfig{
+			Config: "openvpn config",
+		}
+
+		err := manager.connectOpenVPN(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "exited before")
+		// Verify cleanup was called
+		executor.assertCommandExecuted(t, "rm -f /run/net/openvpn.conf")
+	})
 }
 
 func TestConnectWireGuard_ErrorCases(t *testing.T) {
@@ -1238,6 +1266,34 @@ func TestDisconnect_ClearsActiveVPNStateFile(t *testing.T) {
 	// Verify state file was removed
 	_, err = os.Stat(activeVPNFile)
 	assert.True(t, os.IsNotExist(err), "active VPN state file should be removed after disconnect")
+}
+
+func TestDisconnect_WireGuardAlreadyGone(t *testing.T) {
+	tempDir := t.TempDir()
+
+	activeVPNFile := filepath.Join(tempDir, "active-vpn")
+	os.WriteFile(activeVPNFile, []byte("test|wg0|wireguard||"), 0600)
+
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show": "",
+		},
+		errors: map[string]error{
+			// Delete fails and the probe confirms the interface is gone, so the
+			// disconnect should still succeed and clear state.
+			"ip link delete wg0": assert.AnError,
+			"ip link show wg0":   assert.AnError,
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{}
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+	err := manager.Disconnect("test")
+	assert.NoError(t, err)
+
+	_, err = os.Stat(activeVPNFile)
+	assert.True(t, os.IsNotExist(err), "active VPN state file should be removed when the interface is already gone")
 }
 
 func TestConnectWireGuard_CleansUpStaleInterface(t *testing.T) {

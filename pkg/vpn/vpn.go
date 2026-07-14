@@ -78,7 +78,11 @@ func (m *Manager) Connect(name string) error {
 	existingState := m.getActiveVPNState()
 	if existingState != nil && existingState.Type != "" {
 		m.logger.Info("Disconnecting existing VPN before connecting new one", "existing", existingState.Name)
-		m.disconnectTracked(existingState)
+		// A failed teardown is fatal: proceeding would wipe the old VPN's
+		// state while its tunnel may still be up, leaving it untracked.
+		if err := m.disconnectTracked(existingState); err != nil {
+			return fmt.Errorf("cannot disconnect active VPN '%s' before connecting '%s': %w", existingState.Name, name, err)
+		}
 		// Restore original route from the existing state before saving new state
 		m.restoreDefaultRouteFromState(existingState)
 		m.clearActiveVPN()
@@ -181,6 +185,13 @@ func (m *Manager) Disconnect(name string) error {
 		return fmt.Errorf("no active VPN connection")
 	}
 
+	// If bringing the VPN down failed, keep the routes and state file intact so
+	// the user can retry "net vpn stop" instead of being stranded with a live
+	// tunnel and no way to tear it down.
+	if disconnectErr != nil {
+		return disconnectErr
+	}
+
 	// Remove the VPN endpoint route if we added one. Prefer the persisted
 	// route from the state file — the connecting process is usually not the
 	// disconnecting one, so the in-memory value is only a same-process fallback.
@@ -200,7 +211,7 @@ func (m *Manager) Disconnect(name string) error {
 	// Clear the active VPN state file
 	m.clearActiveVPN()
 
-	return disconnectErr
+	return nil
 }
 
 // disconnectTracked disconnects using tracked state (process isolation)
@@ -228,6 +239,13 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 			iface = "wg0"
 		}
 		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface); err != nil {
+			// The delete may fail because the interface is already gone. Probe
+			// for it; if it is truly absent there is nothing to tear down, so
+			// treat the disconnect as successful rather than trapping the user.
+			if _, probeErr := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "show", iface); probeErr != nil {
+				m.logger.Debug("WireGuard interface already gone", "interface", iface)
+				return nil
+			}
 			m.logger.Warn("Failed to delete WireGuard interface", "interface", iface, "error", err)
 			return fmt.Errorf("failed to delete WireGuard interface %s: %w", iface, err)
 		}
@@ -771,6 +789,11 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 	// PID file for tracking this specific OpenVPN process
 	pidFile := filepath.Join(m.runtimeDir, "openvpn.pid")
 
+	// Remove any stale pidfile from a crashed run: --writepid is written by
+	// the forked daemon, so the liveness check below could otherwise read a
+	// dead pid from the previous run and fail a healthy connect.
+	m.removeFile(pidFile)
+
 	// Start OpenVPN (10s timeout for daemon startup)
 	// Use --writepid to track the specific process we started
 	_, err = m.executor.ExecuteWithTimeout(10*time.Second, "openvpn",
@@ -783,6 +806,17 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 	device := openVPNDevice(config.Config)
 	m.logger.Debug("Waiting for OpenVPN tunnel to establish", "device", device)
 	for i := 0; i < 30; i++ {
+		// A stale tunnel interface from a previous run can satisfy the device
+		// check even though our daemon already died. Confirm the process we
+		// started is still alive before reporting success.
+		pid, pidErr := m.executor.ExecuteWithTimeout(1*time.Second, "cat", pidFile)
+		pid = strings.TrimSpace(pid)
+		if pidErr == nil && pid != "" {
+			if _, aliveErr := m.executor.ExecuteWithTimeout(1*time.Second, "kill", "-0", pid); aliveErr != nil {
+				system.KillProcessByPID(m.executor, m.logger, pidFile)
+				return fmt.Errorf("openvpn process exited before the tunnel came up")
+			}
+		}
 		if _, err := m.executor.ExecuteWithTimeout(1*time.Second, "ip", "link", "show", device); err == nil {
 			m.logger.Info("OpenVPN tunnel established", "device", device)
 			return nil
