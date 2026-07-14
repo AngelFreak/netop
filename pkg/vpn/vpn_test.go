@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -523,7 +524,7 @@ func TestConnectWireGuard(t *testing.T) {
 		Gateway:   true,
 	}
 
-	err := manager.connectWireGuard(config)
+	err := manager.connectWireGuard(config, "", "")
 	assert.NoError(t, err)
 }
 
@@ -704,7 +705,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 			Gateway:   false, // No gateway route
 		}
 
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		// Should succeed with mock executor
 		assert.NoError(t, err)
 	})
@@ -731,7 +732,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 		}
 
 		// When both create attempts fail, it should return an error
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to create WireGuard interface")
 		// Verify cleanup was attempted
@@ -757,7 +758,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 			Address:   "10.0.0.1/24",
 		}
 
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to set WireGuard config")
 	})
@@ -782,7 +783,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 			Address:   "10.0.0.1/24",
 		}
 
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to set WireGuard IP")
 	})
@@ -808,7 +809,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 			Address:   "10.0.0.1/24",
 		}
 
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to bring WireGuard interface up")
 	})
@@ -837,7 +838,7 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 		}
 
 		// Gateway route error is only a warning, not a fatal error
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.NoError(t, err)
 	})
 }
@@ -1271,7 +1272,7 @@ func TestConnectWireGuard_CleansUpStaleInterface(t *testing.T) {
 			Address:   "10.0.0.1/24",
 		}
 
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.NoError(t, err)
 
 		// Verify cleanup was called between the two ip link add attempts
@@ -1306,8 +1307,137 @@ func TestConnectWireGuard_CleansUpStaleInterface(t *testing.T) {
 			Address:   "10.0.0.1/24",
 		}
 
-		err := manager.connectWireGuard(config)
+		err := manager.connectWireGuard(config, "", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to create WireGuard interface")
 	})
+}
+
+func TestOpenVPNDevice(t *testing.T) {
+	assert.Equal(t, "tun0", openVPNDevice(""))
+	assert.Equal(t, "tun0", openVPNDevice("remote vpn.example.com 1194\ndev tun\n"))
+	assert.Equal(t, "tap0", openVPNDevice("dev tap\n"))
+	assert.Equal(t, "mytun", openVPNDevice("remote x 1194\ndev mytun\nproto udp\n"))
+	assert.Equal(t, "tun3", openVPNDevice("  dev tun3\n"))
+}
+
+func TestVPNStatusPredicates(t *testing.T) {
+	// Tailscale: only BackendState Running counts
+	assert.True(t, tailscaleStatusRunning(`{"BackendState":"Running"}`))
+	assert.False(t, tailscaleStatusRunning(`{"BackendState":"NeedsLogin"}`))
+	assert.False(t, tailscaleStatusRunning(""))
+
+	// NetBird: daemonStatus is the client-level signal; peer status strings
+	// must not be mistaken for it
+	assert.True(t, netBirdStatusConnected(`{"daemonStatus":"Connected"}`))
+	assert.False(t, netBirdStatusConnected(`{"daemonStatus":"NeedsLogin"}`))
+	assert.False(t, netBirdStatusConnected(
+		`{"peers":{"total":1,"connected":0,"details":[{"status":"Connected"}]},"daemonStatus":"Disconnected"}`))
+	assert.False(t, netBirdStatusConnected(""))
+}
+
+func TestDisconnect_NameMismatchIsError(t *testing.T) {
+	tempDir := t.TempDir()
+	executor := &mockSystemExecutor{}
+	logger := &mockLogger{}
+	manager := NewManagerWithDir(executor, logger, &mockConfigManager{}, tempDir)
+
+	err := manager.setActiveVPNState(vpnState{Name: "work", Type: "netbird", Interface: "wt0"})
+	assert.NoError(t, err)
+
+	err = manager.Disconnect("other")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not the active VPN")
+	// State must be untouched — nothing was disconnected
+	assert.Equal(t, "work", manager.getActiveVPN())
+}
+
+func TestDisconnect_RemovesPersistedEndpointRoute(t *testing.T) {
+	// The connecting process is not the disconnecting one: the endpoint route
+	// must survive via the state file, not just the in-memory field.
+	tempDir := t.TempDir()
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip link delete wg0": "",
+			"ip route show":      "default via 192.168.1.1 dev eth0",
+		},
+	}
+	logger := &mockLogger{}
+	manager := NewManagerWithDir(executor, logger, &mockConfigManager{}, tempDir)
+
+	// Simulate the state written by a previous process's Connect
+	err := manager.setActiveVPNState(vpnState{
+		Name:              "wg-vpn",
+		Interface:         "wg0",
+		Type:              "wireguard",
+		OriginalGateway:   "192.168.1.1",
+		OriginalInterface: "eth0",
+		EndpointRoute:     "203.0.113.5",
+	})
+	assert.NoError(t, err)
+
+	err = manager.Disconnect("")
+	assert.NoError(t, err)
+	executor.assertCommandExecuted(t, "ip route del 203.0.113.5")
+}
+
+func TestConnectWireGuard_ResolvesHostnameEndpoint(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"install -m 0600 /dev/stdin /run/net/wg.conf": "",
+			"ip link add dev wg0 type wireguard":          "",
+			"wg setconf wg0 /run/net/wg.conf":             "",
+			"rm -f /run/net/wg.conf":                      "",
+			"ip link set wg0 up":                          "",
+			"ip route replace default dev wg0":            "",
+		},
+	}
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, runtimeDir: types.RuntimeDir}
+
+	config := &types.VPNConfig{
+		Config:    "[Peer]\nEndpoint = localhost:51820\n",
+		Interface: "wg0",
+		Gateway:   true,
+	}
+
+	err := manager.connectWireGuard(config, "192.168.1.1", "eth0")
+	assert.NoError(t, err)
+	// localhost resolves to a loopback address; the protective endpoint route
+	// must use the resolved IP, not the hostname
+	assert.NotEmpty(t, manager.endpointRoute)
+	assert.NotNil(t, net.ParseIP(manager.endpointRoute))
+	assert.True(t, net.ParseIP(manager.endpointRoute).IsLoopback())
+}
+
+func TestListVPNs_StateFileVerifiedAgainstLiveStatus(t *testing.T) {
+	// State file says netbird is the active VPN, but the daemon reports
+	// disconnected — status must not lie.
+	tempDir := t.TempDir()
+	activeVPNFile := filepath.Join(tempDir, "active-vpn")
+	os.WriteFile(activeVPNFile, []byte("work-nb|wt0|netbird|192.168.1.1|eth0|"), 0600)
+
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pgrep -f openvpn":            "",
+			"ip link show type wireguard": "",
+			"tailscale status --json":     "",
+			"netbird status --json":       `{"daemonStatus":"Disconnected"}`,
+		},
+		errors: map[string]error{
+			"pgrep -f openvpn": fmt.Errorf("no match"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"work-nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+	vpns, err := manager.ListVPNs()
+	assert.NoError(t, err)
+	assert.Len(t, vpns, 1)
+	assert.False(t, vpns[0].Connected, "state file says active but daemon is down — must report disconnected")
 }

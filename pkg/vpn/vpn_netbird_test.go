@@ -31,7 +31,7 @@ func TestConnectNetBird_Success(t *testing.T) {
 		commands: map[string]string{
 			"ip route show default": "default via 192.168.1.1 dev eth0",
 			"netbird up --setup-key XXXXXXXX --management-url https://api.netbird.io --disable-dns": "",
-			"netbird status": "Connected",
+			"netbird status --json": `{"daemonStatus":"Connected"}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -56,7 +56,7 @@ func TestConnectNetBird_NoSetupKey(t *testing.T) {
 		commands: map[string]string{
 			"ip route show default":    "default via 192.168.1.1 dev eth0",
 			"netbird up --disable-dns": "",
-			"netbird status":           "Connected",
+			"netbird status --json":    `{"daemonStatus":"Connected"}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -78,7 +78,7 @@ func TestConnectNetBird_WithProfile(t *testing.T) {
 			"ip route show default":       "default via 192.168.1.1 dev eth0",
 			"netbird profile select work": "Profile switched successfully to: work",
 			"netbird up --disable-dns":    "",
-			"netbird status":              "Connected",
+			"netbird status --json":       `{"daemonStatus":"Connected"}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -104,7 +104,7 @@ func TestConnectNetBird_ProfileSelectFailureIsFatal(t *testing.T) {
 		commands: map[string]string{
 			"ip route show default":    "default via 192.168.1.1 dev eth0",
 			"netbird up --disable-dns": "",
-			"netbird status":           "Connected",
+			"netbird status --json":    `{"daemonStatus":"Connected"}`,
 		},
 		errors: map[string]error{
 			"netbird profile select missing": fmt.Errorf("command failed: exit status 1 (stderr: profile not found)"),
@@ -136,7 +136,7 @@ func TestConnectNetBird_FailsWhenTunnelNeverConnects(t *testing.T) {
 		commands: map[string]string{
 			"ip route show default":    "default via 192.168.1.1 dev eth0",
 			"netbird up --disable-dns": "",
-			"netbird status":           "Connecting",
+			"netbird status --json":    `{"daemonStatus":"Connecting"}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -161,7 +161,7 @@ func TestListVPNs_NetBirdRunning(t *testing.T) {
 			"pgrep -f openvpn":            "",
 			"ip link show type wireguard": "",
 			"tailscale status --json":     "",
-			"netbird status --json":       `{"status":"Connected"}`,
+			"netbird status --json":       `{"daemonStatus":"Connected"}`,
 		},
 		errors: map[string]error{
 			"pgrep -f openvpn":        fmt.Errorf("no match"),
@@ -191,7 +191,7 @@ func TestNetBird_ConnectDisconnectCycle(t *testing.T) {
 		commands: map[string]string{
 			"ip route show default":    "default via 192.168.1.1 dev eth0",
 			"netbird up --disable-dns": "",
-			"netbird status":           "Connected",
+			"netbird status --json":    `{"daemonStatus":"Connected"}`,
 			"netbird down":             "",
 			"ip route show":            "default via 192.168.1.1 dev eth0",
 		},
