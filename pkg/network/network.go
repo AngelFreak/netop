@@ -777,10 +777,12 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				m.logger.Info("Obtaining DHCP lease on wired interface", "interface", config.Interface)
 				err := m.StartDHCP(config.Interface, config.Hostname)
 				if err != nil {
-					m.logger.Warn("Failed to obtain DHCP on wired interface", "interface", config.Interface, "error", err)
-				} else {
-					m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
+					// Surface the failure instead of reporting a successful
+					// connection with no lease. The WiFi path already errors
+					// out on DHCP failure; wired should be consistent.
+					return fmt.Errorf("failed to obtain DHCP lease on %s: %w", config.Interface, err)
 				}
+				m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 			}
 		}
 	}

@@ -1283,6 +1283,28 @@ func TestStartDHCP_ErrorPath(t *testing.T) {
 	})
 }
 
+// A wired network whose DHCP lease fails must return an error, not report a
+// successful connection with no IP.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureReturnsError(t *testing.T) {
+	executor := newMockExecutor()
+	executor.commands["ip addr flush dev eth0"] = ""
+	executor.commands["ip route flush dev eth0"] = ""
+	executor.commands["ip link set eth0 up"] = ""
+	executor.commands["cat /sys/class/net/eth0/carrier"] = "1"
+	logger := &mockLogger{}
+	manager := &Manager{
+		executor:   executor,
+		logger:     logger,
+		dhcpClient: &mockDHCPClient{acquireErr: fmt.Errorf("no lease obtained")},
+	}
+
+	config := &types.NetworkConfig{Interface: "eth0"} // wired: no SSID, no static Addr
+
+	err := manager.ConnectToConfiguredNetwork(config, "", nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
+}
+
 func TestSetMAC_ErrorPaths(t *testing.T) {
 	t.Run("interface down fails", func(t *testing.T) {
 		executor := &mockSystemExecutor{
