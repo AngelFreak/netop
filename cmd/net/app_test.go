@@ -449,6 +449,64 @@ func TestApp_RunConnect_DirectSSID(t *testing.T) {
 	assert.Contains(t, stdout.String(), "Connected!")
 }
 
+func TestApp_RunConnect_SSIDMatchesConfiguredNetwork(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	// GetNetworkConfig fails for the given name, but its SSID uniquely matches
+	// a configured network, so that network's config (and VPN) should apply.
+	cfgMgr := &testConfigManager{
+		networkErr: errors.New("not found"),
+		config: &types.Config{
+			Networks: map[string]types.NetworkConfig{
+				"home": {SSID: "MyWifi", VPN: "work"},
+			},
+		},
+	}
+	app.ConfigMgr = cfgMgr
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{
+			{Interface: "wlan0", SSID: "MyWifi", State: "connected", IP: net.ParseIP("192.168.1.100")},
+		},
+	}
+
+	err := app.RunConnect("MyWifi", "pw")
+	assert.NoError(t, err)
+	// Configured path used the network NAME, not the SSID.
+	assert.True(t, cfgMgr.mergeWithCommonCalled, "should use configured-network path")
+	assert.Equal(t, "home", cfgMgr.lastMergedNetwork)
+	// connectVPN received "home" and resolved its vpn: work.
+	assert.Contains(t, stdout.String(), "Connecting to VPN 'work'")
+	assert.Contains(t, stdout.String(), "VPN connected!")
+}
+
+func TestApp_RunConnect_AmbiguousSSIDFallsBackToDirect(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	// Two configured networks share the same SSID — ambiguous, so connect as a
+	// plain SSID rather than guessing which config applies.
+	cfgMgr := &testConfigManager{
+		networkErr: errors.New("not found"),
+		config: &types.Config{
+			Networks: map[string]types.NetworkConfig{
+				"home":  {SSID: "MyWifi"},
+				"guest": {SSID: "MyWifi", VPN: "work"},
+			},
+		},
+	}
+	app.ConfigMgr = cfgMgr
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{
+			{Interface: "wlan0", SSID: "MyWifi", State: "connected", IP: net.ParseIP("192.168.1.100")},
+		},
+	}
+
+	err := app.RunConnect("MyWifi", "pw")
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Connecting to WiFi...")
+	// Direct-SSID path: connectVPN("MyWifi") finds no Networks entry and
+	// Common.VPN is empty, so no VPN is attempted.
+	assert.NotContains(t, stdout.String(), "Connecting to VPN")
+	assert.False(t, cfgMgr.mergeWithCommonCalled, "ambiguous SSID must not use configured path")
+}
+
 func TestApp_RunConnect_FailsWhenConfigNotLoaded(t *testing.T) {
 	app, _, stderr := newTestApp()
 	// GetConfig() returns nil — the config file failed to load. Connect must

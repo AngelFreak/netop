@@ -193,6 +193,7 @@ func (a *App) RunConnect(name, password string) error {
 	// Check if it's a configured network
 	a.Logger.Debug("Looking up network config", "name", name)
 	networkConfig, err := a.ConfigMgr.GetNetworkConfig(name)
+	configName := name
 	var connectedIface string
 	if err != nil {
 		// A config that failed to load (parse/validation error) is different
@@ -203,6 +204,27 @@ func (a *App) RunConnect(name, password string) error {
 			a.errorf("Error: configuration failed to load, refusing to treat '%s' as a plain SSID. Fix the config file and retry.\n", name)
 			return fmt.Errorf("configuration not loaded: %w", err)
 		}
+		// The name wasn't a configured network key, but it may be the SSID of
+		// one. A unique SSID match lets us apply that network's config (MAC,
+		// DNS, VPN) instead of degrading to a plain SSID connection.
+		cfg := a.ConfigMgr.GetConfig()
+		var matches []string
+		for netName, nc := range cfg.Networks {
+			if nc.SSID == name {
+				matches = append(matches, netName)
+			}
+		}
+		if len(matches) == 1 {
+			configName = matches[0]
+			nc := cfg.Networks[configName] // copy: map values are not addressable
+			networkConfig = &nc
+			err = nil
+			a.Logger.Info("SSID matches configured network, using its configuration", "ssid", name, "network", configName)
+		} else if len(matches) > 1 {
+			a.Logger.Warn("Multiple configured networks share this SSID, connecting as plain SSID", "ssid", name, "networks", strings.Join(matches, ", "))
+		}
+	}
+	if err != nil {
 		// Not configured, treat as SSID
 		a.Logger.Debug("Network config not found, treating as direct SSID", "name", name, "error", err)
 		a.Logger.Info("Connecting to SSID", "ssid", name)
@@ -224,9 +246,9 @@ func (a *App) RunConnect(name, password string) error {
 		a.NetworkMgr.LockDNS()
 	} else {
 		// Use configured network - merge with common settings first
-		networkConfig = a.ConfigMgr.MergeWithCommon(name, networkConfig)
-		a.Logger.Debug("Found network config", "name", name, "ssid", networkConfig.SSID, "mac", networkConfig.MAC)
-		a.Logger.Info("Connecting to configured network", "name", name)
+		networkConfig = a.ConfigMgr.MergeWithCommon(configName, networkConfig)
+		a.Logger.Debug("Found network config", "name", configName, "ssid", networkConfig.SSID, "mac", networkConfig.MAC)
+		a.Logger.Info("Connecting to configured network", "name", configName)
 		if password == "" {
 			password = networkConfig.PSK
 		}
@@ -257,7 +279,7 @@ func (a *App) RunConnect(name, password string) error {
 
 	// Connect VPN if configured and not disabled
 	if !a.NoVPN {
-		a.connectVPN(name)
+		a.connectVPN(configName)
 	}
 	return nil
 }

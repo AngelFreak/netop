@@ -233,21 +233,21 @@ func TestConnect(t *testing.T) {
 				"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
 SSID: OtherSSID`,
 				// Disconnect commands (interface-specific termination)
-				"wpa_cli -i wlan0 terminate":                        "",
-				"pkill -9 -f dhclient.*wlan0":                       "",
-				"ip addr flush dev wlan0":                           "",
-				"ip route flush dev wlan0":                          "",
-				"ip link set wlan0 down":                            "",
+				"wpa_cli -i wlan0 terminate":  "",
+				"pkill -9 -f dhclient.*wlan0": "",
+				"ip addr flush dev wlan0":     "",
+				"ip route flush dev wlan0":    "",
+				"ip link set wlan0 down":      "",
 				// Reconnect commands
-				"ip link set wlan0 up":                              "",
-				"mkdir -p /run/wpa_supplicant":                      "",
+				"ip link set wlan0 up":                                       "",
+				"mkdir -p /run/wpa_supplicant":                               "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status":                           "wpa_state=COMPLETED\nssid=TestSSID",
+				"wpa_cli -i wlan0 status":                                    "wpa_state=COMPLETED\nssid=TestSSID",
 				// DHCP flow
-				"pkill -9 -f udhcpc.*wlan0":                         "",
+				"pkill -9 -f udhcpc.*wlan0": "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
-				"timeout 15 dhclient -v wlan0":                      "",
-				"ip addr show wlan0":                                "inet 192.168.1.100/24",
+				"timeout 15 dhclient -v wlan0":                                             "",
+				"ip addr show wlan0":                                                       "inet 192.168.1.100/24",
 			},
 		}
 		logger := &mockLogger{}
@@ -260,18 +260,18 @@ SSID: OtherSSID`,
 	t.Run("needs connection", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":           "Not connected",
-				"ip link set wlan0 up":    "",
+				"iw wlan0 link":        "Not connected",
+				"ip link set wlan0 up": "",
 				// Interface-specific wpa_supplicant termination
-				"wpa_cli -i wlan0 terminate": "",
-				"mkdir -p /run/wpa_supplicant": "",
+				"wpa_cli -i wlan0 terminate":                                 "",
+				"mkdir -p /run/wpa_supplicant":                               "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0":   "",
-				"pkill -9 -f dhclient.*wlan0":   "",
+				"pkill -9 -f dhclient.*wlan0": "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
-				"timeout 15 dhclient -v wlan0": "",
-				"ip addr show wlan0":         "inet 192.168.1.100/24",
+				"timeout 15 dhclient -v wlan0":                                             "",
+				"ip addr show wlan0":                                                       "inet 192.168.1.100/24",
 			},
 			callCount: make(map[string]int),
 		}
@@ -286,13 +286,13 @@ SSID: OtherSSID`,
 		// Test that timeout is properly handled when network is unavailable
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":           "Not connected",
-				"ip link set wlan0 up":    "",
+				"iw wlan0 link":        "Not connected",
+				"ip link set wlan0 up": "",
 				// Interface-specific wpa_supplicant termination
-				"wpa_cli -i wlan0 terminate": "",
-				"mkdir -p /run/wpa_supplicant": "",
+				"wpa_cli -i wlan0 terminate":                                 "",
+				"mkdir -p /run/wpa_supplicant":                               "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status": "wpa_state=SCANNING", // Never completes
+				"wpa_cli -i wlan0 status":                                    "wpa_state=SCANNING", // Never completes
 			},
 		}
 		logger := &mockLogger{}
@@ -332,14 +332,14 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	executor := &recordingExecutor{
 		mockSystemExecutor: mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":           "Not connected", // post-hibernation: no current SSID
-				"ip link set wlan0 up":    "",
-				"wpa_cli -i wlan0 terminate": "",
-				"ip addr flush dev wlan0": "",
-				"ip route flush dev wlan0": "",
+				"iw wlan0 link":                "Not connected", // post-hibernation: no current SSID
+				"ip link set wlan0 up":         "",
+				"wpa_cli -i wlan0 terminate":   "",
+				"ip addr flush dev wlan0":      "",
+				"ip route flush dev wlan0":     "",
 				"mkdir -p /run/wpa_supplicant": "",
 				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status": "wpa_state=COMPLETED\nssid=TestSSID",
+				"wpa_cli -i wlan0 status":                                    "wpa_state=COMPLETED\nssid=TestSSID",
 			},
 		},
 	}
@@ -619,7 +619,7 @@ freq: 2412
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"iw wlan0 scan dump": scanData,
-				"iw wlan0 scan":     scanData,
+				"iw wlan0 scan":      scanData,
 			},
 		}
 		manager := &Manager{
@@ -636,7 +636,7 @@ freq: 2412
 			commands: map[string]string{},
 			errors: map[string]error{
 				"iw wlan0 scan dump": fmt.Errorf("scan failed"),
-				"iw wlan0 scan":     fmt.Errorf("scan failed"),
+				"iw wlan0 scan":      fmt.Errorf("scan failed"),
 			},
 		}
 		manager := &Manager{
@@ -800,15 +800,15 @@ func TestGenerateWPAConfig(t *testing.T) {
 
 	t.Run("rejects various invalid BSSID formats", func(t *testing.T) {
 		invalidBSSIDs := []string{
-			"",                               // empty
-			"aa:bb:cc:dd:ee",                 // too short
-			"aa:bb:cc:dd:ee:ff:00",           // too long
-			"aabbccddeeff",                   // no colons
-			"aa-bb-cc-dd-ee-ff",              // wrong separator
-			"gg:hh:ii:jj:kk:ll",              // invalid hex
-			"00:11:22:33:44:5",               // missing digit
-			"00:11:22:33:44:55 extra",        // extra content
-			"00:11:22:33:44:55\nbssid=evil",  // newline injection
+			"",                              // empty
+			"aa:bb:cc:dd:ee",                // too short
+			"aa:bb:cc:dd:ee:ff:00",          // too long
+			"aabbccddeeff",                  // no colons
+			"aa-bb-cc-dd-ee-ff",             // wrong separator
+			"gg:hh:ii:jj:kk:ll",             // invalid hex
+			"00:11:22:33:44:5",              // missing digit
+			"00:11:22:33:44:55 extra",       // extra content
+			"00:11:22:33:44:55\nbssid=evil", // newline injection
 		}
 
 		for _, invalidBSSID := range invalidBSSIDs {
@@ -1065,10 +1065,10 @@ func TestListConnections_AdditionalCases(t *testing.T) {
 	t.Run("connection without DNS", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":          "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
-				"ip addr show wlan0":     "inet 192.168.1.100/24",
+				"iw wlan0 link":           "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
+				"ip addr show wlan0":      "inet 192.168.1.100/24",
 				"ip route show dev wlan0": "default via 192.168.1.1",
-				"cat /etc/resolv.conf":   "", // No DNS
+				"cat /etc/resolv.conf":    "", // No DNS
 			},
 		}
 		logger := &mockLogger{}
@@ -1084,10 +1084,10 @@ func TestListConnections_AdditionalCases(t *testing.T) {
 	t.Run("connection without gateway", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":          "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
-				"ip addr show wlan0":     "inet 192.168.1.100/24",
+				"iw wlan0 link":           "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
+				"ip addr show wlan0":      "inet 192.168.1.100/24",
 				"ip route show dev wlan0": "", // No gateway
-				"cat /etc/resolv.conf":   "nameserver 8.8.8.8",
+				"cat /etc/resolv.conf":    "nameserver 8.8.8.8",
 			},
 		}
 		logger := &mockLogger{}
@@ -1106,7 +1106,7 @@ func TestScan_AlwaysTriggersFreshScan(t *testing.T) {
 		mockSystemExecutor: mockSystemExecutor{
 			commands: map[string]string{
 				"ip link set wlan0 up": "",
-				"iw wlan0 scan":       "",
+				"iw wlan0 scan":        "",
 				"iw wlan0 scan dump": `BSS aa:bb:cc:dd:ee:ff(on wlan0)
 SSID: FreshNetwork
 signal: -50.00
@@ -1160,8 +1160,8 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("graceful termination via wpa_cli succeeds", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"wpa_cli -i wlan0 terminate":           "OK",
-				"rm -f /run/wpa_supplicant/wlan0":      "",
+				"wpa_cli -i wlan0 terminate":      "OK",
+				"rm -f /run/wpa_supplicant/wlan0": "",
 			},
 		}
 		logger := &mockLogger{}
@@ -1174,7 +1174,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("fallback to pkill when wpa_cli fails", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pkill -9 wpa_supplicant":      "",
+				"pkill -9 wpa_supplicant":         "",
 				"rm -f /run/wpa_supplicant/wlan0": "",
 			},
 			errors: map[string]error{
@@ -1191,8 +1191,8 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("uses correct interface in wpa_cli", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"wpa_cli -i eth0 terminate":       "OK",
-				"rm -f /run/wpa_supplicant/eth0":  "",
+				"wpa_cli -i eth0 terminate":      "OK",
+				"rm -f /run/wpa_supplicant/eth0": "",
 			},
 		}
 		logger := &mockLogger{}
@@ -1204,7 +1204,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("kills all wpa_supplicant in pkill fallback", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pkill -9 wpa_supplicant":       "",
+				"pkill -9 wpa_supplicant":          "",
 				"rm -f /run/wpa_supplicant/wlp2s0": "",
 			},
 			errors: map[string]error{
@@ -1246,10 +1246,10 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 			commands: map[string]string{
 				// Interface-specific commands for wlan0 only
 				"wpa_cli -i wlan0 terminate":      "OK",
-				"rm -f /run/wpa_supplicant/wlan0":  "",
-				"ip addr flush dev wlan0":          "",
-				"ip route flush dev wlan0":         "",
-				"ip link set wlan0 down":           "",
+				"rm -f /run/wpa_supplicant/wlan0": "",
+				"ip addr flush dev wlan0":         "",
+				"ip route flush dev wlan0":        "",
+				"ip link set wlan0 down":          "",
 			},
 		}
 		logger := &mockLogger{}
@@ -1269,7 +1269,7 @@ func TestWaitForAssociationPollingDetectsCrash(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{},
 			errors: map[string]error{
-				"wpa_cli -i wlan0 status":                                                                                              fmt.Errorf("Failed to connect to non-global ctrl_ifname: wlan0"),
+				"wpa_cli -i wlan0 status": fmt.Errorf("Failed to connect to non-global ctrl_ifname: wlan0"),
 				"wpa_cli -i wlan0 wait_event CTRL-EVENT-CONNECTED CTRL-EVENT-ASSOC-REJECT CTRL-EVENT-DISCONNECTED CTRL-EVENT-TEMP-DISABLED CTRL-EVENT-AUTH-REJECT": fmt.Errorf("Failed to connect to non-global ctrl_ifname: wlan0"),
 			},
 		}
@@ -1314,7 +1314,7 @@ func TestWaitForAssociationPollingDetectsCrash(t *testing.T) {
 // countingExecutor tracks call counts per command for fine-grained control
 type countingExecutor struct {
 	mockSystemExecutor
-	statusFunc func(callNum int) (string, error)
+	statusFunc  func(callNum int) (string, error)
 	statusCalls int
 }
 
