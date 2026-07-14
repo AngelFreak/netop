@@ -16,17 +16,40 @@ import (
 
 // Timeout constants for DHCP operations
 const (
-	// UdhcpcTimeout is the timeout for udhcpc (faster client, typically 1-2s)
-	UdhcpcTimeout = 10 * time.Second
+	// UdhcpcDiscoverRetries is the number of DHCP DISCOVER packets udhcpc sends
+	// before giving up. Default in BusyBox is 3; we raise to 6 so the total
+	// discovery window matches NetworkManager's behavior more closely. This is
+	// critical for USB ethernet adapters that take 1-3s to start passing frames
+	// after `ip link up`, even though /sys/class/net/X/carrier already reads 1.
+	UdhcpcDiscoverRetries = 6
 
-	// DhclientTimeout is the timeout for dhclient (slower, typically 3-5s)
-	DhclientTimeout = 15 * time.Second
+	// UdhcpcDiscoverTimeout is the seconds between each DISCOVER retry.
+	// 3s is BusyBox's default; total discover window = retries * timeout = 18s.
+	UdhcpcDiscoverTimeout = 3
+
+	// UdhcpcTryAgain is the seconds to wait before re-trying after a full
+	// discover cycle. Only relevant when not using -n; included for documentation.
+	UdhcpcTryAgain = 10
+
+	// UdhcpcTimeout is the wall-clock timeout for the udhcpc process.
+	// Must exceed UdhcpcDiscoverRetries * UdhcpcDiscoverTimeout (= 18s) plus
+	// time for ARP probing, route setup, and script hooks.
+	UdhcpcTimeout = 30 * time.Second
+
+	// DhclientTimeout is the timeout for dhclient. Increased from 15s to 60s
+	// to match dhclient's RFC-2131-compliant default timeout, which gives
+	// flaky links (USB ethernet, slow switches) time to negotiate.
+	DhclientTimeout = 60 * time.Second
 
 	// CleanupTimeout is the timeout for cleanup operations (pkill, rm)
 	CleanupTimeout = 500 * time.Millisecond
 
 	// IPCheckTimeout is the timeout for checking acquired IP address
 	IPCheckTimeout = 2 * time.Second
+
+	// RetryDelay is how long to wait between DHCP attempts. Mirrors
+	// NetworkManager's autoconnect-retry behavior.
+	RetryDelay = 2 * time.Second
 )
 
 // Manager implements the DHCPClientManager interface
@@ -70,6 +93,15 @@ func (m *Manager) getDhclientTimeout() time.Duration {
 
 // Acquire obtains a DHCP lease for the interface.
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname.
+//
+// Client selection: wired interfaces prefer dhclient (RFC-2131 backoff, longer
+// default timeout) because USB ethernet adapters often need a longer discovery
+// window than udhcpc's default. WiFi interfaces prefer udhcpc (faster on the
+// already-associated link). If the preferred client isn't installed, falls
+// back to whichever is available.
+//
+// Each attempt is retried once on failure with a short delay, mirroring
+// NetworkManager's autoconnect-retries default.
 func (m *Manager) Acquire(iface string, hostname string) error {
 	// Validate interface name to prevent command injection
 	if err := types.ValidateInterfaceName(iface); err != nil {
@@ -85,18 +117,51 @@ func (m *Manager) Acquire(iface string, hostname string) error {
 
 	m.logger.Info("Acquiring DHCP lease", "interface", iface)
 
-	// Try udhcpc first (faster, ~1s vs 3-5s for dhclient)
-	if m.executor.HasCommand("udhcpc") {
-		m.logger.Debug("Using udhcpc for DHCP (faster)")
-		return m.acquireUdhcpc(iface, hostname)
-	}
+	hasUdhcpc := m.executor.HasCommand("udhcpc")
+	hasDhclient := m.executor.HasCommand("dhclient")
 
-	// Fall back to dhclient
-	if !m.executor.HasCommand("dhclient") {
+	// Wired interfaces prefer dhclient — its default 60s timeout and RFC-2131
+	// exponential backoff handle slow USB ethernet adapters and flaky switches
+	// far better than udhcpc's 3-retry default. WiFi interfaces prefer udhcpc
+	// (faster on already-associated links). dhclient remains the historical
+	// fallback when udhcpc is unavailable.
+	var attempt func() error
+	switch {
+	case isWiredInterface(iface) && hasDhclient:
+		m.logger.Debug("Using dhclient for DHCP on wired interface", "interface", iface)
+		attempt = func() error { return m.acquireDhclient(iface, hostname) }
+	case hasUdhcpc:
+		m.logger.Debug("Using udhcpc for DHCP", "interface", iface)
+		attempt = func() error { return m.acquireUdhcpc(iface, hostname) }
+	case hasDhclient:
+		m.logger.Debug("Using dhclient for DHCP", "interface", iface)
+		attempt = func() error { return m.acquireDhclient(iface, hostname) }
+	default:
 		return fmt.Errorf("no DHCP client found: install udhcpc (recommended) or dhclient")
 	}
-	m.logger.Debug("Using dhclient for DHCP")
-	return m.acquireDhclient(iface, hostname)
+
+	if err := attempt(); err == nil {
+		return nil
+	} else {
+		m.logger.Warn("DHCP attempt failed, retrying once", "interface", iface, "error", err)
+		time.Sleep(RetryDelay)
+		if retryErr := attempt(); retryErr != nil {
+			return retryErr
+		}
+		return nil
+	}
+}
+
+// isWiredInterface returns true if the interface name matches a wired prefix.
+// Mirrors the detection logic in pkg/network/network.go: eth, enp, enx (USB
+// MAC-based), eno (onboard), ens (slot-based), em (Dell/BSD-style), usb.
+func isWiredInterface(iface string) bool {
+	for _, prefix := range []string{"eth", "enp", "enx", "eno", "ens", "em", "usb"} {
+		if strings.HasPrefix(iface, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Release stops any running DHCP client for the interface and cleans up lease files.
@@ -175,10 +240,13 @@ func udhcpcPidFile(iface string) string {
 	return types.RuntimeDir + "/udhcpc." + iface + ".pid"
 }
 
-// acquireUdhcpc uses udhcpc (BusyBox) for faster DHCP acquisition.
+// acquireUdhcpc uses udhcpc (BusyBox) for DHCP acquisition.
 // udhcpc daemonizes after obtaining the lease and stays alive to handle
 // renewals. The PID is written to /run/net/udhcpc.<iface>.pid so Release
 // can terminate it cleanly (which sends a DHCPRELEASE via -R).
+// The default BusyBox build sends only 3 DISCOVERs at 3s intervals (~9s
+// window), which is too short for many USB ethernet adapters, so -t/-T
+// widen the discovery window to ~18s, closer to dhclient's default.
 func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 	// Release any existing clients first
 	m.Release(iface)
@@ -190,8 +258,16 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 	// -B: set the broadcast flag in DISCOVER. Some embedded DHCP servers
 	//     (e.g. IP radios, WISP gear) only reply via broadcast and silently
 	//     drop clients that ask for unicast.
+	// -t: number of DISCOVER retries (BusyBox default 3; we use 6)
+	// -T: seconds between retries (BusyBox default 3)
+	// -A: seconds to wait before re-trying after a full discover cycle
 	// NOTE: no -q — udhcpc must stay running to renew the lease.
-	args := []string{"-i", iface, "-n", "-p", udhcpcPidFile(iface), "-R", "-B"}
+	args := []string{
+		"-i", iface, "-n", "-p", udhcpcPidFile(iface), "-R", "-B",
+		"-t", fmt.Sprintf("%d", UdhcpcDiscoverRetries),
+		"-T", fmt.Sprintf("%d", UdhcpcDiscoverTimeout),
+		"-A", fmt.Sprintf("%d", UdhcpcTryAgain),
+	}
 	if hostname != "" {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)
 		args = append(args, "-x", "hostname:"+hostname)

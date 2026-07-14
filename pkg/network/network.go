@@ -13,6 +13,13 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 )
 
+// wiredSettleDelay is how long we wait after `ip link set up` before starting
+// DHCP on a wired interface. USB ethernet adapters (ASIX, RTL8153, etc.)
+// often report carrier=1 before they can reliably forward L2 frames; the
+// first 1-2s of TX after link-up gets dropped. Exposed as a var so tests
+// can shrink it without affecting production behavior.
+var wiredSettleDelay = 1500 * time.Millisecond
+
 // Manager implements the NetworkManager interface
 type Manager struct {
 	executor         types.SystemExecutor
@@ -740,6 +747,11 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			if !m.waitForCarrier(config.Interface, 5*time.Second) {
 				m.logger.Warn("No carrier detected on interface, proceeding anyway", "interface", config.Interface)
 			}
+
+			// USB ethernet adapters frequently report carrier=1 before they
+			// can reliably forward L2 frames; sleeping briefly avoids losing
+			// the first DHCP DISCOVER. See wiredSettleDelay docs.
+			time.Sleep(wiredSettleDelay)
 
 			if config.Addr == "" {
 				m.logger.Info("Obtaining DHCP lease on wired interface", "interface", config.Interface)

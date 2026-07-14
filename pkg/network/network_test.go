@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,14 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestMain(m *testing.M) {
+	// Disable the wired-settle delay during tests — it's a real-world
+	// hardware workaround that adds 1.5s per wired connect path and would
+	// inflate test runtime.
+	wiredSettleDelay = 0
+	os.Exit(m.Run())
+}
 
 // Mock implementations with strict mode - fails on unexpected commands
 type mockSystemExecutor struct {
