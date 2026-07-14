@@ -330,6 +330,65 @@ func TestSetDNS(t *testing.T) {
 	})
 }
 
+// After DHCP DNS is written, LockDNS must record ownership so that a later
+// ClearDNS/`net stop` can unlock resolv.conf again — a raw `chattr +i` here
+// (the old bug) left the file immutable forever.
+func TestLockDNS_RecordsOwnership(t *testing.T) {
+	tmp := t.TempDir()
+	executor := newMockExecutor()
+	executor.commands["chattr +i /etc/resolv.conf"] = ""
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+
+	assert.False(t, manager.isDNSOwned())
+	manager.LockDNS()
+	assert.True(t, manager.isDNSOwned(), "LockDNS must mark ownership so ClearDNS can later unlock")
+
+	// A subsequent clear must actually unlock and drop ownership.
+	executor.commands["chattr -i /etc/resolv.conf"] = ""
+	executor.commands["tee /etc/resolv.conf"] = ""
+	cleared, err := manager.ClearDNSIfOwned()
+	assert.NoError(t, err)
+	assert.True(t, cleared)
+	executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+	assert.False(t, manager.isDNSOwned())
+}
+
+// resolvConfHasNameserver gates whether we lock after DHCP: a static-addr
+// network with dns: dhcp never runs a DHCP client, so resolv.conf holds only
+// the placeholder and must not be locked (which would strand the system).
+func TestResolvConfHasNameserver(t *testing.T) {
+	t.Run("placeholder only - false", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["cat /etc/resolv.conf"] = "# Waiting for DHCP\n"
+		manager := &Manager{executor: executor, logger: &mockLogger{}}
+		assert.False(t, manager.resolvConfHasNameserver())
+	})
+	t.Run("has nameserver - true", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["cat /etc/resolv.conf"] = "# comment\nnameserver 192.168.1.1\n"
+		manager := &Manager{executor: executor, logger: &mockLogger{}}
+		assert.True(t, manager.resolvConfHasNameserver())
+	})
+}
+
+// RunDNS "dhcp" restore path: DHCPRenew must unlock resolv.conf and release
+// ownership first, or the renewed lease's DNS can't be written to an immutable
+// file.
+func TestDHCPRenew_UnlocksResolvConf(t *testing.T) {
+	tmp := t.TempDir()
+	executor := newMockExecutor()
+	executor.commands["chattr -i /etc/resolv.conf"] = ""
+	logger := &mockLogger{}
+	manager := &Manager{executor: executor, logger: logger, dhcpClient: &mockDHCPClient{}, dnsOwnershipPath: tmp + "/dns-owned"}
+	manager.markDNSOwned()
+
+	err := manager.DHCPRenew("eth0", "")
+	assert.NoError(t, err)
+	executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+	assert.False(t, manager.isDNSOwned(), "ownership must be released so DHCP DNS takes effect")
+}
+
 func TestSetMAC(t *testing.T) {
 	t.Run("specific mac - full sequence", func(t *testing.T) {
 		executor := newStrictMockExecutor()
@@ -560,16 +619,20 @@ func TestStartDHCP(t *testing.T) {
 
 func TestDHCPRenew(t *testing.T) {
 	t.Run("success - delegates to DHCPClientManager", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{dhcpClient: dhcpClient}
+		manager := &Manager{executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("wlan0", "test-hostname")
 		assert.NoError(t, err)
 	})
 
 	t.Run("failure - propagates error from DHCPClientManager", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{renewErr: fmt.Errorf("renew failed")}
-		manager := &Manager{dhcpClient: dhcpClient}
+		manager := &Manager{executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("wlan0", "")
 		assert.Error(t, err)
@@ -987,7 +1050,12 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("with DHCP DNS - clears resolv.conf and unlocks for DHCP", func(t *testing.T) {
+	t.Run("static addr with dns dhcp - does NOT lock the placeholder resolv.conf", func(t *testing.T) {
+		// A static-addr network skips the DHCP client (Addr != ""), so with
+		// dns: dhcp resolv.conf keeps only the "# Waiting for DHCP" placeholder.
+		// Locking that would strand the system with no nameservers and an
+		// immutable file, so the post-DHCP lock must be skipped here.
+		tmp := t.TempDir()
 		executor := newMockExecutor()
 		executor.commands["ip link set eth0 up"] = ""
 		executor.commands["ip addr flush dev eth0"] = ""
@@ -996,8 +1064,10 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
+		// resolv.conf still holds only the placeholder (no DHCP client ran).
+		executor.commands["cat /etc/resolv.conf"] = "# Waiting for DHCP\n"
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := &Manager{executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1008,7 +1078,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 
 		err := manager.ConnectToConfiguredNetwork(config, "", nil)
 		assert.NoError(t, err)
-		// resolv.conf should be unlocked and cleared so DHCP client can write fresh DNS
+
 		unlockCalled := false
 		clearCalled := false
 		lockCalled := false
@@ -1025,8 +1095,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		}
 		assert.True(t, unlockCalled, "should unlock resolv.conf for DHCP DNS")
 		assert.True(t, clearCalled, "should clear resolv.conf before DHCP runs")
-		assert.True(t, lockCalled, "should lock resolv.conf after DHCP to prevent external tools from overwriting")
-		// Verify the placeholder content was written
+		assert.False(t, lockCalled, "must NOT lock the placeholder-only resolv.conf")
+		assert.False(t, manager.isDNSOwned(), "must not claim DNS ownership when nothing was written")
 		assert.Contains(t, executor.inputsReceived["tee /etc/resolv.conf"], "Waiting for DHCP")
 	})
 
@@ -1034,14 +1104,17 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// When using DHCP for DNS and netbird is still connected, netbird
 		// will overwrite resolv.conf with its own DNS after DHCP writes it.
 		// The fix: lock resolv.conf with chattr +i AFTER DHCP completes.
+		tmp := t.TempDir()
 		executor := newMockExecutor()
 		executor.commands["ip link set wlan0 down"] = ""
 		executor.commands["ip link set wlan0 up"] = ""
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
+		// DHCP wrote a real nameserver, so the post-DHCP lock must fire.
+		executor.commands["cat /etc/resolv.conf"] = "nameserver 192.168.1.1\n"
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger}
+		manager := &Manager{executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
 
 		// No DNS configured = DHCP handles DNS
 		config := &types.NetworkConfig{
@@ -1083,6 +1156,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		assert.True(t, lockIdx >= 0, "should lock resolv.conf after DHCP to prevent netbird overwrite")
 		assert.True(t, unlockIdx < clearIdx, "unlock should come before clear")
 		assert.True(t, clearIdx < lockIdx, "lock should come after clear (i.e., after DHCP)")
+		// The post-DHCP lock must record ownership so `net stop` can unlock it.
+		assert.True(t, manager.isDNSOwned(), "DHCP-DNS lock must mark ownership")
 	})
 
 	t.Run("auto-detect interface falls back when detection finds nothing", func(t *testing.T) {
@@ -1390,8 +1465,10 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 
 func TestDHCPRenew_ErrorPaths(t *testing.T) {
 	t.Run("dhcp renew fails", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{renewErr: assert.AnError}
-		manager := &Manager{dhcpClient: dhcpClient}
+		manager := &Manager{executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("eth0", "")
 		assert.Error(t, err)

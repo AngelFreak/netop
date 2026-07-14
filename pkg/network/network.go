@@ -179,6 +179,21 @@ func (m *Manager) unlockResolvConf() error {
 	return err
 }
 
+// resolvConfHasNameserver reports whether /etc/resolv.conf currently contains
+// at least one active "nameserver" line (ignoring comments/blank lines).
+func (m *Manager) resolvConfHasNameserver() bool {
+	output, err := m.executor.Execute("cat", "/etc/resolv.conf")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
+			return true
+		}
+	}
+	return false
+}
+
 // SetMAC sets the MAC address for an interface
 func (m *Manager) SetMAC(iface, mac string) error {
 	m.logger.Debug("SetMAC using interface", "interface", iface, "mac", mac)
@@ -420,6 +435,13 @@ func (m *Manager) StartDHCP(iface string, hostname string) error {
 // DHCPRenew performs DHCP renewal
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname
 func (m *Manager) DHCPRenew(iface string, hostname string) error {
+	// The DHCP client can't write DNS to an immutable resolv.conf. If netop
+	// (or a VPN client) locked it, unlock and release ownership first so the
+	// renewed lease's nameservers actually take effect.
+	if err := m.unlockResolvConf(); err != nil {
+		m.logger.Debug("Failed to unlock resolv.conf before DHCP renew (may not be locked)", "error", err)
+	}
+	m.clearDNSOwnership()
 	return m.dhcpClient.Renew(iface, hostname)
 }
 
@@ -814,11 +836,19 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 	// DNS servers. If netbird is still connected when switching WiFi, it will
 	// overwrite the DHCP-provided DNS, breaking internet connectivity.
 	// Custom DNS is already locked by SetDNS(), so only lock here for DHCP DNS.
+	//
+	// Only lock if DHCP actually wrote nameservers — a static-addr network with
+	// dns: dhcp never runs a DHCP client, so resolv.conf still holds only the
+	// "# Waiting for DHCP" placeholder; locking that would strand the system
+	// with zero nameservers and an immutable file.
 	if useDHCPForDNS {
-		if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
-			m.logger.Warn("Failed to lock resolv.conf after DHCP DNS", "error", err)
-		} else {
+		if m.resolvConfHasNameserver() {
+			// LockDNS marks ownership so ClearDNS/net stop can later unlock it.
+			// A raw chattr +i here would leave resolv.conf immutable forever.
+			m.LockDNS()
 			m.logger.Debug("Locked resolv.conf to prevent external DNS overwrite")
+		} else {
+			m.logger.Debug("Skipping resolv.conf lock: no nameserver written (no DHCP client ran)")
 		}
 	}
 
