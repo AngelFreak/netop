@@ -734,7 +734,6 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 	return nil
 }
 
-// connectOpenVPN connects to an OpenVPN server
 // openVPNDevice extracts the tunnel device name from an OpenVPN config.
 // A bare device type ("dev tun" / "dev tap") means the kernel assigns the
 // first free unit, which is 0 on a clean system, so those default to
@@ -756,6 +755,7 @@ func openVPNDevice(config string) string {
 	return "tun0"
 }
 
+// connectOpenVPN connects to an OpenVPN server
 func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to OpenVPN")
 
