@@ -18,8 +18,8 @@ type mockSystemExecutor struct {
 	mu                 sync.Mutex
 	commands           map[string]string
 	errors             map[string]error
-	executedCommands   []string          // Track executed commands for verification
-	hasCommandOverride map[string]bool   // Override HasCommand results per command
+	executedCommands   []string        // Track executed commands for verification
+	hasCommandOverride map[string]bool // Override HasCommand results per command
 }
 
 func (m *mockSystemExecutor) Execute(cmd string, args ...string) (string, error) {
@@ -259,7 +259,7 @@ func TestConnect(t *testing.T) {
 					// Common - getting current gateway for state file
 					"ip route show default": "default via 192.168.1.1 dev eth0",
 					// OpenVPN commands
-					"install -m 0600 /dev/stdin /run/net/openvpn.conf":                              "",
+					"install -m 0600 /dev/stdin /run/net/openvpn.conf":                                "",
 					"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
 					"ip link show tun0": "", // tunnel verification
 					// WireGuard commands
@@ -298,7 +298,7 @@ func TestDisconnect(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"ip link delete wg0": "",
-				"ip route show":     "",
+				"ip route show":      "",
 			},
 		}
 		logger := &mockLogger{}
@@ -485,7 +485,7 @@ func TestGenerateWireGuardKey(t *testing.T) {
 func TestConnectOpenVPN(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"install -m 0600 /dev/stdin /run/net/openvpn.conf":                              "",
+			"install -m 0600 /dev/stdin /run/net/openvpn.conf":                                "",
 			"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
 			"ip link show tun0": "", // tunnel verification
 		},
@@ -656,14 +656,14 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 	t.Run("tunnel verification timeout cleans up temp file", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"install -m 0600 /dev/stdin /run/net/openvpn.conf":                              "",
+				"install -m 0600 /dev/stdin /run/net/openvpn.conf":                                "",
 				"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
-				"rm -f /run/net/openvpn.conf": "",                      // cleanup should happen
-				"cat /run/net/openvpn.pid":    "12345",                 // PID file exists
-				"kill 12345":                  "",                      // graceful kill
-				"kill -0 12345":               "",                      // check if running
-				"kill -9 12345":               "",                      // force kill
-				"rm -f /run/net/openvpn.pid":  "",                      // PID file cleanup
+				"rm -f /run/net/openvpn.conf":                                                     "",      // cleanup should happen
+				"cat /run/net/openvpn.pid":                                                        "12345", // PID file exists
+				"kill 12345":                                                                      "",      // graceful kill
+				"kill -0 12345":                                                                   "",      // check if running
+				"kill -9 12345":                                                                   "",      // force kill
+				"rm -f /run/net/openvpn.pid":                                                      "",      // PID file cleanup
 			},
 			errors: map[string]error{
 				"ip link show tun0": assert.AnError, // tun0 never appears
@@ -1137,12 +1137,12 @@ func TestDisconnectTracked(t *testing.T) {
 		tempDir := t.TempDir()
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"cat " + tempDir + "/openvpn.pid": "12345",
-				"kill 12345":                      "",
-				"kill -0 12345":                   "",
-				"kill -9 12345":                   "",
+				"cat " + tempDir + "/openvpn.pid":   "12345",
+				"kill 12345":                        "",
+				"kill -0 12345":                     "",
+				"kill -9 12345":                     "",
 				"rm -f " + tempDir + "/openvpn.pid": "",
-				"ip link set tun0 down":          "",
+				"ip link set tun0 down":             "",
 			},
 			errors: map[string]error{
 				"kill -0 12345": assert.AnError, // Process already dead

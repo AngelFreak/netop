@@ -27,6 +27,12 @@ type Manager struct {
 	endpointRoute string     // Stores the VPN endpoint IP for cleanup on disconnect
 	runtimeDir    string     // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex // Protects endpointRoute and serializes Connect/Disconnect/state file operations
+
+	// Status verification polling for daemon-based VPNs (tailscale, netbird).
+	// Their "up" command can return before the tunnel is established, so we
+	// poll status until it reports connected. Overridable in tests.
+	verifyAttempts int
+	verifyDelay    time.Duration
 }
 
 // vpnState holds the state information stored in the active-vpn file
@@ -47,10 +53,12 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, configMgr ty
 // NewManagerWithDir creates a new VPN manager with a custom runtime directory
 func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, configMgr types.ConfigManager, runtimeDir string) *Manager {
 	return &Manager{
-		executor:   executor,
-		logger:     logger,
-		configMgr:  configMgr,
-		runtimeDir: runtimeDir,
+		executor:       executor,
+		logger:         logger,
+		configMgr:      configMgr,
+		runtimeDir:     runtimeDir,
+		verifyAttempts: 30,
+		verifyDelay:    time.Second,
 	}
 }
 
@@ -531,18 +539,48 @@ func (m *Manager) removeFile(path string) {
 	}
 }
 
+// waitForVPNStatus polls a VPN CLI's status command until its output contains
+// marker, retrying up to verifyAttempts times with verifyDelay between checks.
+// Daemon-based VPNs (tailscale, netbird) establish the tunnel asynchronously
+// after "up" returns, so a single immediate check races the daemon.
+func (m *Manager) waitForVPNStatus(cli string, statusArgs []string, marker string) error {
+	var lastOutput string
+	var lastErr error
+	attempts := m.verifyAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(m.verifyDelay)
+		}
+		output, err := m.executor.ExecuteWithTimeout(5*time.Second, cli, statusArgs...)
+		if err == nil && strings.Contains(output, marker) {
+			return nil
+		}
+		lastOutput = output
+		lastErr = err
+	}
+	if lastErr != nil {
+		return fmt.Errorf("%s status check failed: %w", cli, lastErr)
+	}
+	return fmt.Errorf("%s tunnel did not come up (last status: %s)", cli, strings.TrimSpace(lastOutput))
+}
+
 // connectTailscale connects using the Tailscale CLI
 func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to Tailscale")
 
 	// Switch profile if specified (for multi-account support).
 	// "tailscale switch" may return a non-zero exit code even on success
-	// (e.g. empty stderr), so we only warn when stderr contains a message.
+	// (e.g. empty stderr), so only a failure with a real message counts.
+	// A real failure is fatal: proceeding would bring up the tunnel on
+	// whatever account is currently active — silently wrong for multi-account.
 	if config.Profile != "" {
 		m.logger.Debug("Switching Tailscale profile", "profile", config.Profile)
 		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "switch", config.Profile)
 		if err != nil && !isEmptyStderrError(err) {
-			m.logger.Warn("Failed to switch Tailscale profile", "profile", config.Profile, "error", err)
+			return fmt.Errorf("failed to switch Tailscale profile %q: %w (check 'tailscale switch --list'; net runs as root, so the profile must be visible to root)", config.Profile, err)
 		}
 	}
 
@@ -573,12 +611,9 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 		return fmt.Errorf("failed to apply Tailscale settings: %w", err)
 	}
 
-	// Verify connection
-	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "tailscale", "status", "--json")
-	if err != nil {
-		m.logger.Warn("Could not verify Tailscale status", "error", err)
-	} else if !strings.Contains(output, "Running") {
-		m.logger.Warn("Tailscale may not be fully connected", "status", output)
+	// Verify the tunnel actually came up before reporting success
+	if err := m.waitForVPNStatus("tailscale", []string{"status", "--json"}, "Running"); err != nil {
+		return err
 	}
 
 	m.logger.Info("Tailscale connected")
@@ -595,12 +630,24 @@ func isEmptyStderrError(err error) bool {
 func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to NetBird")
 
-	// Build args
+	// Switch profile if specified (for multi-account support).
+	// Mirrors the Tailscale flow: select the profile before "up" so the
+	// daemon uses the right account. A failed select is fatal: a bare "up"
+	// would connect whatever profile was last active — silently the wrong
+	// account. NetBird profiles are per-OS-user, and net runs as root, so
+	// the profile must have been created for root (sudo netbird profile add).
+	if config.Profile != "" {
+		m.logger.Debug("Switching NetBird profile", "profile", config.Profile)
+		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "profile", "select", config.Profile)
+		if err != nil {
+			return fmt.Errorf("failed to switch NetBird profile %q: %w (check 'sudo netbird profile list' — profiles are per-user and net runs as root)", config.Profile, err)
+		}
+	}
+
+	// Profile is applied via "profile select" above, so it is intentionally
+	// omitted from "up" here.
 	args := []string{"up"}
 
-	if config.Profile != "" {
-		args = append(args, "--profile", config.Profile)
-	}
 	if config.SetupKey != "" {
 		args = append(args, "--setup-key", config.SetupKey)
 	}
@@ -616,12 +663,9 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 		return fmt.Errorf("failed to connect NetBird: %w", err)
 	}
 
-	// Verify connection
-	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "netbird", "status")
-	if err != nil {
-		m.logger.Warn("Could not verify NetBird status", "error", err)
-	} else if !strings.Contains(output, "Connected") {
-		m.logger.Warn("NetBird may not be fully connected", "status", output)
+	// Verify the tunnel actually came up before reporting success
+	if err := m.waitForVPNStatus("netbird", []string{"status"}, "Connected"); err != nil {
+		return err
 	}
 
 	m.logger.Info("NetBird connected")
@@ -842,7 +886,6 @@ func (m *Manager) writeFile(path, content string) error {
 func (m *Manager) activeVPNFilePath() string {
 	return filepath.Join(m.runtimeDir, "active-vpn")
 }
-
 
 // setActiveVPNState records the full VPN state to the state file
 func (m *Manager) setActiveVPNState(state vpnState) error {
