@@ -885,3 +885,36 @@ func TestValidateConfig_TailscaleAndNetBirdFields(t *testing.T) {
 	errors := validateRawConfig(raw)
 	assert.Empty(t, errors, "Tailscale and NetBird fields should be valid: %v", errors)
 }
+
+func TestLoadConfig_WarnsAboutDanglingVPNRefs(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	content := `
+common:
+  vpn: does-not-exist
+
+vpn:
+  real-vpn:
+    type: wireguard
+
+home:
+  ssid: MyWifi
+  vpn: real-vpn
+
+office:
+  ssid: OfficeWifi
+  vpn: also-missing
+`
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0600))
+
+	logger := &mockLogger{}
+	manager := NewManager(logger)
+	_, err := manager.LoadConfig(configFile)
+	require.NoError(t, err)
+
+	// common.vpn and office.vpn reference undefined VPNs; home.vpn is fine
+	warnings := strings.Join(logger.warnMessages, "\n")
+	assert.Contains(t, warnings, "Config references a VPN that is not defined")
+	count := strings.Count(warnings, "Config references a VPN that is not defined")
+	assert.Equal(t, 2, count, "expected warnings for common and office only")
+}
