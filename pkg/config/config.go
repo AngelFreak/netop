@@ -535,6 +535,12 @@ func (m *Manager) GetVPNConfig(name string) (*types.VPNConfig, error) {
 
 	config, exists := m.config.VPN[name]
 	if !exists {
+		// Viper lowercases all map keys when unmarshalling, so a VPN defined
+		// as "Work-VPN" is stored under "work-vpn" while references to it
+		// (common.vpn, a network's vpn: field) keep their original case.
+		config, exists = m.config.VPN[strings.ToLower(name)]
+	}
+	if !exists {
 		return nil, fmt.Errorf("VPN configuration '%s' not found", name)
 	}
 

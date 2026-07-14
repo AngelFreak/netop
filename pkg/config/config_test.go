@@ -321,6 +321,46 @@ func TestGetVPNConfig(t *testing.T) {
 	})
 }
 
+// Viper lowercases all map keys when unmarshalling, so a VPN defined as
+// "Work-VPN" in YAML is stored under "work-vpn" while references to it
+// (common.vpn or a network's vpn: field) keep their original case.
+// GetVPNConfig must resolve those case-preserved references.
+func TestGetVPNConfig_MixedCaseName(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	content := `
+common:
+  vpn: Work-VPN
+
+vpn:
+  Work-VPN:
+    type: netbird
+    profile: work
+
+home:
+  ssid: MyWifi
+  vpn: Work-VPN
+`
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0600))
+
+	manager := NewManager(&mockLogger{})
+	_, err := manager.LoadConfig(configFile)
+	require.NoError(t, err)
+
+	// Direct lookup with the case-preserved name from the network's vpn: field
+	vpnConfig, err := manager.GetVPNConfig("Work-VPN")
+	require.NoError(t, err)
+	assert.Equal(t, "netbird", vpnConfig.Type)
+	assert.Equal(t, "work", vpnConfig.Profile)
+
+	// The merged network config's VPN reference must also resolve
+	netConfig, err := manager.GetNetworkConfig("home")
+	require.NoError(t, err)
+	merged := manager.MergeWithCommon("home", netConfig)
+	_, err = manager.GetVPNConfig(merged.VPN)
+	assert.NoError(t, err)
+}
+
 func TestMergeWithCommon(t *testing.T) {
 	manager := NewManager(&mockLogger{})
 	config := &types.Config{
@@ -502,10 +542,10 @@ testnet:
 
 func TestValidateConfigFile_InvalidFields(t *testing.T) {
 	tests := []struct {
-		name          string
-		config        string
-		expectedCount int
-		expectedField string
+		name               string
+		config             string
+		expectedCount      int
+		expectedField      string
 		expectedSuggestion string
 	}{
 		{
@@ -514,8 +554,8 @@ func TestValidateConfigFile_InvalidFields(t *testing.T) {
   dhs:
     - 8.8.8.8
 `,
-			expectedCount: 1,
-			expectedField: "dhs",
+			expectedCount:      1,
+			expectedField:      "dhs",
 			expectedSuggestion: "dns",
 		},
 		{
@@ -523,8 +563,8 @@ func TestValidateConfigFile_InvalidFields(t *testing.T) {
 			config: `testnet:
   ssd: test
 `,
-			expectedCount: 1,
-			expectedField: "ssd",
+			expectedCount:      1,
+			expectedField:      "ssd",
 			expectedSuggestion: "ssid",
 		},
 		{
@@ -533,8 +573,8 @@ func TestValidateConfigFile_InvalidFields(t *testing.T) {
   myvpn:
     tipe: openvpn
 `,
-			expectedCount: 1,
-			expectedField: "tipe",
+			expectedCount:      1,
+			expectedField:      "tipe",
 			expectedSuggestion: "type",
 		},
 		{
