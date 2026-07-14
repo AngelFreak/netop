@@ -1497,3 +1497,71 @@ func TestListVPNs_StateFileVerifiedAgainstLiveStatus(t *testing.T) {
 	assert.Len(t, vpns, 1)
 	assert.False(t, vpns[0].Connected, "state file says active but daemon is down — must report disconnected")
 }
+
+// Switching directly from one VPN to another (via Connect, not Disconnect)
+// must remove the old VPN's persisted endpoint route, not leak it.
+func TestConnect_RemovesOldEndpointRouteOnSwitch(t *testing.T) {
+	tempDir := t.TempDir()
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":    "default via 192.168.1.1 dev eth0",
+			"netbird up --disable-dns": "",
+			"netbird status --json":    `{"daemonStatus":"Connected"}`,
+			"netbird down":             "",
+			"ip route show":            "default via 192.168.1.1 dev eth0",
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"new-nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+	// Existing WireGuard VPN with a protective endpoint route recorded.
+	err := manager.setActiveVPNState(vpnState{
+		Name: "old-wg", Type: "wireguard", Interface: "wg0",
+		OriginalGateway: "192.168.1.1", OriginalInterface: "eth0",
+		EndpointRoute: "203.0.113.9",
+	})
+	assert.NoError(t, err)
+	executor.commands["ip link delete wg0"] = ""
+
+	err = manager.Connect("new-nb")
+	assert.NoError(t, err)
+	executor.assertCommandExecuted(t, "ip route del 203.0.113.9")
+}
+
+// When two same-type daemon VPNs are configured and none is net-tracked, live
+// detection can't tell which is up, so ListVPNs must not flag both connected.
+func TestListVPNs_AmbiguousSameTypeNotBothConnected(t *testing.T) {
+	tempDir := t.TempDir()
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"pgrep -f openvpn":            "",
+			"ip link show type wireguard": "",
+			"tailscale status --json":     "",
+			"netbird status --json":       `{"daemonStatus":"Connected"}`,
+		},
+		errors: map[string]error{
+			"pgrep -f openvpn":        fmt.Errorf("no match"),
+			"tailscale status --json": fmt.Errorf("not installed"),
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"work-nb": {Type: "netbird"},
+			"home-nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+
+	vpns, err := manager.ListVPNs()
+	assert.NoError(t, err)
+	assert.Len(t, vpns, 2)
+	for _, v := range vpns {
+		assert.False(t, v.Connected, "ambiguous same-type VPN %q must not be flagged connected", v.Name)
+	}
+}

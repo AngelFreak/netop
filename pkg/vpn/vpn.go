@@ -83,7 +83,10 @@ func (m *Manager) Connect(name string) error {
 		if err := m.disconnectTracked(existingState); err != nil {
 			return fmt.Errorf("cannot disconnect active VPN '%s' before connecting '%s': %w", existingState.Name, name, err)
 		}
-		// Restore original route from the existing state before saving new state
+		// Remove the old VPN's protective endpoint route and restore the
+		// original route before saving new state, mirroring Disconnect — else
+		// the old /32 endpoint route leaks permanently.
+		m.removeEndpointRoute(existingState)
 		m.restoreDefaultRouteFromState(existingState)
 		m.clearActiveVPN()
 	}
@@ -192,18 +195,8 @@ func (m *Manager) Disconnect(name string) error {
 		return disconnectErr
 	}
 
-	// Remove the VPN endpoint route if we added one. Prefer the persisted
-	// route from the state file — the connecting process is usually not the
-	// disconnecting one, so the in-memory value is only a same-process fallback.
-	endpointRoute := m.endpointRoute
-	if state != nil && state.EndpointRoute != "" {
-		endpointRoute = state.EndpointRoute
-	}
-	m.endpointRoute = ""
-	if endpointRoute != "" {
-		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
-		_, _ = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "del", endpointRoute)
-	}
+	// Remove the VPN endpoint route if we added one.
+	m.removeEndpointRoute(state)
 
 	// Restore default route via the physical interface using saved original route
 	m.restoreDefaultRouteFromState(state)
@@ -327,6 +320,22 @@ func (m *Manager) disconnectLegacy() {
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
 			m.logger.Debug("Failed to disconnect NetBird (legacy)", "error", err)
 		}
+	}
+}
+
+// removeEndpointRoute removes the protective /32 route to a WireGuard VPN
+// endpoint that connectWireGuard may have added. Prefers the persisted route
+// from the state file — the connecting process is usually not the one tearing
+// down, so the in-memory value is only a same-process fallback.
+func (m *Manager) removeEndpointRoute(state *vpnState) {
+	endpointRoute := m.endpointRoute
+	if state != nil && state.EndpointRoute != "" {
+		endpointRoute = state.EndpointRoute
+	}
+	m.endpointRoute = ""
+	if endpointRoute != "" {
+		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
+		_, _ = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "del", endpointRoute)
 	}
 }
 
@@ -497,6 +506,19 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	// Get configured VPNs from config
 	config := m.configMgr.GetConfig()
 	if config != nil && config.VPN != nil {
+		// Count configs per daemon-based type. Tailscale/NetBird/OpenVPN each
+		// run a single global daemon, so live detection can't tell which of
+		// several same-type configs is actually up. When more than one exists
+		// and no state file names the active one, marking them all "connected"
+		// would lie — so we don't guess. WireGuard is exempt: it's keyed by a
+		// distinct interface, so live detection is unambiguous.
+		typeCount := make(map[string]int)
+		for _, vc := range config.VPN {
+			if vc.Type != "wireguard" {
+				typeCount[vc.Type]++
+			}
+		}
+
 		for name, vpnConfig := range config.VPN {
 			status := types.VPNStatus{
 				Name:      name,
@@ -516,6 +538,10 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 			}
 			if activeVPN != "" {
 				status.Connected = name == activeVPN && liveConnected(vpnConfig.Type, iface)
+			} else if typeCount[vpnConfig.Type] > 1 {
+				// Ambiguous: multiple same-type daemon VPNs, none tracked.
+				// Report disconnected rather than falsely flag all as up.
+				status.Connected = false
 			} else {
 				status.Connected = liveConnected(vpnConfig.Type, iface)
 			}
@@ -667,9 +693,17 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	// Bring the interface up first. When an authkey is provided we pass it
 	// here so the node can register; otherwise a bare "up" just ensures the
 	// daemon is running (it won't block if already authenticated).
+	//
+	// The key is passed via "file:<path>" (a 0600 file) rather than as an argv
+	// token so it isn't exposed through `ps` / process inspection.
 	upArgs := []string{"up"}
 	if config.AuthKey != "" {
-		upArgs = append(upArgs, "--authkey="+config.AuthKey)
+		keyPath, cleanup, err := m.writeSecretFile("tailscale-authkey", config.AuthKey)
+		if err != nil {
+			return fmt.Errorf("failed to stage Tailscale auth key: %w", err)
+		}
+		defer cleanup()
+		upArgs = append(upArgs, "--auth-key=file:"+keyPath)
 	}
 
 	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", upArgs...)
@@ -733,7 +767,14 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 	args := []string{"up"}
 
 	if config.SetupKey != "" {
-		args = append(args, "--setup-key", config.SetupKey)
+		// Pass the setup key via --setup-key-file (a 0600 file) rather than as
+		// an argv token so it isn't exposed through `ps` / process inspection.
+		keyPath, cleanup, err := m.writeSecretFile("netbird-setupkey", config.SetupKey)
+		if err != nil {
+			return fmt.Errorf("failed to stage NetBird setup key: %w", err)
+		}
+		defer cleanup()
+		args = append(args, "--setup-key-file", keyPath)
 	}
 	if config.ManagementURL != "" {
 		args = append(args, "--management-url", config.ManagementURL)
@@ -1014,6 +1055,17 @@ func (m *Manager) getCurrentGateway() (gateway, iface string) {
 // avoiding TOCTOU race where file exists briefly with wrong permissions
 func (m *Manager) writeFile(path, content string) error {
 	return system.WriteSecureFile(m.executor, path, content)
+}
+
+// writeSecretFile writes a credential to a 0600 file named <name> in the
+// runtime dir and returns its path plus a cleanup func. Keeping keys in a file
+// rather than an argv token prevents exposure via `ps` and process inspection.
+func (m *Manager) writeSecretFile(name, secret string) (path string, cleanup func(), err error) {
+	path = filepath.Join(m.runtimeDir, name)
+	if err := m.writeFile(path, secret); err != nil {
+		return "", func() {}, err
+	}
+	return path, func() { m.removeFile(path) }, nil
 }
 
 // activeVPNFilePath returns the path to the active VPN state file
