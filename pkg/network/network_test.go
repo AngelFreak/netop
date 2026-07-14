@@ -24,11 +24,11 @@ func TestMain(m *testing.M) {
 type mockSystemExecutor struct {
 	commands       map[string]string
 	errors         map[string]error
-	strict         bool                 // If true, fail on unexpected commands
-	executedCmds   []string             // Track executed commands for verification
-	inputsReceived map[string]string    // Track inputs received by ExecuteWithInput
-	hasCommands    map[string]bool      // which commands are "installed"
-	failOnPattern  string               // If set, fail any command containing this substring
+	strict         bool              // If true, fail on unexpected commands
+	executedCmds   []string          // Track executed commands for verification
+	inputsReceived map[string]string // Track inputs received by ExecuteWithInput
+	hasCommands    map[string]bool   // which commands are "installed"
+	failOnPattern  string            // If set, fail any command containing this substring
 }
 
 func newStrictMockExecutor() *mockSystemExecutor {

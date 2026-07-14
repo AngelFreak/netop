@@ -75,17 +75,17 @@ type IgnoredConfig struct {
 
 // VPNConfig represents VPN configuration
 type VPNConfig struct {
-	Type          string `yaml:"type" mapstructure:"type"`               // "openvpn", "wireguard", "tailscale", or "netbird"
-	Config        string `yaml:"config" mapstructure:"config"`           // Inline config (OpenVPN/WireGuard)
-	Address       string `yaml:"address" mapstructure:"address"`         // WireGuard IP
-	Interface     string `yaml:"interface" mapstructure:"interface"`     // WireGuard interface name
-	Gateway       bool   `yaml:"gateway" mapstructure:"gateway"`         // Route all traffic via VPN (WireGuard)
-	AuthKey       string `yaml:"auth_key" mapstructure:"auth_key"`       // Tailscale auth key
-	ExitNode      string `yaml:"exit_node" mapstructure:"exit_node"`     // Tailscale exit node
-	AcceptRoutes  bool   `yaml:"accept_routes" mapstructure:"accept_routes"` // Tailscale accept routes
-	SetupKey      string `yaml:"setup_key" mapstructure:"setup_key"`     // NetBird setup key
+	Type          string `yaml:"type" mapstructure:"type"`                     // "openvpn", "wireguard", "tailscale", or "netbird"
+	Config        string `yaml:"config" mapstructure:"config"`                 // Inline config (OpenVPN/WireGuard)
+	Address       string `yaml:"address" mapstructure:"address"`               // WireGuard IP
+	Interface     string `yaml:"interface" mapstructure:"interface"`           // WireGuard interface name
+	Gateway       bool   `yaml:"gateway" mapstructure:"gateway"`               // Route all traffic via VPN (WireGuard)
+	AuthKey       string `yaml:"auth_key" mapstructure:"auth_key"`             // Tailscale auth key
+	ExitNode      string `yaml:"exit_node" mapstructure:"exit_node"`           // Tailscale exit node
+	AcceptRoutes  bool   `yaml:"accept_routes" mapstructure:"accept_routes"`   // Tailscale accept routes
+	SetupKey      string `yaml:"setup_key" mapstructure:"setup_key"`           // NetBird setup key
 	ManagementURL string `yaml:"management_url" mapstructure:"management_url"` // NetBird management URL
-	Profile       string `yaml:"profile" mapstructure:"profile"`         // Tailscale/NetBird profile for account switching
+	Profile       string `yaml:"profile" mapstructure:"profile"`               // Tailscale/NetBird profile for account switching
 }
 
 // NetworkConfig represents a network configuration
@@ -154,9 +154,9 @@ type HotspotConfig struct {
 	SSID      string   `yaml:"ssid" mapstructure:"ssid"`
 	Password  string   `yaml:"password" mapstructure:"password"`
 	Channel   int      `yaml:"channel" mapstructure:"channel"`
-	IPRange   string   `yaml:"ip_range" mapstructure:"ip_range"`     // DHCP range, e.g., "192.168.50.50,192.168.50.150"
-	Gateway   string   `yaml:"gateway" mapstructure:"gateway"`       // e.g., "192.168.50.1"
-	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`      // CIDR prefix length, e.g., "24" (default: "24")
+	IPRange   string   `yaml:"ip_range" mapstructure:"ip_range"` // DHCP range, e.g., "192.168.50.50,192.168.50.150"
+	Gateway   string   `yaml:"gateway" mapstructure:"gateway"`   // e.g., "192.168.50.1"
+	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`   // CIDR prefix length, e.g., "24" (default: "24")
 	DNS       []string `yaml:"dns" mapstructure:"dns"`
 }
 
@@ -172,9 +172,9 @@ type HotspotStatus struct {
 // DHCPServerConfig represents DHCP server configuration
 type DHCPServerConfig struct {
 	Interface string   `yaml:"interface" mapstructure:"interface"`
-	IPRange   string   `yaml:"ip_range" mapstructure:"ip_range"`     // e.g., "192.168.100.50,192.168.100.150"
-	Gateway   string   `yaml:"gateway" mapstructure:"gateway"`       // e.g., "192.168.100.1"
-	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`       // CIDR bits, e.g., "24" for /24. Defaults to "24"
+	IPRange   string   `yaml:"ip_range" mapstructure:"ip_range"` // e.g., "192.168.100.50,192.168.100.150"
+	Gateway   string   `yaml:"gateway" mapstructure:"gateway"`   // e.g., "192.168.100.1"
+	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`   // CIDR bits, e.g., "24" for /24. Defaults to "24"
 	DNS       []string `yaml:"dns" mapstructure:"dns"`
 	LeaseTime string   `yaml:"lease_time" mapstructure:"lease_time"` // e.g., "12h"
 }

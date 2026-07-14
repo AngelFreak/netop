@@ -189,4 +189,3 @@ func (ap *TestAP) IsRunning() bool {
 	// Check if process has exited
 	return ap.cmd.ProcessState == nil || !ap.cmd.ProcessState.Exited()
 }
-

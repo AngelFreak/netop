@@ -13,14 +13,14 @@ import (
 
 // DHCPServerConfig holds configuration for a test DHCP server.
 type DHCPServerConfig struct {
-	Interface   string
-	RangeStart  string // e.g., "192.168.100.10"
-	RangeEnd    string // e.g., "192.168.100.50"
-	Gateway     string // e.g., "192.168.100.1"
-	Netmask     string // e.g., "255.255.255.0"
-	LeaseTime   string // e.g., "1h"
-	DNS         string // e.g., "8.8.8.8"
-	Domain      string // e.g., "test.local"
+	Interface  string
+	RangeStart string // e.g., "192.168.100.10"
+	RangeEnd   string // e.g., "192.168.100.50"
+	Gateway    string // e.g., "192.168.100.1"
+	Netmask    string // e.g., "255.255.255.0"
+	LeaseTime  string // e.g., "1h"
+	DNS        string // e.g., "8.8.8.8"
+	Domain     string // e.g., "test.local"
 }
 
 // TestDHCPServer represents a running dnsmasq DHCP server for testing.
