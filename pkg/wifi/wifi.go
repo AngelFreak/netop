@@ -577,6 +577,30 @@ func (m *Manager) getCurrentSSID() (string, error) {
 	return "", fmt.Errorf("SSID not found")
 }
 
+// otherInterfaceAssociated reports whether any wireless interface OTHER than
+// m.iface is currently associated with an AP. Used to guard the unscoped
+// global wpa_supplicant kill so we don't drop another interface's connection.
+// On any error enumerating interfaces it returns true (fail safe: don't kill).
+func (m *Manager) otherInterfaceAssociated() bool {
+	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "iw", "dev")
+	if err != nil {
+		return true
+	}
+	var iface string
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "Interface" {
+			iface = fields[1]
+			continue
+		}
+		// "ssid <name>" appears under an Interface stanza only when associated.
+		if iface != "" && iface != m.iface && len(fields) >= 1 && fields[0] == "ssid" {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) getDNSServers() ([]net.IP, error) {
 	output, err := m.readFile("/etc/resolv.conf")
 	if err != nil {
@@ -631,11 +655,18 @@ func (m *Manager) terminateWpaSupplicant() {
 		_, err2 := m.executor.ExecuteWithTimeout(500*time.Millisecond,
 			"pkill", "-9", "-f", fmt.Sprintf("wpa_supplicant.*-i.*%s", m.iface))
 		if err2 != nil {
-			// Last resort: kill the system wpa_supplicant (started via -u -s for D-Bus)
-			// which doesn't use -i flag. Required to avoid nl80211 "Match already
-			// configured" conflicts that prevent our instance from creating its socket.
-			m.executor.ExecuteWithTimeout(500*time.Millisecond,
-				"pkill", "-9", "wpa_supplicant")
+			// Last resort: kill the system wpa_supplicant (started via -u -s for
+			// D-Bus) which doesn't use -i flag. Required to avoid nl80211 "Match
+			// already configured" conflicts that prevent our instance from
+			// creating its socket. But this is unscoped, so skip it when another
+			// wireless interface is currently associated — killing it would drop
+			// that connection too.
+			if m.otherInterfaceAssociated() {
+				m.logger.Warn("Skipping global wpa_supplicant kill: another interface is associated", "interface", m.iface)
+			} else {
+				m.executor.ExecuteWithTimeout(500*time.Millisecond,
+					"pkill", "-9", "wpa_supplicant")
+			}
 		}
 	}
 
