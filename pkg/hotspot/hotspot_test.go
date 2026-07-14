@@ -46,6 +46,7 @@ type mockExecutor struct {
 	commands  map[string]string
 	errors    map[string]error
 	callbacks map[string]func() // Callbacks to run when command is executed
+	called    []string          // Full command strings that were executed
 }
 
 func newMockExecutor() *mockExecutor {
@@ -61,6 +62,8 @@ func (m *mockExecutor) Execute(cmd string, args ...string) (string, error) {
 	for _, arg := range args {
 		fullCmd += " " + arg
 	}
+
+	m.called = append(m.called, fullCmd)
 
 	// Run callback if registered (e.g., to create PID files)
 	if cb, ok := m.callbacks[fullCmd]; ok {
@@ -121,6 +124,7 @@ func setupTestManager() (*hotspotManagerImpl, *mockExecutor) {
 	mgr.dnsmasqPidFile = filepath.Join(tmpDir, "test_dnsmasq.pid")
 	mgr.hostapdConfFile = filepath.Join(tmpDir, "test_hostapd.conf")
 	mgr.dnsmasqConfFile = filepath.Join(tmpDir, "test_dnsmasq.conf")
+	mgr.stateFile = filepath.Join(tmpDir, "test_hotspot_state")
 
 	return mgr, executor
 }
@@ -130,6 +134,7 @@ func cleanup(mgr *hotspotManagerImpl) {
 	os.Remove(mgr.dnsmasqPidFile)
 	os.Remove(mgr.hostapdConfFile)
 	os.Remove(mgr.dnsmasqConfFile)
+	os.Remove(mgr.stateFile)
 }
 
 // Tests
@@ -386,6 +391,50 @@ func TestStop_NotRunning(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "not running")
+}
+
+// Teardown must restore the pre-hotspot ip_forward value, not force it to 0.
+func TestStop_RestoresPriorIPForward(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	mgr.currentConfig = &types.HotspotConfig{Interface: "wlan0"}
+	mgr.outInterface = "eth0"
+	mgr.prevIPForward = "1" // host had forwarding enabled before us
+
+	hostapdPid, cleanHostapd := startFakeProcess("hostapd")
+	defer cleanHostapd()
+	os.WriteFile(mgr.hostapdPidFile, []byte(hostapdPid), 0644)
+	executor.commands["kill "+hostapdPid] = ""
+	executor.commands["ip addr flush dev wlan0"] = ""
+	executor.commands["ip link set wlan0 down"] = ""
+	executor.commands["iw wlan0 set type managed"] = ""
+	executor.commands["ip link set wlan0 up"] = ""
+
+	err := mgr.Stop()
+	assert.NoError(t, err)
+	assert.Contains(t, executor.called, "sh -c echo 1 > /proc/sys/net/ipv4/ip_forward",
+		"must restore prior ip_forward=1 rather than forcing 0")
+}
+
+// If both daemons died on their own but state remains, Stop must still tear
+// down the NAT rules and ip_forward they left behind.
+func TestStop_CleansNATWhenDaemonsAlreadyDead(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	// State on disk, no running hostapd/dnsmasq (no pidfiles).
+	os.WriteFile(mgr.stateFile, []byte("wlan0|eth0|0"), 0600)
+	executor.commands["ip addr flush dev wlan0"] = ""
+	executor.commands["ip link set wlan0 down"] = ""
+	executor.commands["iw wlan0 set type managed"] = ""
+	executor.commands["ip link set wlan0 up"] = ""
+
+	err := mgr.Stop()
+	assert.NoError(t, err)
+	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE",
+		"NAT masquerade rule must be removed even when the daemons already died")
+	assert.Contains(t, executor.called, "sh -c echo 0 > /proc/sys/net/ipv4/ip_forward")
 }
 
 func TestStop_PartialFailure(t *testing.T) {

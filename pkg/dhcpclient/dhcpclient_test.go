@@ -37,6 +37,9 @@ type mockExecutor struct {
 	errors       map[string]error
 	hasCommands  map[string]bool
 	executedCmds []string
+	// timeoutByCmd records the deadline passed to ExecuteWithTimeout, keyed by
+	// the full command string, so tests can assert the executor deadline.
+	timeoutByCmd map[string]time.Duration
 }
 
 func newMockExecutor() *mockExecutor {
@@ -65,6 +68,11 @@ func (m *mockExecutor) ExecuteContext(ctx context.Context, cmd string, args ...s
 }
 
 func (m *mockExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
+	if m.timeoutByCmd == nil {
+		m.timeoutByCmd = make(map[string]time.Duration)
+	}
+	fullCmd := strings.TrimSpace(cmd + " " + strings.Join(args, " "))
+	m.timeoutByCmd[fullCmd] = timeout
 	return m.Execute(cmd, args...)
 }
 
@@ -240,6 +248,25 @@ func TestAcquire_UsesDhclientAsFallback(t *testing.T) {
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "dhclient -v -1 wlan0")
+}
+
+// The executor deadline for the `timeout N dhclient ...` wrapper must exceed
+// the inner N seconds, or the default 30s command timeout SIGKILLs the wrapper
+// before dhclient's own window elapses and orphans the child.
+func TestAcquireDhclient_ExecutorDeadlineExceedsInnerTimeout(t *testing.T) {
+	executor := newMockExecutor()
+	executor.hasCommands["udhcpc"] = false
+	executor.hasCommands["dhclient"] = true
+	executor.commands["timeout 60 dhclient -v -1 wlan0"] = ""
+	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
+	manager := NewManager(executor, &mockLogger{})
+
+	err := manager.Acquire("wlan0", "")
+	assert.NoError(t, err)
+
+	got := executor.timeoutByCmd["timeout 60 dhclient -v -1 wlan0"]
+	assert.Greater(t, got, DhclientTimeout,
+		"executor deadline must exceed the inner dhclient timeout so the wrapper isn't SIGKILLed early")
 }
 
 func TestAcquire_WithHostname_Udhcpc(t *testing.T) {

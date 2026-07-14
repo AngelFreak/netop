@@ -65,6 +65,7 @@ var (
 		"mac":       true,
 		"hostname":  true,
 		"vpn":       true,
+		"metric":    true,
 	}
 )
 
@@ -509,7 +510,15 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 			if m.logger != nil {
 				m.logger.Debug("Network alias detected", "alias", name, "target", aliasTarget)
 			}
-			return m.resolveAlias(aliasTarget, 5)
+			resolved, err := m.resolveAlias(aliasTarget, 5)
+			if err != nil {
+				return nil, err
+			}
+			// Cache the resolved config under the ALIAS name too, so later
+			// lookups by alias (notably connectVPN, which indexes Networks by
+			// the name the user connected with) find the target's VPN/settings.
+			m.config.Networks[name] = *resolved
+			return resolved, nil
 		}
 		return nil, fmt.Errorf("failed to read network configuration '%s'", name)
 	}
@@ -533,6 +542,17 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 func (m *Manager) resolveAlias(name string, maxDepth int) (*types.NetworkConfig, error) {
 	if maxDepth <= 0 {
 		return nil, fmt.Errorf("alias chain too deep or circular (at '%s')", name)
+	}
+
+	// Apply $(hostname) substitution to the alias target so the documented
+	// per-host pattern (e.g. "static: static-$(hostname)") resolves to the
+	// host-specific network block.
+	if strings.Contains(name, "$(hostname)") {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get hostname: %w", err)
+		}
+		name = strings.ReplaceAll(name, "$(hostname)", hostname)
 	}
 
 	// Check cache first

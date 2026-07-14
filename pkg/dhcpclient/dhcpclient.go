@@ -312,7 +312,12 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	// Start dhclient with timeout wrapper. The -1 flag ensures dhclient
 	// exits after the first attempt (success or fail) rather than retrying
 	// forever. The timeout wrapper is a safety net in case dhclient hangs.
-	_, err := m.executor.Execute("timeout", args...)
+	//
+	// The executor deadline must exceed the inner `timeout` value, otherwise
+	// the default 30s command timeout SIGKILLs the `timeout` process before
+	// dhclient's own window elapses — SIGKILL can't be forwarded, so dhclient
+	// is orphaned and any lease past 30s is silently lost. Give a 5s margin.
+	_, err := m.executor.ExecuteWithTimeout(dhclientTimeout+5*time.Second, "timeout", args...)
 	if err != nil {
 		// Clean up any partial state on failure
 		m.Release(iface)

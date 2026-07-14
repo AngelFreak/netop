@@ -22,6 +22,7 @@ type dhcpManagerImpl struct {
 	stateFile       string // Persists interface and outInterface for crash recovery
 	currentConfig   *types.DHCPServerConfig
 	outInterface    string // Interface for NAT routing (e.g., wlan0)
+	prevIPForward   string // ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
 }
 
 // NewDHCPManager creates a new DHCP server manager
@@ -99,16 +100,21 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 func (d *dhcpManagerImpl) Stop() error {
 	d.logger.Info("Stopping DHCP server")
 
-	if !d.IsRunning() {
-		// Clean up stale PID/config files even if the process isn't running
-		// (e.g., dnsmasq was killed externally)
-		d.cleanupStaleFiles()
-		return fmt.Errorf("DHCP server is not running")
-	}
-
 	// Recover state from file if needed (e.g., after crash/restart)
 	if d.currentConfig == nil || d.outInterface == "" {
 		d.loadState()
+	}
+
+	if !d.IsRunning() {
+		// dnsmasq isn't running. If we have no recorded state either, there's
+		// nothing to tear down beyond stale files. But if dnsmasq died on its
+		// own while state remains, fall through so the NAT rules and ip_forward
+		// it left behind still get cleaned up.
+		if d.currentConfig == nil {
+			d.cleanupStaleFiles()
+			os.Remove(d.stateFile)
+			return fmt.Errorf("DHCP server is not running")
+		}
 	}
 
 	// Clean up NAT rules first
@@ -288,6 +294,12 @@ func (d *dhcpManagerImpl) generateDnsmasqConfig(config *types.DHCPServerConfig) 
 
 // setupNAT configures IP forwarding and NAT masquerade for internet sharing
 func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
+	// Record the current forwarding state so teardown can restore it instead
+	// of unconditionally disabling forwarding the host may have had enabled.
+	if out, err := d.executor.Execute("cat", "/proc/sys/net/ipv4/ip_forward"); err == nil {
+		d.prevIPForward = strings.TrimSpace(out)
+	}
+
 	// Enable IP forwarding
 	if _, err := d.executor.Execute("sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"); err != nil {
 		return fmt.Errorf("failed to enable IP forwarding: %w", err)
@@ -355,14 +367,21 @@ func (d *dhcpManagerImpl) cleanupNAT(dhcpIface string) {
 		}
 	}
 
-	if _, err := d.executor.Execute("sh", "-c", "echo 0 > /proc/sys/net/ipv4/ip_forward"); err != nil {
-		d.logger.Warn("Failed to disable IP forwarding", "error", err.Error())
+	// Restore IP forwarding to its pre-server value rather than forcing it off —
+	// the host may have had forwarding enabled. Default to "0" only when we
+	// never recorded the prior value.
+	restore := d.prevIPForward
+	if restore != "0" && restore != "1" {
+		restore = "0"
+	}
+	if _, err := d.executor.Execute("sh", "-c", "echo "+restore+" > /proc/sys/net/ipv4/ip_forward"); err != nil {
+		d.logger.Warn("Failed to restore IP forwarding", "error", err.Error())
 	}
 }
 
 // saveState persists DHCP interface and outInterface to a state file for crash recovery
 func (d *dhcpManagerImpl) saveState(dhcpIface string) {
-	content := dhcpIface + "|" + d.outInterface
+	content := dhcpIface + "|" + d.outInterface + "|" + d.prevIPForward
 	if err := os.WriteFile(d.stateFile, []byte(content), 0600); err != nil {
 		d.logger.Debug("Failed to save DHCP state", "error", err)
 	}
@@ -374,12 +393,15 @@ func (d *dhcpManagerImpl) loadState() {
 	if err != nil {
 		return
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 2)
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 3)
 	if len(parts) >= 1 && parts[0] != "" && d.currentConfig == nil {
 		d.currentConfig = &types.DHCPServerConfig{Interface: parts[0]}
 	}
 	if len(parts) >= 2 && parts[1] != "" {
 		d.outInterface = parts[1]
+	}
+	if len(parts) >= 3 && parts[2] != "" {
+		d.prevIPForward = parts[2]
 	}
 }
 
@@ -422,6 +444,12 @@ func (d *dhcpManagerImpl) dnsmasqRunning() bool {
 func (d *dhcpManagerImpl) stopDnsmasq() error {
 	data, err := os.ReadFile(d.dnsmasqPidFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// No pidfile means dnsmasq already exited — nothing to kill. This
+			// is not an error on the teardown path (the daemon may have died
+			// on its own), so cleanup of NAT/interface can still proceed.
+			return nil
+		}
 		return fmt.Errorf("failed to read dnsmasq PID: %w", err)
 	}
 
