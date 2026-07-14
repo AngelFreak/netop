@@ -911,6 +911,47 @@ func TestStop_RecoverStateFromFile(t *testing.T) {
 	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE")
 }
 
+// Teardown must restore the pre-server ip_forward value, not force it to 0.
+func TestStop_RestoresPriorIPForward(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	mgr.currentConfig = &types.DHCPServerConfig{Interface: "eth0"}
+	mgr.outInterface = "wlan0"
+	mgr.prevIPForward = "1" // host had forwarding enabled before us
+
+	dnsmasqPid, cleanDnsmasq := startFakeProcess("dnsmasq")
+	defer cleanDnsmasq()
+	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
+	executor.commands["kill "+dnsmasqPid] = ""
+	executor.commands["ip addr flush dev eth0"] = ""
+	executor.commands["ip link set eth0 down"] = ""
+
+	err := mgr.Stop()
+	assert.NoError(t, err)
+	assert.Contains(t, executor.called, "sh -c echo 1 > /proc/sys/net/ipv4/ip_forward",
+		"must restore prior ip_forward=1 rather than forcing 0")
+	assert.NotContains(t, executor.called, "sh -c echo 0 > /proc/sys/net/ipv4/ip_forward")
+}
+
+// If dnsmasq died on its own but state remains, Stop must still tear down the
+// NAT rules and ip_forward it left behind.
+func TestStop_CleansNATWhenDaemonAlreadyDead(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	// State on disk, but no running dnsmasq (no pidfile / process).
+	os.WriteFile(mgr.stateFile, []byte("eth0|wlan0|0"), 0600)
+	executor.commands["ip addr flush dev eth0"] = ""
+	executor.commands["ip link set eth0 down"] = ""
+
+	err := mgr.Stop()
+	assert.NoError(t, err)
+	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE",
+		"NAT masquerade rule must be removed even when the daemon already died")
+	assert.Contains(t, executor.called, "sh -c echo 0 > /proc/sys/net/ipv4/ip_forward")
+}
+
 func TestStart_PersistsStateFile(t *testing.T) {
 	mgr, executor := setupTestManager()
 	defer cleanup(mgr)
@@ -931,10 +972,12 @@ func TestStart_PersistsStateFile(t *testing.T) {
 	err := mgr.Start(config)
 	assert.NoError(t, err)
 
-	// State file should exist with interface and outbound interface
+	// State file should exist with interface, outbound interface, and the
+	// recorded prior ip_forward value (empty here — the test mock doesn't
+	// return one for `cat /proc/.../ip_forward`).
 	data, err := os.ReadFile(mgr.stateFile)
 	assert.NoError(t, err)
-	assert.Equal(t, "eth0|wlan0", string(data))
+	assert.Equal(t, "eth0|wlan0|", string(data))
 }
 
 func TestStart_WithDifferentNetmasks(t *testing.T) {

@@ -23,6 +23,7 @@ type hotspotManagerImpl struct {
 	stateFile       string // Persists hotspot interface and outInterface for crash recovery
 	currentConfig   *types.HotspotConfig
 	outInterface    string // Interface for NAT routing (e.g., eth0)
+	prevIPForward   string // /proc/.../ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
 }
 
 // NewHotspotManager creates a new hotspot manager
@@ -156,6 +157,12 @@ func (h *hotspotManagerImpl) waitForHostapd() error {
 
 // setupNAT configures IP forwarding and NAT masquerade
 func (h *hotspotManagerImpl) setupNAT(hotspotIface string) error {
+	// Record the current forwarding state so teardown can restore it instead
+	// of unconditionally disabling forwarding the host may have had enabled.
+	if out, err := h.executor.ExecuteWithTimeout(2*time.Second, "cat", "/proc/sys/net/ipv4/ip_forward"); err == nil {
+		h.prevIPForward = strings.TrimSpace(out)
+	}
+
 	// Enable IP forwarding
 	if _, err := h.executor.ExecuteWithTimeout(2*time.Second, "sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"); err != nil {
 		return fmt.Errorf("failed to enable IP forwarding: %w", err)
@@ -228,9 +235,15 @@ func (h *hotspotManagerImpl) cleanupNAT(hotspotIface string) {
 		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 	}
 
-	// Disable IP forwarding (was enabled in setupNAT)
-	if _, err := h.executor.ExecuteWithTimeout(2*time.Second, "sh", "-c", "echo 0 > /proc/sys/net/ipv4/ip_forward"); err != nil {
-		h.logger.Warn("Failed to disable IP forwarding", "error", err.Error())
+	// Restore IP forwarding to its pre-hotspot value rather than forcing it
+	// off — the host may have had forwarding enabled before netop ran. Default
+	// to "0" only when we never recorded the prior value.
+	restore := h.prevIPForward
+	if restore != "0" && restore != "1" {
+		restore = "0"
+	}
+	if _, err := h.executor.ExecuteWithTimeout(2*time.Second, "sh", "-c", "echo "+restore+" > /proc/sys/net/ipv4/ip_forward"); err != nil {
+		h.logger.Warn("Failed to restore IP forwarding", "error", err.Error())
 	}
 }
 
@@ -238,13 +251,18 @@ func (h *hotspotManagerImpl) cleanupNAT(hotspotIface string) {
 func (h *hotspotManagerImpl) Stop() error {
 	h.logger.Info("Stopping hotspot")
 
-	if !h.isRunning() {
-		return fmt.Errorf("hotspot is not running")
-	}
-
 	// Recover state from file if currentConfig is nil (e.g., after crash/restart)
 	if h.currentConfig == nil || h.outInterface == "" {
 		h.loadState()
+	}
+
+	// If neither daemon is running and we have no recorded state, there is
+	// genuinely nothing to clean up. But if the daemons died on their own
+	// while state remains, fall through and tear down the NAT rules and
+	// interface so MASQUERADE and ip_forward aren't left dangling.
+	if !h.isRunning() && h.currentConfig == nil {
+		os.Remove(h.stateFile)
+		return fmt.Errorf("hotspot is not running")
 	}
 
 	var errors []string
@@ -544,6 +562,9 @@ func (h *hotspotManagerImpl) processRunning(pidFile, expectedName string) bool {
 func (h *hotspotManagerImpl) stopHostapd() error {
 	data, err := os.ReadFile(h.hostapdPidFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // already exited — nothing to kill, don't block teardown
+		}
 		return fmt.Errorf("failed to read hostapd PID: %w", err)
 	}
 
@@ -564,6 +585,9 @@ func (h *hotspotManagerImpl) stopHostapd() error {
 func (h *hotspotManagerImpl) stopDnsmasq() error {
 	data, err := os.ReadFile(h.dnsmasqPidFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // already exited — nothing to kill, don't block teardown
+		}
 		return fmt.Errorf("failed to read dnsmasq PID: %w", err)
 	}
 
@@ -591,8 +615,8 @@ func isValidPID(pid string) bool {
 
 // saveState persists hotspot interface and outInterface to a state file for crash recovery
 func (h *hotspotManagerImpl) saveState(hotspotIface string) {
-	// Format: hotspotInterface|outInterface
-	content := hotspotIface + "|" + h.outInterface
+	// Format: hotspotInterface|outInterface|prevIPForward
+	content := hotspotIface + "|" + h.outInterface + "|" + h.prevIPForward
 	if err := os.WriteFile(h.stateFile, []byte(content), 0600); err != nil {
 		h.logger.Debug("Failed to save hotspot state", "error", err)
 	}
@@ -604,12 +628,15 @@ func (h *hotspotManagerImpl) loadState() {
 	if err != nil {
 		return
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 2)
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 3)
 	if len(parts) >= 1 && parts[0] != "" {
 		h.currentConfig = &types.HotspotConfig{Interface: parts[0]}
 	}
 	if len(parts) >= 2 && parts[1] != "" {
 		h.outInterface = parts[1]
+	}
+	if len(parts) >= 3 && parts[2] != "" {
+		h.prevIPForward = parts[2]
 	}
 }
 
