@@ -98,14 +98,31 @@ func init() {
 // commandNeedsRoot returns false for commands that can run without root privileges.
 // Only checks the subcommand (first non-flag arg) and global flags, not positional
 // arguments — otherwise a network named "status" would skip the sudo elevation.
+// valueFlags are global flags that take a separate value argument. When one
+// appears in space-separated form (e.g. "--iface wlp1s0"), the following arg
+// is its value, not the subcommand, and must be skipped when locating the
+// subcommand — otherwise a root-exempt command like "net --iface X status"
+// would be wrongly elevated via sudo.
+var valueFlags = map[string]bool{"--config": true, "--iface": true}
+
 func commandNeedsRoot() bool {
-	for _, arg := range os.Args[1:] {
+	return commandNeedsRootArgs(os.Args[1:])
+}
+
+func commandNeedsRootArgs(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		// Global flags that don't need root
 		if arg == "-h" || arg == "--help" || arg == "--version" || arg == "-v" {
 			return false
 		}
-		// Skip flag arguments (start with -)
+		// Skip flags. For a value-taking flag in space-separated form, also
+		// skip its value so it isn't mistaken for the subcommand. The "--f=v"
+		// form is a single arg and needs no extra skip.
 		if strings.HasPrefix(arg, "-") {
+			if valueFlags[arg] && i+1 < len(args) {
+				i++
+			}
 			continue
 		}
 		// First positional arg is the subcommand — check if it's root-exempt
@@ -269,42 +286,87 @@ func createApp() *App {
 	}
 }
 
+// findDefaultInterface picks the primary network interface by reading sysfs
+// directly (/sys/class/net), which needs no external binary. This matters
+// because root-exempt commands like `net status` run without /sbin in PATH,
+// where `iw`/`ip` may not resolve — the old shell-out silently fell through to
+// the "wlan0" fallback and reported the wrong interface.
+//
+// Preference order: an up wireless interface, then any wireless interface,
+// then an up wired interface, then any wired interface. VPN/virtual interfaces
+// (wg*, tun*, tailscale*, docker*, veth*, br*) are ignored.
 func findDefaultInterface() string {
-	// Try to find first wireless interface
-	output, err := sysExecutor.Execute("iw", "dev")
-	if err == nil {
-		lines := strings.Split(output, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "Interface ") {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					logger.Debug("Found wireless interface", "interface", parts[1])
-					return parts[1]
-				}
+	iface, why := selectDefaultInterface("/sys/class/net")
+	if why != "" {
+		logger.Debug("Selected default interface", "interface", iface, "reason", why)
+	} else {
+		logger.Debug("No network interface found, using fallback", "interface", iface)
+	}
+	return iface
+}
+
+// selectDefaultInterface implements findDefaultInterface's logic against a
+// given sysfs root so it can be unit-tested. Returns the chosen interface and
+// a short reason ("" when it fell back to the default).
+func selectDefaultInterface(sysNet string) (iface, why string) {
+	entries, err := os.ReadDir(sysNet)
+	if err != nil {
+		return "wlan0", ""
+	}
+
+	isUp := func(name string) bool {
+		state, _ := os.ReadFile(sysNet + "/" + name + "/operstate")
+		return strings.TrimSpace(string(state)) == "up"
+	}
+	isWireless := func(name string) bool {
+		_, err := os.Stat(sysNet + "/" + name + "/wireless")
+		return err == nil
+	}
+	isWired := func(name string) bool {
+		for _, p := range []string{"eth", "enp", "enx", "eno", "ens", "em"} {
+			if strings.HasPrefix(name, p) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var upWireless, anyWireless, upWired, anyWired string
+	for _, e := range entries {
+		name := e.Name()
+		if name == "lo" {
+			continue
+		}
+		switch {
+		case isWireless(name):
+			if anyWireless == "" {
+				anyWireless = name
+			}
+			if upWireless == "" && isUp(name) {
+				upWireless = name
+			}
+		case isWired(name):
+			if anyWired == "" {
+				anyWired = name
+			}
+			if upWired == "" && isUp(name) {
+				upWired = name
 			}
 		}
 	}
 
-	// No wireless interface found, try wired interfaces
-	logger.Debug("No wireless interface found, looking for wired interfaces")
-	wiredOutput, err := sysExecutor.Execute("ip", "-o", "link", "show")
-	if err == nil {
-		for _, line := range strings.Split(wiredOutput, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			name := strings.TrimSuffix(fields[1], ":")
-			if strings.HasPrefix(name, "eth") || strings.HasPrefix(name, "enp") ||
-				strings.HasPrefix(name, "enx") || strings.HasPrefix(name, "eno") ||
-				strings.HasPrefix(name, "ens") {
-				logger.Debug("Found wired interface", "interface", name)
-				return name
-			}
+	for _, candidate := range []struct {
+		iface, why string
+	}{
+		{upWireless, "up wireless"},
+		{anyWireless, "wireless"},
+		{upWired, "up wired"},
+		{anyWired, "wired"},
+	} {
+		if candidate.iface != "" {
+			return candidate.iface, candidate.why
 		}
 	}
 
-	// Last resort fallback
-	logger.Debug("No network interface found, using fallback", "interface", "wlan0")
-	return "wlan0"
+	return "wlan0", ""
 }
