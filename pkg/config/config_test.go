@@ -918,3 +918,79 @@ office:
 	count := strings.Count(warnings, "Config references a VPN that is not defined")
 	assert.Equal(t, 2, count, "expected warnings for common and office only")
 }
+
+// The route-metric field (types.NetworkConfig.Metric, feature ccef543) must be
+// an accepted config field — otherwise any config that sets it fails to load.
+func TestLoadConfig_MetricFieldAccepted(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	content := `
+home:
+  ssid: MyWifi
+  metric: 200
+`
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0600))
+
+	manager := NewManager(&mockLogger{})
+	_, err := manager.LoadConfig(configFile)
+	require.NoError(t, err, "metric is a valid field and must not fail config load")
+
+	nc, err := manager.GetNetworkConfig("home")
+	require.NoError(t, err)
+	assert.Equal(t, 200, nc.Metric)
+}
+
+// An alias whose target contains $(hostname) must resolve to the host-specific
+// network block (documented "static: static-$(hostname)" pattern).
+func TestGetNetworkConfig_AliasWithHostnameSubstitution(t *testing.T) {
+	host, err := os.Hostname()
+	require.NoError(t, err)
+
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	content := fmt.Sprintf(`
+static: static-$(hostname)
+
+static-%s:
+  ssid: HostWifi
+  vpn: work
+`, host)
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0600))
+
+	manager := NewManager(&mockLogger{})
+	_, err = manager.LoadConfig(configFile)
+	require.NoError(t, err)
+
+	nc, err := manager.GetNetworkConfig("static")
+	require.NoError(t, err, "alias with $(hostname) must resolve")
+	assert.Equal(t, "HostWifi", nc.SSID)
+}
+
+// Resolving a network via an alias must make the target's config (incl. VPN)
+// findable under the ALIAS name, so connectVPN(aliasName) doesn't skip the VPN.
+func TestGetNetworkConfig_AliasCachedUnderAliasName(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	content := `
+work: home
+
+home:
+  ssid: MyWifi
+  vpn: office-vpn
+`
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0600))
+
+	manager := NewManager(&mockLogger{})
+	cfg, err := manager.LoadConfig(configFile)
+	require.NoError(t, err)
+
+	// Connecting via the alias resolves it...
+	_, err = manager.GetNetworkConfig("work")
+	require.NoError(t, err)
+
+	// ...and the resolved config (with the VPN) is now indexable by the alias
+	// name, which is what connectVPN(name) relies on.
+	resolved, ok := cfg.Networks["work"]
+	assert.True(t, ok, "alias must be cached under its own name for connectVPN")
+	assert.Equal(t, "office-vpn", resolved.VPN)
+}

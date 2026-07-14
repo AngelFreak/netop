@@ -1741,3 +1741,33 @@ func (m *mockWiFiManagerFailing) ListConnections() ([]types.Connection, error) {
 func (m *mockWiFiManagerFailing) GetInterface() string {
 	return "wlan0"
 }
+
+// GetConnectionInfo must populate SSID for a wireless interface so `net status`
+// can display it (previously always blank).
+func TestGetConnectionInfo_PopulatesSSID(t *testing.T) {
+	executor := newMockExecutor()
+	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
+	executor.commands["ip route show dev wlan0"] = "default via 192.168.1.1"
+	executor.commands["cat /etc/resolv.conf"] = "nameserver 1.1.1.1\n"
+	executor.commands["iw dev wlan0 link"] = "Connected to aa:bb:cc:dd:ee:ff\n\tSSID: CoffeeShop\n\tfreq: 2412"
+	manager := &Manager{executor: executor, logger: &mockLogger{}}
+
+	conn, err := manager.GetConnectionInfo("wlan0")
+	assert.NoError(t, err)
+	assert.Equal(t, "CoffeeShop", conn.SSID)
+}
+
+// A wired interface (iw returns an error / no link) must leave SSID empty
+// rather than showing garbage.
+func TestGetConnectionInfo_NoSSIDForWired(t *testing.T) {
+	executor := newMockExecutor()
+	executor.commands["ip addr show eth0"] = "inet 10.0.0.5/24"
+	executor.commands["ip route show dev eth0"] = "default via 10.0.0.1"
+	executor.commands["cat /etc/resolv.conf"] = "nameserver 1.1.1.1\n"
+	executor.errors["iw dev eth0 link"] = fmt.Errorf("nl80211 not found (not a wireless interface)")
+	manager := &Manager{executor: executor, logger: &mockLogger{}}
+
+	conn, err := manager.GetConnectionInfo("eth0")
+	assert.NoError(t, err)
+	assert.Equal(t, "", conn.SSID)
+}

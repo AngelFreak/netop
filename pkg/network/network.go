@@ -887,7 +887,25 @@ func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 		IP:        ip,
 		Gateway:   gateway,
 		DNS:       dns,
+		SSID:      m.currentSSID(iface),
 	}, nil
+}
+
+// currentSSID returns the SSID the interface is associated with, or "" for
+// wired interfaces / when not associated. Uses `iw dev <iface> link`, which
+// prints "SSID: <name>" when connected.
+func (m *Manager) currentSSID(iface string) string {
+	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "iw", "dev", iface, "link")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "SSID: ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "SSID: "))
+		}
+	}
+	return ""
 }
 
 // applyDefaultRouteMetric finds the DHCP-installed default route on iface and

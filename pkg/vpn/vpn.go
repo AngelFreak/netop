@@ -679,12 +679,16 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	// Apply settings via "tailscale set" which changes individual prefs
 	// without requiring all non-default flags (unlike "up").
-	setArgs := []string{"set", "--accept-dns=false"}
-	if config.ExitNode != "" {
-		setArgs = append(setArgs, "--exit-node="+config.ExitNode)
-	}
-	if config.AcceptRoutes {
-		setArgs = append(setArgs, "--accept-routes")
+	// Always pass explicit values so `tailscale set` resets prefs that were
+	// dropped from the config. `set` persists prefs across sessions, so an
+	// omitted flag would silently keep a previous session's exit-node or
+	// accepted routes rather than clearing them. An empty --exit-node= clears
+	// any existing exit node.
+	setArgs := []string{
+		"set",
+		"--accept-dns=false",
+		"--exit-node=" + config.ExitNode,
+		fmt.Sprintf("--accept-routes=%t", config.AcceptRoutes),
 	}
 
 	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", setArgs...); err != nil {
