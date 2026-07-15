@@ -1771,3 +1771,38 @@ func TestGetConnectionInfo_NoSSIDForWired(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "", conn.SSID)
 }
+
+// Disconnect releases DHCP, flushes addresses/routes, and brings the interface
+// down — the core of what `net stop` does per interface.
+func TestDisconnect(t *testing.T) {
+	t.Run("full sequence succeeds", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.commands["ip addr flush dev eth0"] = ""
+		executor.commands["ip route flush dev eth0"] = ""
+		executor.commands["ip link set eth0 down"] = ""
+		dhcp := &mockDHCPClient{}
+		manager := &Manager{executor: executor, logger: &mockLogger{}, dhcpClient: dhcp}
+
+		err := manager.Disconnect("eth0")
+		assert.NoError(t, err)
+		executor.assertCommandExecuted(t, "ip addr flush dev eth0")
+		executor.assertCommandExecuted(t, "ip route flush dev eth0")
+		executor.assertCommandExecuted(t, "ip link set eth0 down")
+	})
+
+	t.Run("invalid interface name is rejected", func(t *testing.T) {
+		manager := &Manager{executor: newMockExecutor(), logger: &mockLogger{}}
+		err := manager.Disconnect("eth0; rm -rf /")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid interface")
+	})
+
+	t.Run("link-down failure returns error", func(t *testing.T) {
+		executor := newMockExecutor()
+		executor.errors["ip link set eth0 down"] = fmt.Errorf("device busy")
+		manager := &Manager{executor: executor, logger: &mockLogger{}}
+		err := manager.Disconnect("eth0")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to bring interface down")
+	})
+}
