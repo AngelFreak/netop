@@ -60,7 +60,6 @@ func (m *RouteManager) ReplaceDefault(iface, gw string, metric int) error {
 
 	route := &vnl.Route{
 		LinkIndex: link.Attrs().Index,
-		Dst:       nil, // nil Dst = default route
 		Family:    vnl.FAMILY_V4,
 		Table:     unix.RT_TABLE_MAIN,
 		Priority:  metric,
@@ -74,10 +73,14 @@ func (m *RouteManager) ReplaceDefault(iface, gw string, metric int) error {
 		if gwIP.To4() == nil {
 			return fmt.Errorf("gateway %q is not an IPv4 address", gw)
 		}
+		// With a gateway, a nil Dst is accepted as the default route.
 		route.Gw = gwIP
 		route.Scope = vnl.SCOPE_UNIVERSE
 	} else {
-		// Device-only default route (e.g. wg0): no gateway, link scope.
+		// Device-only default route (e.g. wg0): no gateway. The kernel rejects a
+		// route with neither Dst nor Gw set, so specify the destination
+		// explicitly as 0.0.0.0/0 with link scope.
+		route.Dst = defaultV4Net()
 		route.Scope = vnl.SCOPE_LINK
 	}
 
@@ -102,6 +105,13 @@ func (m *RouteManager) ListRoutes() ([]types.Route, error) {
 		out = append(out, *r)
 	}
 	return out, nil
+}
+
+// defaultV4Net returns the 0.0.0.0/0 network used as an explicit default-route
+// destination. Needed for device-only default routes, where the kernel rejects
+// a route with neither Dst nor Gw set.
+func defaultV4Net() *net.IPNet {
+	return &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
 }
 
 // isDefaultDst reports whether a netlink route destination represents the
