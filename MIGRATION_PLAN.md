@@ -177,3 +177,58 @@ Incorporate before execution:
 
 8. **Start file/proc cleanups (T2.3, T2.5) earlier** — they're low-risk and can
    land in parallel with Tier 1, front-loading easy wins.
+
+### Codex review — additional corrections
+
+9. **Subcommand counts were stale/inverted.** Actual: `ip link` 34, `ip route` 22,
+   `ip addr` 16 (total 73). **Link ops are the LARGEST category, not routes.** Size
+   T1.5 accordingly — it's bigger and more valuable than "afterthought" ordering
+   implied. Still do T1.2 gateway PoC first, but don't under-budget link work.
+
+10. **The `iw dev <if> link` SSID read is missing from the inventory entirely.** It
+    lives in `GetConnectionInfo` (network.go) alongside calls that WILL migrate, but
+    it's an **nl80211 genetlink** call — vishvananda/netlink (rtnetlink) can't do it.
+    Explicitly place it in **Tier 3** (stays a shell-out; a future `mdlayher/wifi`
+    would be needed to migrate it). Note that `GetConnectionInfo` will be a hybrid:
+    netlink for addr/route, shell `iw` for SSID.
+
+11. **"Status without root" is PRESERVE, not ENABLE.** `net status` is already
+    root-exempt and its `ip`/`iw` reads are already unprivileged — status works
+    without root TODAY, before any migration. Reword T1.4: netlink *preserves* this,
+    doesn't unlock it.
+
+12. **Caller branch logic, not just the parser, must change for device-only routes.**
+    Callers that branch on `gateway != "" && iface != ""` (e.g.
+    `restoreDefaultRouteFromState`) must be rewritten to branch on "route exists"
+    (LinkIndex valid, Gw may be nil), or the device-only `wg0` case stays silently
+    skipped even after the parser is netlink-native. This is the crux of the
+    motivating bug — test it end to end.
+
+13. **iptables idempotency is a hidden behavior change.** dhcp.go/hotspot.go use
+    unconditional delete-then-add (delete errors discarded). Swapping to
+    `AppendUnique`/`Exists` CHANGES this idiom — a behavior change that violates the
+    "no behavior changes bundled in" rule. Decide explicitly in T2.1: keep
+    delete-then-append, or move to Exists-check — as its own reviewed decision.
+
+14. **Preserve the metric skip-if-already-set check.** `applyDefaultRouteMetric`
+    avoids churn by skipping if metric already matches. Under netlink, compare
+    `Route.Priority` rather than re-parsing a `metric N` token — keep the check.
+
+15. **Add explicit Tier-1 exit criterion:** "existing ip-netns integration harness
+    (tests/integration/testutil/namespace.go, which itself shells `ip netns`/`ip link`)
+    passes UNMODIFIED with the migrated production code." Netlink write-ops under the
+    test's `Setns(CLONE_NEWNET)` isolation are untested until this runs — don't assume
+    it transfers.
+
+16. **Drop `go-ps`.** Stdlib `os.FindProcess`+`Signal` plus reading `/proc/<pid>/cmdline`
+    covers precise process scoping without a new dependency. Only add go-ps if stdlib
+    proves insufficient.
+
+17. **Grep for error-string matching before Tier 1 lands.** netlink returns `unix`
+    errnos (EPERM), not `"command failed: ... (stderr: ...)"`. Any test/code matching
+    on the old text must update; user-facing errors lose `ip`'s descriptive stderr —
+    re-word them.
+
+**Both reviewers agree:** the direction is sound, Tier 1 (netlink for routes/addrs/
+links) targets the real bug, and the T1.2 gateway PoC (with a device-only-route test)
+is the correct first step. Nothing blocks starting — but apply corrections 1-17 first.
