@@ -118,3 +118,62 @@ this tier exists to record the boundary so future contributors don't re-litigate
 Tier 1 fully first (it's the bug-removal win and unblocks root-free status), then
 Tier 2 items in any order. Tier 3 is never executed. Recommend a Tier-1 T1.2 PoC
 (gateway detection) reviewed before proceeding to the rest of Tier 1.
+
+---
+
+## Review corrections (Codex + Grok)
+
+Incorporate before execution:
+
+1. **iptables is NOT native.** `coreos/go-iptables` execs the `iptables` binary
+   (with `-w` locking, `AppendUnique`/`Exists`/`Delete`). It reduces duplicate-rule
+   and list-parsing bugs but keeps the binary dependency. Relabel T2.1 as "safer
+   iptables wrapper (still exec)", not native. Still worth doing for correctness.
+
+2. **The "status without root" win is partial.** netlink read ops (RouteList,
+   AddrList) are unprivileged, BUT `net status` also calls `currentSSID` →
+   `iw dev <if> link`, which is still a binary + may need perms. Don't claim fully
+   root-free status until the SSID read is addressed (mdlayher/wifi can READ status
+   via nl80211, or accept a narrow iw shell for SSID). Adjust T1.4 accordingly.
+
+3. **Missing Tier-1 migration sites** (add as explicit items):
+   - MAC get/set: `ip link ... address` (SetMAC), `GetMAC` parsing of `link/ether`,
+     and permanent-MAC via `ethtool -P` (driver-dependent — may keep a narrow
+     ethtool shell for the permanent case; netlink handles set/get).
+   - `applyDefaultRouteMetric` (network.go) — set via `Route.Priority`, and its
+     current del+re-add text parsing.
+   - `ip link show type wireguard` enumeration + `wg show` scraping in
+     `ListVPNs`/`disconnectLegacy` (vpn.go) — netlink LinkList by type + wgctrl.
+   - `detectOutInterface` (hotspot.go) default-route parsing.
+   - `dhcpclient.parseIPAddress` / `ip addr show` usage.
+   - Remove now-dead `Parse*FromOutput` helpers + their tests as sites migrate.
+
+4. **DI/refactor surface is larger than stated.** Decide explicitly: do existing
+   managers grow `RouteManager`/`LinkManager` fields, or a hybrid? Every mock
+   executor in tests needs a corresponding fake for the new managers. Budget for
+   this wiring in T1.1.
+
+5. **Preserve atomic/secure file semantics.** `WriteSecureFile` uses
+   `install -m 0600 /dev/stdin` specifically for atomic 0600 creation (TOCTOU
+   avoidance). A stdlib replacement must be tempfile+chmod+rename, not a naive
+   `os.WriteFile`. Same care for the chattr→ioctl change: GETFLAGS + bit-twiddle +
+   SETFLAGS (don't clobber other flags), preserving the round-2 ownership/restore
+   semantics exactly.
+
+6. **go-ps changes pkill semantics.** `pkill -f` matches full argv; `go-ps` matches
+   comm/argv differently. This directly affects the scoped-wpa_supplicant-kill logic
+   — test that the new matching targets the same processes. Higher risk than the
+   plan implied.
+
+7. **Netlink parity must be explicitly tested**, not assumed:
+   - Device-only default route (`default dev wg0`, `Gw==nil`, Scope LINK) must
+     return the exact same `(gw="", iface="wg0")` tuple as today — a dedicated test.
+   - Set Family (FAMILY_V4), Table (main), Scope, Priority correctly or you get
+     "file exists" / wrong scope / IPv6 leakage.
+   - Implement the graceful EPERM path (restricted envs), don't just document it.
+   - WireGuard LinkAdd attrs (MTU, txqlen) must match `ip link add ... type wireguard`.
+   - Error messages become syscall-style, not "ip: ... (stderr: ...)" — update any
+     tests/log assertions that match on the old text.
+
+8. **Start file/proc cleanups (T2.3, T2.5) earlier** — they're low-risk and can
+   land in parallel with Tier 1, front-loading easy wins.
