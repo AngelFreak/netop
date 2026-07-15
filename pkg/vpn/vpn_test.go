@@ -10,9 +10,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink/fake"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
+
+// newFakeRoutes returns a fake RouteManager preloaded with a typical physical
+// default route (192.168.1.1 via eth0). Gateway detection and route restore go
+// through the RouteManager (netlink) rather than the executor, so tests inject
+// this to keep those paths deterministic and off the real kernel. Tests that
+// assert on specific gateway/route behavior override manager.routeMgr with their
+// own fake.
+func newFakeRoutes() *fake.RouteManager {
+	return &fake.RouteManager{
+		Routes: []types.Route{{Gw: "192.168.1.1", Iface: "eth0"}},
+	}
+}
 
 // Mock implementations
 type mockSystemExecutor struct {
@@ -218,6 +231,7 @@ func TestNewManager(t *testing.T) {
 	logger := &mockLogger{}
 	configMgr := &mockConfigManager{}
 	manager := NewManager(executor, logger, configMgr)
+	manager.routeMgr = newFakeRoutes()
 	assert.NotNil(t, manager)
 	assert.Equal(t, executor, manager.executor)
 	assert.Equal(t, logger, manager.logger)
@@ -231,6 +245,7 @@ func TestNewManagerWithDir(t *testing.T) {
 	configMgr := &mockConfigManager{}
 	customDir := "/custom/runtime/dir"
 	manager := NewManagerWithDir(executor, logger, configMgr, customDir)
+	manager.routeMgr = newFakeRoutes()
 	assert.NotNil(t, manager)
 	assert.Equal(t, executor, manager.executor)
 	assert.Equal(t, logger, manager.logger)
@@ -258,7 +273,6 @@ func TestConnect(t *testing.T) {
 			executor := &mockSystemExecutor{
 				commands: map[string]string{
 					// Common - getting current gateway for state file
-					"ip route show default": "default via 192.168.1.1 dev eth0",
 					// OpenVPN commands
 					"install -m 0600 /dev/stdin /run/net/openvpn.conf":                                "",
 					"openvpn --config /run/net/openvpn.conf --daemon --writepid /run/net/openvpn.pid": "",
@@ -286,6 +300,7 @@ func TestConnect(t *testing.T) {
 				},
 			}
 			manager := NewManager(executor, logger, configMgr)
+			manager.routeMgr = newFakeRoutes()
 
 			err := manager.Connect("test")
 			assert.NoError(t, err)
@@ -299,12 +314,12 @@ func TestDisconnect(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"ip link delete wg0": "",
-				"ip route show":      "",
 			},
 		}
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		// Create a state file so Disconnect has something to act on
 		os.WriteFile(filepath.Join(tempDir, "active-vpn"), []byte("test|wg0|wireguard|192.168.1.1|eth0"), 0600)
@@ -321,6 +336,7 @@ func TestDisconnect(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		err := manager.Disconnect("test")
 		assert.Error(t, err)
@@ -339,6 +355,7 @@ func TestListVPNs(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{} // No config
 		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -360,6 +377,7 @@ func TestListVPNs(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{} // No config
 		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -380,6 +398,7 @@ func TestListVPNs(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -407,6 +426,7 @@ func TestListVPNs(t *testing.T) {
 			},
 		}
 		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -449,6 +469,7 @@ func TestListVPNs(t *testing.T) {
 			},
 		}
 		manager := NewManagerWithDir(executor, logger, configMgr, t.TempDir())
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -473,6 +494,7 @@ func TestGenerateWireGuardKey(t *testing.T) {
 	logger := &mockLogger{}
 	configMgr := &mockConfigManager{}
 	manager := NewManager(executor, logger, configMgr)
+	manager.routeMgr = newFakeRoutes()
 
 	private, public, err := manager.GenerateWireGuardKey()
 	assert.NoError(t, err)
@@ -545,6 +567,7 @@ func TestConnect_ErrorCases(t *testing.T) {
 			vpnConfigs: nil, // Will return error
 		}
 		manager := NewManager(executor, logger, configMgr)
+		manager.routeMgr = newFakeRoutes()
 
 		err := manager.Connect("nonexistent")
 		assert.Error(t, err)
@@ -562,6 +585,7 @@ func TestConnect_ErrorCases(t *testing.T) {
 			},
 		}
 		manager := NewManager(executor, logger, configMgr)
+		manager.routeMgr = newFakeRoutes()
 
 		err := manager.Connect("test")
 		assert.Error(t, err)
@@ -578,6 +602,7 @@ func TestDisconnect_ErrorCases(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		err := manager.Disconnect("test")
 		assert.Error(t, err)
@@ -587,9 +612,7 @@ func TestDisconnect_ErrorCases(t *testing.T) {
 	t.Run("disconnect with tracked state returns disconnect error", func(t *testing.T) {
 		tempDir := t.TempDir()
 		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip route show": "",
-			},
+			commands: map[string]string{},
 			errors: map[string]error{
 				"ip link delete wg0": assert.AnError,
 			},
@@ -597,6 +620,7 @@ func TestDisconnect_ErrorCases(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		// Create state file
 		os.WriteFile(filepath.Join(tempDir, "active-vpn"), []byte("test|wg0|wireguard||"), 0600)
@@ -876,6 +900,7 @@ func TestGenerateWireGuardKey_Coverage(t *testing.T) {
 	logger := &mockLogger{}
 	configMgr := &mockConfigManager{}
 	manager := NewManager(executor, logger, configMgr)
+	manager.routeMgr = newFakeRoutes()
 
 	// Run multiple times to ensure randomness
 	for i := 0; i < 5; i++ {
@@ -895,6 +920,7 @@ func TestActiveVPNStateFile(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		result := manager.getActiveVPN()
 		assert.Equal(t, "", result)
@@ -906,6 +932,7 @@ func TestActiveVPNStateFile(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		// Set active VPN
 		err := manager.setActiveVPNState(vpnState{Name: "test-vpn"})
@@ -922,6 +949,7 @@ func TestActiveVPNStateFile(t *testing.T) {
 		logger := &mockLogger{}
 		configMgr := &mockConfigManager{}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		// Create the file first
 		activeVPNFile := filepath.Join(tempDir, "active-vpn")
@@ -966,6 +994,7 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 			},
 		}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -1010,6 +1039,7 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 			},
 		}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -1050,6 +1080,7 @@ func TestListVPNs_WithActiveVPNStateFile(t *testing.T) {
 			},
 		}
 		manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+		manager.routeMgr = newFakeRoutes()
 
 		vpns, err := manager.ListVPNs()
 		assert.NoError(t, err)
@@ -1065,8 +1096,6 @@ func TestConnect_SetsActiveVPNStateFile(t *testing.T) {
 
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			// Getting current gateway for state file - getCurrentGateway first tries "ip route show default"
-			"ip route show default": "default via 192.168.1.1 dev eth0",
 			// WireGuard commands
 			"install -m 0600 /dev/stdin " + tempDir + "/wg.conf": "",
 			"ip link add dev wg0 type wireguard":                 "",
@@ -1089,6 +1118,11 @@ func TestConnect_SetsActiveVPNStateFile(t *testing.T) {
 		},
 	}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+	// Gateway detection now goes through the RouteManager (netlink), not the
+	// executor. Inject a fake default route: 192.168.1.1 via eth0.
+	manager.routeMgr = &fake.RouteManager{
+		Routes: []types.Route{{Gw: "192.168.1.1", Iface: "eth0"}},
+	}
 
 	err := manager.Connect("test-vpn")
 	assert.NoError(t, err)
@@ -1253,12 +1287,12 @@ func TestDisconnect_ClearsActiveVPNStateFile(t *testing.T) {
 			"ip link show type wireguard": "",
 			"ip link delete wg0":          "",
 			"ip link set tun0 down":       "",
-			"ip route show":               "",
 		},
 	}
 	logger := &mockLogger{}
 	configMgr := &mockConfigManager{}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	err := manager.Disconnect("test-vpn")
 	assert.NoError(t, err)
@@ -1275,9 +1309,7 @@ func TestDisconnect_WireGuardAlreadyGone(t *testing.T) {
 	os.WriteFile(activeVPNFile, []byte("test|wg0|wireguard||"), 0600)
 
 	executor := &mockSystemExecutor{
-		commands: map[string]string{
-			"ip route show": "",
-		},
+		commands: map[string]string{},
 		errors: map[string]error{
 			// Delete fails and the probe confirms the interface is gone, so the
 			// disconnect should still succeed and clear state.
@@ -1288,6 +1320,7 @@ func TestDisconnect_WireGuardAlreadyGone(t *testing.T) {
 	logger := &mockLogger{}
 	configMgr := &mockConfigManager{}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	err := manager.Disconnect("test")
 	assert.NoError(t, err)
@@ -1397,6 +1430,7 @@ func TestDisconnect_NameMismatchIsError(t *testing.T) {
 	executor := &mockSystemExecutor{}
 	logger := &mockLogger{}
 	manager := NewManagerWithDir(executor, logger, &mockConfigManager{}, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	err := manager.setActiveVPNState(vpnState{Name: "work", Type: "netbird", Interface: "wt0"})
 	assert.NoError(t, err)
@@ -1415,11 +1449,11 @@ func TestDisconnect_RemovesPersistedEndpointRoute(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			"ip link delete wg0": "",
-			"ip route show":      "default via 192.168.1.1 dev eth0",
 		},
 	}
 	logger := &mockLogger{}
 	manager := NewManagerWithDir(executor, logger, &mockConfigManager{}, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	// Simulate the state written by a previous process's Connect
 	err := manager.setActiveVPNState(vpnState{
@@ -1491,6 +1525,7 @@ func TestListVPNs_StateFileVerifiedAgainstLiveStatus(t *testing.T) {
 		},
 	}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	vpns, err := manager.ListVPNs()
 	assert.NoError(t, err)
@@ -1504,11 +1539,9 @@ func TestConnect_RemovesOldEndpointRouteOnSwitch(t *testing.T) {
 	tempDir := t.TempDir()
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":    "default via 192.168.1.1 dev eth0",
 			"netbird up --disable-dns": "",
 			"netbird status --json":    `{"daemonStatus":"Connected"}`,
 			"netbird down":             "",
-			"ip route show":            "default via 192.168.1.1 dev eth0",
 		},
 	}
 	logger := &mockLogger{}
@@ -1518,6 +1551,7 @@ func TestConnect_RemovesOldEndpointRouteOnSwitch(t *testing.T) {
 		},
 	}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	// Existing WireGuard VPN with a protective endpoint route recorded.
 	err := manager.setActiveVPNState(vpnState{
@@ -1557,6 +1591,7 @@ func TestListVPNs_AmbiguousSameTypeNotBothConnected(t *testing.T) {
 		},
 	}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
+	manager.routeMgr = newFakeRoutes()
 
 	vpns, err := manager.ListVPNs()
 	assert.NoError(t, err)
