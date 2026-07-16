@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	fwfake "github.com/angelfreak/net/pkg/firewall/fake"
 	"github.com/angelfreak/net/pkg/netlink/fake"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
@@ -123,6 +124,11 @@ func setupTestManager() (*dhcpManagerImpl, *mockExecutor) {
 	// Tests that need to inspect or fail link operations access it via
 	// mgr.linkMgr.(*fake.LinkManager).
 	mgr.linkMgr = &fake.LinkManager{}
+
+	// Inject an in-memory fake FirewallManager so setupNAT/cleanupNAT never
+	// reach the real go-iptables backend. Tests that assert on NAT rules access
+	// it via mgr.firewall.(*fwfake.Manager).
+	mgr.firewall = &fwfake.Manager{}
 
 	return mgr, executor
 }
@@ -802,10 +808,9 @@ func TestStart_SetsUpNAT(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "1", string(data))
 
-	// Verify NAT commands were called
-	assert.Contains(t, executor.called, "iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE")
-	assert.Contains(t, executor.called, "iptables -A FORWARD -i eth0 -j ACCEPT")
-	assert.Contains(t, executor.called, "iptables -A FORWARD -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+	// Verify NAT was enabled for the DHCP interface out via wlan0
+	fw := mgr.firewall.(*fwfake.Manager)
+	assert.Contains(t, fw.Enabled, fwfake.NATCall{Internal: "eth0", Out: "wlan0"})
 }
 
 func TestStart_NATSkippedWhenNoOutboundInterface(t *testing.T) {
@@ -897,10 +902,9 @@ func TestStop_CleansUpNAT(t *testing.T) {
 	err := mgr.Stop()
 	assert.NoError(t, err)
 
-	// Verify NAT cleanup commands were issued
-	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE")
-	assert.Contains(t, executor.called, "iptables -D FORWARD -i eth0 -j ACCEPT")
-	assert.Contains(t, executor.called, "iptables -D FORWARD -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+	// Verify NAT was disabled for the DHCP interface out via wlan0
+	fw := mgr.firewall.(*fwfake.Manager)
+	assert.Contains(t, fw.Disabled, fwfake.NATCall{Internal: "eth0", Out: "wlan0"})
 
 	// No prior value recorded, so forwarding should be disabled (default "0").
 	data, err := os.ReadFile(ipfPath)
@@ -927,7 +931,8 @@ func TestStop_RecoverStateFromFile(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Should have recovered outInterface from state file and cleaned up NAT
-	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE")
+	fw := mgr.firewall.(*fwfake.Manager)
+	assert.Contains(t, fw.Disabled, fwfake.NATCall{Internal: "eth0", Out: "wlan0"})
 }
 
 // Teardown must restore the pre-server ip_forward value, not force it to 0.
@@ -979,7 +984,8 @@ func TestStop_CleansNATWhenDaemonAlreadyDead(t *testing.T) {
 
 	err := mgr.Stop()
 	assert.NoError(t, err)
-	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE",
+	fw := mgr.firewall.(*fwfake.Manager)
+	assert.Contains(t, fw.Disabled, fwfake.NATCall{Internal: "eth0", Out: "wlan0"},
 		"NAT masquerade rule must be removed even when the daemon already died")
 
 	// Prior value recorded in state ("0") must be restored.

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/firewall"
 	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
@@ -23,9 +24,10 @@ type dhcpManagerImpl struct {
 	leasesFile      string
 	stateFile       string // Persists interface and outInterface for crash recovery
 	currentConfig   *types.DHCPServerConfig
-	outInterface    string            // Interface for NAT routing (e.g., wlan0)
-	prevIPForward   string            // ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
-	linkMgr         types.LinkManager // netlink-backed link access (interface up/down)
+	outInterface    string                // Interface for NAT routing (e.g., wlan0)
+	prevIPForward   string                // ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
+	linkMgr         types.LinkManager     // netlink-backed link access (interface up/down)
+	firewall        types.FirewallManager // go-iptables-backed NAT rules; nil until first use / injected in tests
 }
 
 // NewDHCPManager creates a new DHCP server manager
@@ -39,6 +41,21 @@ func NewDHCPManager(executor types.SystemExecutor, logger types.Logger) types.DH
 		stateFile:       types.RuntimeDir + "/dhcp-state",
 		linkMgr:         netlink.NewLinkManager(),
 	}
+}
+
+// firewallMgr returns the FirewallManager, constructing the go-iptables-backed
+// one on first use. It is a field so tests can inject a fake. Returns an error
+// if iptables is unavailable.
+func (d *dhcpManagerImpl) firewallMgr() (types.FirewallManager, error) {
+	if d.firewall != nil {
+		return d.firewall, nil
+	}
+	fw, err := firewall.New()
+	if err != nil {
+		return nil, err
+	}
+	d.firewall = fw
+	return d.firewall, nil
 }
 
 // Start starts the DHCP server with the given configuration
@@ -318,24 +335,14 @@ func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
 
 	d.logger.Debug("Setting up NAT", "outInterface", outIface, "dhcpInterface", dhcpIface)
 
-	// Remove existing rules first to prevent duplicates from repeated Start/Stop cycles
-	d.executor.Execute("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
-	d.executor.Execute("iptables", "-D", "FORWARD", "-i", dhcpIface, "-j", "ACCEPT")
-	d.executor.Execute("iptables", "-D", "FORWARD", "-o", dhcpIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-
-	// Setup NAT masquerade
-	if _, err := d.executor.Execute("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE"); err != nil {
-		return fmt.Errorf("failed to setup masquerade: %w", err)
+	// Install MASQUERADE + FORWARD rules idempotently (AppendUnique), replacing
+	// the previous delete-then-add iptables command lines.
+	fw, err := d.firewallMgr()
+	if err != nil {
+		return fmt.Errorf("failed to set up NAT: %w", err)
 	}
-
-	// Allow forwarding from DHCP interface
-	if _, err := d.executor.Execute("iptables", "-A", "FORWARD", "-i", dhcpIface, "-j", "ACCEPT"); err != nil {
-		d.logger.Warn("Failed to setup forward rule", "error", err.Error())
-	}
-
-	// Allow established connections back
-	if _, err := d.executor.Execute("iptables", "-A", "FORWARD", "-o", dhcpIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
-		d.logger.Warn("Failed to setup established forward rule", "error", err.Error())
+	if err := fw.EnableNAT(dhcpIface, outIface); err != nil {
+		return fmt.Errorf("failed to set up NAT: %w", err)
 	}
 
 	d.outInterface = outIface
@@ -364,10 +371,13 @@ func (d *dhcpManagerImpl) detectOutInterface(exclude string) string {
 // cleanupNAT removes NAT rules and disables IP forwarding
 func (d *dhcpManagerImpl) cleanupNAT(dhcpIface string) {
 	if d.outInterface != "" {
-		d.executor.Execute("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", d.outInterface, "-j", "MASQUERADE")
-		if dhcpIface != "" {
-			d.executor.Execute("iptables", "-D", "FORWARD", "-i", dhcpIface, "-j", "ACCEPT")
-			d.executor.Execute("iptables", "-D", "FORWARD", "-o", dhcpIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		// Remove NAT rules (missing rules are tolerated by DisableNAT). When
+		// dhcpIface is empty (recovery path with unknown internal interface),
+		// DisableNAT still removes the MASQUERADE rule.
+		if fw, err := d.firewallMgr(); err == nil {
+			if err := fw.DisableNAT(dhcpIface, d.outInterface); err != nil {
+				d.logger.Warn("Failed to remove NAT rules", "error", err.Error())
+			}
 		}
 	}
 

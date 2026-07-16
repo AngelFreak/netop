@@ -387,3 +387,20 @@ type LinkManager interface {
 	// down; callers are responsible for down/up sequencing.
 	SetMAC(iface, mac string) error
 }
+
+// FirewallManager configures the IPv4 NAT/forwarding rules that let clients on
+// an internal interface (hotspot or DHCP-served) reach the internet through an
+// outbound interface. It wraps iptables (via github.com/coreos/go-iptables),
+// which reduces duplicate-rule and rule-listing bugs versus building iptables
+// command lines by hand. Implementations must return a clear error (never
+// panic) when iptables is unavailable.
+type FirewallManager interface {
+	// EnableNAT installs the three rules needed to share internet from
+	// internalIface out through outIface: MASQUERADE on outIface, FORWARD accept
+	// for traffic from internalIface, and FORWARD accept for established/related
+	// return traffic. Idempotent — re-applying is a no-op.
+	EnableNAT(internalIface, outIface string) error
+	// DisableNAT removes the rules installed by EnableNAT. Missing rules are not
+	// treated as errors.
+	DisableNAT(internalIface, outIface string) error
+}
