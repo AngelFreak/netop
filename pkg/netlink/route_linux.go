@@ -25,6 +25,7 @@ import (
 var (
 	_ types.RouteManager = (*RouteManager)(nil)
 	_ types.AddrManager  = (*AddrManager)(nil)
+	_ types.LinkManager  = (*LinkManager)(nil)
 )
 
 // RouteManager is the Linux/netlink implementation of types.RouteManager.

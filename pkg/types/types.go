@@ -361,3 +361,29 @@ type AddrManager interface {
 	// Flush removes all IPv4 addresses from iface.
 	Flush(iface string) error
 }
+
+// LinkManager provides structured access to network links (interfaces) via
+// netlink, replacing text-parsing of `ip link`. Read operations (Exists,
+// ListByType, GetMAC) are unprivileged; write operations require CAP_NET_ADMIN.
+// Implementations must return a clear error (never panic) when netlink is
+// restricted.
+type LinkManager interface {
+	// SetUp brings the interface administratively up.
+	SetUp(iface string) error
+	// SetDown brings the interface administratively down.
+	SetDown(iface string) error
+	// Delete removes a virtual interface (e.g. a WireGuard device).
+	Delete(iface string) error
+	// Exists reports whether an interface with the given name exists.
+	Exists(iface string) (bool, error)
+	// AddWireGuard creates a WireGuard interface with the given name.
+	AddWireGuard(iface string) error
+	// ListByType returns the names of all interfaces of the given link type
+	// (e.g. "wireguard"), in kernel order.
+	ListByType(linkType string) ([]string, error)
+	// GetMAC returns the hardware (MAC) address of iface as a string.
+	GetMAC(iface string) (string, error)
+	// SetMAC sets the hardware (MAC) address of iface. The interface must be
+	// down; callers are responsible for down/up sequencing.
+	SetMAC(iface, mac string) error
+}

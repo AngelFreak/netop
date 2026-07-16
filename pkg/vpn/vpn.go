@@ -28,6 +28,7 @@ type Manager struct {
 	configMgr     types.ConfigManager
 	routeMgr      types.RouteManager // netlink-backed routing table access (gateway detection, route restore)
 	addrMgr       types.AddrManager  // netlink-backed interface address access (WireGuard iface IP)
+	linkMgr       types.LinkManager  // netlink-backed link access (WireGuard iface create/delete/enumerate)
 	endpointRoute string             // Stores the VPN endpoint IP for cleanup on disconnect
 	runtimeDir    string             // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex         // Protects endpointRoute and serializes Connect/Disconnect/state file operations
@@ -63,6 +64,7 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		configMgr:      configMgr,
 		routeMgr:       netlink.NewRouteManager(),
 		addrMgr:        netlink.NewAddrManager(),
+		linkMgr:        netlink.NewLinkManager(),
 		runtimeDir:     runtimeDir,
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
@@ -227,7 +229,7 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 		if iface == "" {
 			iface = "tun0"
 		}
-		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", iface, "down"); err != nil {
+		if err := m.linkMgr.SetDown(iface); err != nil {
 			m.logger.Debug("Failed to bring down OpenVPN interface", "interface", iface, "error", err)
 		}
 	case "wireguard":
@@ -236,11 +238,11 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 		if iface == "" {
 			iface = "wg0"
 		}
-		if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface); err != nil {
+		if err := m.linkMgr.Delete(iface); err != nil {
 			// The delete may fail because the interface is already gone. Probe
 			// for it; if it is truly absent there is nothing to tear down, so
 			// treat the disconnect as successful rather than trapping the user.
-			if _, probeErr := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "show", iface); probeErr != nil {
+			if exists, probeErr := m.linkMgr.Exists(iface); probeErr != nil || !exists {
 				m.logger.Debug("WireGuard interface already gone", "interface", iface)
 				return nil
 			}
@@ -267,23 +269,11 @@ func (m *Manager) disconnectLegacy() {
 	// Kill OpenVPN processes with SIGKILL fallback
 	m.killProcess("openvpn")
 
-	// Collect WireGuard interfaces to tear down
-	wgInterfaces := []string{}
-
-	// Check for running WireGuard interfaces
-	wgOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "show", "type", "wireguard")
-	if err == nil && strings.TrimSpace(wgOutput) != "" {
-		lines := strings.Split(wgOutput, "\n")
-		for _, line := range lines {
-			// Lines with interface names start with a number and contain the interface
-			if strings.Contains(line, ":") && !strings.HasPrefix(strings.TrimSpace(line), "link") {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					iface := strings.Trim(parts[1], ":")
-					wgInterfaces = append(wgInterfaces, iface)
-				}
-			}
-		}
+	// Collect WireGuard interfaces to tear down (netlink enumeration by type).
+	wgInterfaces, err := m.linkMgr.ListByType("wireguard")
+	if err != nil {
+		m.logger.Debug("Failed to list WireGuard interfaces", "error", err)
+		wgInterfaces = nil
 	}
 
 	// If no WireGuard interfaces found, default to wg0 in case it exists
@@ -302,12 +292,12 @@ func (m *Manager) disconnectLegacy() {
 			defer wg.Done()
 			// For WireGuard, delete the interface entirely (it's a virtual interface)
 			if strings.HasPrefix(ifaceName, "wg") {
-				if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", ifaceName); err != nil {
+				if err := m.linkMgr.Delete(ifaceName); err != nil {
 					m.logger.Debug("Failed to delete WireGuard interface", "interface", ifaceName, "error", err)
 				}
 			} else {
 				// For tun/tap, just bring it down
-				if _, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", ifaceName, "down"); err != nil {
+				if err := m.linkMgr.SetDown(ifaceName); err != nil {
 					m.logger.Debug("Failed to bring down interface", "interface", ifaceName, "error", err)
 				}
 			}
@@ -447,24 +437,17 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 		runningOpenVPN = true
 	}
 
-	// Check WireGuard interfaces (with timeout)
-	// First find all WireGuard interfaces
-	wgOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "show", "type", "wireguard")
-	if err == nil && strings.TrimSpace(wgOutput) != "" {
-		lines := strings.Split(wgOutput, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "wg") {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					iface := strings.Trim(parts[1], ":")
-					// Verify the interface is actually configured (has peers)
-					// A stale interface will have no peers
-					wgShowOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "wg", "show", iface)
-					if err == nil && strings.Contains(wgShowOutput, "peer:") {
-						runningWireGuard[iface] = true
-					}
-				}
-			}
+	// Check WireGuard interfaces: enumerate by type via netlink, then verify
+	// each is actually configured (has peers) via `wg show` — a stale interface
+	// will have no peers.
+	wgIfaces, err := m.linkMgr.ListByType("wireguard")
+	if err != nil {
+		m.logger.Debug("Failed to list WireGuard interfaces", "error", err)
+	}
+	for _, iface := range wgIfaces {
+		wgShowOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "wg", "show", iface)
+		if err == nil && strings.Contains(wgShowOutput, "peer:") {
+			runningWireGuard[iface] = true
 		}
 	}
 
@@ -862,7 +845,7 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 				return fmt.Errorf("openvpn process exited before the tunnel came up")
 			}
 		}
-		if _, err := m.executor.ExecuteWithTimeout(1*time.Second, "ip", "link", "show", device); err == nil {
+		if exists, _ := m.linkMgr.Exists(device); exists {
 			m.logger.Info("OpenVPN tunnel established", "device", device)
 			return nil
 		}
@@ -897,11 +880,11 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 
 	// Create WireGuard interface — if it already exists, delete and recreate
 	// to ensure clean state (no stale routes/config from previous connection)
-	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "add", "dev", iface, "type", "wireguard")
+	err = m.linkMgr.AddWireGuard(iface)
 	if err != nil {
 		m.logger.Debug("WireGuard interface exists, recreating for clean state", "interface", iface)
-		m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "delete", iface)
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "add", "dev", iface, "type", "wireguard")
+		m.linkMgr.Delete(iface)
+		err = m.linkMgr.AddWireGuard(iface)
 		if err != nil {
 			return fmt.Errorf("failed to create WireGuard interface: %w", err)
 		}
@@ -918,16 +901,16 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		err = m.addrMgr.Replace(iface, config.Address)
 		if err != nil {
 			// Clean up interface on failure
-			m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "del", iface)
+			m.linkMgr.Delete(iface)
 			return fmt.Errorf("failed to set WireGuard IP: %w", err)
 		}
 	}
 
 	// Bring interface up
-	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", iface, "up")
+	err = m.linkMgr.SetUp(iface)
 	if err != nil {
 		// Clean up interface on failure
-		m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "del", iface)
+		m.linkMgr.Delete(iface)
 		return fmt.Errorf("failed to bring WireGuard interface up: %w", err)
 	}
 

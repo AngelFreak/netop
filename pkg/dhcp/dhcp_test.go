@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink/fake"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -117,6 +118,11 @@ func setupTestManager() (*dhcpManagerImpl, *mockExecutor) {
 	mgr.dnsmasqConfFile = filepath.Join(tmpDir, "test_dnsmasq_dhcp.conf")
 	mgr.stateFile = filepath.Join(tmpDir, "test_dhcp_state")
 
+	// Use an in-memory fake for interface up/down instead of real netlink.
+	// Tests that need to inspect or fail link operations access it via
+	// mgr.linkMgr.(*fake.LinkManager).
+	mgr.linkMgr = &fake.LinkManager{}
+
 	return mgr, executor
 }
 
@@ -149,8 +155,6 @@ func TestStart_Success(t *testing.T) {
 	}
 
 	// Mock successful commands
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -159,6 +163,11 @@ func TestStart_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, mgr.currentConfig)
 	assert.Equal(t, "eth0", mgr.currentConfig.Interface)
+
+	// Interface should have been brought down then up via the link manager
+	links := mgr.linkMgr.(*fake.LinkManager)
+	assert.Contains(t, links.Downed, "eth0")
+	assert.Contains(t, links.Upped, "eth0")
 
 	// Verify configuration file was created
 	assert.FileExists(t, mgr.dnsmasqConfFile)
@@ -200,7 +209,7 @@ func TestStart_InvalidConfig(t *testing.T) {
 }
 
 func TestStart_AlreadyRunning(t *testing.T) {
-	mgr, executor := setupTestManager()
+	mgr, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.DHCPServerConfig{
@@ -214,9 +223,6 @@ func TestStart_AlreadyRunning(t *testing.T) {
 	defer cleanDnsmasq()
 	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
 
-	// Mock commands
-	executor.commands["ip link set eth0 down"] = ""
-
 	err := mgr.Start(config)
 
 	assert.Error(t, err)
@@ -224,7 +230,7 @@ func TestStart_AlreadyRunning(t *testing.T) {
 }
 
 func TestStart_InterfaceDownFails(t *testing.T) {
-	mgr, executor := setupTestManager()
+	mgr, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.DHCPServerConfig{
@@ -233,7 +239,7 @@ func TestStart_InterfaceDownFails(t *testing.T) {
 		IPRange:   "192.168.100.50,192.168.100.150",
 	}
 
-	executor.errors["ip link set eth0 down"] = fmt.Errorf("operation not permitted")
+	mgr.linkMgr.(*fake.LinkManager).SetDownErr = assert.AnError
 
 	err := mgr.Start(config)
 
@@ -251,8 +257,6 @@ func TestStart_DnsmasqFails(t *testing.T) {
 		IPRange:   "192.168.100.50,192.168.100.150",
 	}
 
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.errors[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = fmt.Errorf("dnsmasq failed")
 
@@ -278,13 +282,15 @@ func TestStop_Success(t *testing.T) {
 
 	executor.commands["kill "+dnsmasqPid] = ""
 	executor.commands["ip addr flush dev eth0"] = ""
-	executor.commands["ip link set eth0 down"] = ""
 
 	err := mgr.Stop()
 
 	assert.NoError(t, err)
 	assert.Nil(t, mgr.currentConfig)
 	assert.NoFileExists(t, mgr.dnsmasqPidFile)
+
+	// Interface should have been brought down via the link manager
+	assert.Contains(t, mgr.linkMgr.(*fake.LinkManager).Downed, "eth0")
 }
 
 func TestStop_NotRunning(t *testing.T) {
@@ -440,8 +446,6 @@ func TestStart_WithCustomNetmask(t *testing.T) {
 	}
 
 	// Mock successful commands with custom netmask
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 10.0.0.1/16 dev eth0"] = "" // Should use /16 not /24
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -462,8 +466,6 @@ func TestStart_WithDefaultNetmask(t *testing.T) {
 	}
 
 	// Mock successful commands
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = "" // Should default to /24
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -648,7 +650,6 @@ func TestStop_CleansUpLeaseFile(t *testing.T) {
 
 	executor.commands["kill "+dnsmasqPid] = ""
 	executor.commands["ip addr flush dev eth0"] = ""
-	executor.commands["ip link set eth0 down"] = ""
 
 	err = mgr.Stop()
 	assert.NoError(t, err)
@@ -670,8 +671,6 @@ func TestStart_Success_SetsLeasefile(t *testing.T) {
 		LeaseTime: "24h",
 	}
 
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -782,8 +781,6 @@ func TestStart_SetsUpNAT(t *testing.T) {
 	}
 
 	// Mock standard commands
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -811,8 +808,6 @@ func TestStart_NATSkippedWhenNoOutboundInterface(t *testing.T) {
 		IPRange:   "192.168.100.50,192.168.100.150",
 	}
 
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -841,8 +836,6 @@ func TestStart_NATExcludesDHCPInterface(t *testing.T) {
 		IPRange:   "192.168.100.50,192.168.100.150",
 	}
 
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 
@@ -876,7 +869,6 @@ func TestStop_CleansUpNAT(t *testing.T) {
 
 	executor.commands["kill "+dnsmasqPid] = ""
 	executor.commands["ip addr flush dev eth0"] = ""
-	executor.commands["ip link set eth0 down"] = ""
 
 	err := mgr.Stop()
 	assert.NoError(t, err)
@@ -902,7 +894,6 @@ func TestStop_RecoverStateFromFile(t *testing.T) {
 
 	executor.commands["kill "+dnsmasqPid] = ""
 	executor.commands["ip addr flush dev eth0"] = ""
-	executor.commands["ip link set eth0 down"] = ""
 
 	err := mgr.Stop()
 	assert.NoError(t, err)
@@ -925,7 +916,6 @@ func TestStop_RestoresPriorIPForward(t *testing.T) {
 	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
 	executor.commands["kill "+dnsmasqPid] = ""
 	executor.commands["ip addr flush dev eth0"] = ""
-	executor.commands["ip link set eth0 down"] = ""
 
 	err := mgr.Stop()
 	assert.NoError(t, err)
@@ -943,7 +933,6 @@ func TestStop_CleansNATWhenDaemonAlreadyDead(t *testing.T) {
 	// State on disk, but no running dnsmasq (no pidfile / process).
 	os.WriteFile(mgr.stateFile, []byte("eth0|wlan0|0"), 0600)
 	executor.commands["ip addr flush dev eth0"] = ""
-	executor.commands["ip link set eth0 down"] = ""
 
 	err := mgr.Stop()
 	assert.NoError(t, err)
@@ -962,8 +951,6 @@ func TestStart_PersistsStateFile(t *testing.T) {
 		IPRange:   "192.168.100.50,192.168.100.150",
 	}
 
-	executor.commands["ip link set eth0 down"] = ""
-	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["ip addr add 192.168.100.1/24 dev eth0"] = ""
 	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 	executor.commands["ip route show default"] = "default via 192.168.1.1 dev wlan0"
@@ -1007,8 +994,6 @@ func TestStart_WithDifferentNetmasks(t *testing.T) {
 			}
 
 			// Mock successful commands
-			executor.commands["ip link set eth0 down"] = ""
-			executor.commands["ip link set eth0 up"] = ""
 			executor.commands["ip addr add 10.0.0.1"+tt.expected+" dev eth0"] = ""
 			executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
 

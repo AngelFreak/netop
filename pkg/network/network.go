@@ -28,6 +28,7 @@ type Manager struct {
 	dhcpClient       types.DHCPClientManager
 	routeMgr         types.RouteManager // netlink-backed routing table access
 	addrMgr          types.AddrManager  // netlink-backed interface address access
+	linkMgr          types.LinkManager  // netlink-backed link access (up/down, MAC)
 	dnsOwnershipPath string             // overridable for tests; defaults to types.RuntimeDir/dns-owned
 }
 
@@ -39,6 +40,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		dhcpClient:       dhcpClient,
 		routeMgr:         netlink.NewRouteManager(),
 		addrMgr:          netlink.NewAddrManager(),
+		linkMgr:          netlink.NewLinkManager(),
 		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
 	}
 }
@@ -239,20 +241,17 @@ func (m *Manager) SetMAC(iface, mac string) error {
 	m.logger.Info("Setting MAC address", "interface", iface, "mac", mac)
 
 	// Bring interface down
-	_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", iface, "down")
-	if err != nil {
+	if err := m.linkMgr.SetDown(iface); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)
 	}
 
 	// Set MAC address
-	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", iface, "address", mac)
-	if err != nil {
+	if err := m.linkMgr.SetMAC(iface, mac); err != nil {
 		return fmt.Errorf("failed to set MAC address: %w", err)
 	}
 
 	// Bring interface up
-	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", iface, "up")
-	if err != nil {
+	if err := m.linkMgr.SetUp(iface); err != nil {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
 
@@ -261,23 +260,14 @@ func (m *Manager) SetMAC(iface, mac string) error {
 
 // GetMAC gets the current MAC address
 func (m *Manager) GetMAC(iface string) (string, error) {
-	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "show", iface)
+	mac, err := m.linkMgr.GetMAC(iface)
 	if err != nil {
 		return "", fmt.Errorf("failed to get interface info: %w", err)
 	}
-
-	// Parse MAC from output like: "link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff"
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "link/ether") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				return parts[1], nil
-			}
-		}
+	if mac == "" {
+		return "", fmt.Errorf("MAC address not found in interface output")
 	}
-
-	return "", fmt.Errorf("MAC address not found in interface output")
+	return mac, nil
 }
 
 // SetIP sets IP address and gateway. If metric > 0, it is applied to the default
@@ -504,7 +494,7 @@ func (m *Manager) detectInterface(config *types.NetworkConfig) string {
 		m.logger.Debug("No interface with carrier found, trying to bring interfaces up")
 		for _, candidate := range candidates {
 			// Bring interface up
-			_, err := m.executor.Execute("ip", "link", "set", candidate, "up")
+			err := m.linkMgr.SetUp(candidate)
 			if err != nil {
 				m.logger.Debug("Failed to bring up interface", "interface", candidate, "error", err)
 				continue
@@ -747,7 +737,7 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			m.routeMgr.FlushRoutes(config.Interface)
 
 			m.logger.Info("Bringing up wired interface", "interface", config.Interface)
-			_, err := m.executor.Execute("ip", "link", "set", config.Interface, "up")
+			err := m.linkMgr.SetUp(config.Interface)
 			if err != nil {
 				m.logger.Warn("Failed to bring up wired interface", "interface", config.Interface, "error", err)
 			}
@@ -940,7 +930,7 @@ func (m *Manager) Disconnect(iface string) error {
 	}
 	m.addrMgr.Flush(iface)
 	m.routeMgr.FlushRoutes(iface)
-	if _, err := m.executor.Execute("ip", "link", "set", iface, "down"); err != nil {
+	if err := m.linkMgr.SetDown(iface); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)
 	}
 	return nil
