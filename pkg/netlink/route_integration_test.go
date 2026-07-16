@@ -160,6 +160,106 @@ func TestGetDefaultRouteNoneInNamespace(t *testing.T) {
 	}
 }
 
+// TestRouteOpsInNamespace exercises the T1.3 route operations (AddRoute,
+// FlushRoutes, SetDefaultForIface, GetDefaultRouteForIface) against the real
+// kernel in a namespace. As above, failures are recorded and asserted after
+// ns.Run returns (never t.Fatal inside the closure).
+func TestRouteOpsInNamespace(t *testing.T) {
+	ns := testutil.NewTestNamespace(t)
+	rm := NewRouteManager()
+
+	type result struct {
+		perIface      *routeSnapshot
+		sawCustom     bool
+		flushedGone   bool
+		multiHomeKept bool
+		err           error
+	}
+	var res result
+
+	runErr := ns.Run(func() {
+		mkLink := func(name, cidr string) error {
+			l := &vnl.Dummy{LinkAttrs: vnl.LinkAttrs{Name: name}}
+			if err := vnl.LinkAdd(l); err != nil {
+				return err
+			}
+			if err := vnl.LinkSetUp(l); err != nil {
+				return err
+			}
+			addr, _ := vnl.ParseAddr(cidr)
+			return vnl.AddrAdd(l, addr)
+		}
+		if res.err = mkLink("eth0", "192.168.10.2/24"); res.err != nil {
+			return
+		}
+		if res.err = mkLink("eth1", "192.168.20.2/24"); res.err != nil {
+			return
+		}
+
+		// SetDefaultForIface on eth0, then eth1 — both must coexist (multi-homing).
+		if res.err = rm.SetDefaultForIface("eth0", "192.168.10.1", 100); res.err != nil {
+			return
+		}
+		if res.err = rm.SetDefaultForIface("eth1", "192.168.20.1", 200); res.err != nil {
+			return
+		}
+		// eth0's default must still be present with metric 100.
+		if res.perIface, res.err = snapshotDefaultForIface(rm, "eth0"); res.err != nil {
+			return
+		}
+		// eth1's default must also still be present (not clobbered by eth0's).
+		if _, err := rm.GetDefaultRouteForIface("eth1"); err == nil {
+			res.multiHomeKept = true
+		}
+
+		// AddRoute: a custom route to 10.0.0.0/24 via eth0's gateway.
+		if res.err = rm.AddRoute("eth0", "10.0.0.0/24", "192.168.10.1"); res.err != nil {
+			return
+		}
+		routes, err := rm.ListRoutes()
+		if err != nil {
+			res.err = err
+			return
+		}
+		for _, r := range routes {
+			if r.Dst == "10.0.0.0/24" {
+				res.sawCustom = true
+			}
+		}
+
+		// FlushRoutes on eth0 removes its routes; GetDefaultRouteForIface(eth0)
+		// should then error, while eth1's default survives.
+		if res.err = rm.FlushRoutes("eth0"); res.err != nil {
+			return
+		}
+		_, eth0Err := rm.GetDefaultRouteForIface("eth0")
+		_, eth1Err := rm.GetDefaultRouteForIface("eth1")
+		res.flushedGone = eth0Err != nil && eth1Err == nil
+	})
+	if runErr != nil {
+		t.Fatalf("namespace Run failed: %v", runErr)
+	}
+	if res.err != nil {
+		t.Fatalf("in-namespace operation failed: %v", res.err)
+	}
+
+	if res.perIface.gw != "192.168.10.1" || res.perIface.iface != "eth0" {
+		t.Errorf("per-iface default: got Gw=%q Iface=%q, want 192.168.10.1/eth0", res.perIface.gw, res.perIface.iface)
+	}
+	if res.perIface.metric != 100 {
+		t.Errorf("per-iface default: Metric = %d, want 100", res.perIface.metric)
+	}
+	if !res.multiHomeKept {
+		t.Errorf("SetDefaultForIface clobbered the other interface's default route (multi-homing broken)")
+	}
+	if !res.sawCustom {
+		t.Errorf("AddRoute: custom route 10.0.0.0/24 not found in route table")
+	}
+	if !res.flushedGone {
+		t.Errorf("FlushRoutes: eth0 routes should be gone while eth1 default survives")
+	}
+}
+
 // routeSnapshot captures the fields of a default route for assertion outside
 // the namespace goroutine.
 type routeSnapshot struct {
@@ -171,6 +271,19 @@ type routeSnapshot struct {
 
 func snapshotDefault(rm *RouteManager) (*routeSnapshot, error) {
 	r, err := rm.GetDefaultRoute()
+	if err != nil {
+		return nil, err
+	}
+	return &routeSnapshot{
+		gw:        r.Gw,
+		iface:     r.Iface,
+		metric:    r.Metric,
+		isDefault: r.IsDefault(),
+	}, nil
+}
+
+func snapshotDefaultForIface(rm *RouteManager, iface string) (*routeSnapshot, error) {
+	r, err := rm.GetDefaultRouteForIface(iface)
 	if err != nil {
 		return nil, err
 	}

@@ -62,19 +62,151 @@ func (m *RouteManager) GetDefaultRoute() (*types.Route, error) {
 // device-only and a gateway default can leave the old route in place on some
 // kernels. Clearing first makes the outcome deterministic across kernels.
 func (m *RouteManager) ReplaceDefault(iface, gw string, metric int) error {
+	route, err := buildDefaultRoute(iface, gw, metric)
+	if err != nil {
+		return err
+	}
+
+	// Remove ALL existing IPv4 default routes so exactly one remains afterward.
+	if err := m.deleteDefaultRoutes(0); err != nil {
+		return fmt.Errorf("clearing existing default route: %w", err)
+	}
+
+	if err := vnl.RouteAdd(route); err != nil {
+		return fmt.Errorf("adding default route via %q dev %q: %w", gw, iface, err)
+	}
+	return nil
+}
+
+// SetDefaultForIface installs the IPv4 default route via iface, replacing only
+// the default route already on that interface and leaving default routes on
+// other interfaces intact (multi-homing). When gw is "", a device-only default
+// route via iface is installed (scope link). A metric of 0 leaves it unset.
+func (m *RouteManager) SetDefaultForIface(iface, gw string, metric int) error {
 	link, err := vnl.LinkByName(iface)
 	if err != nil {
 		return fmt.Errorf("resolving interface %q: %w", iface, err)
 	}
+	route, err := buildDefaultRouteForLink(link, gw, metric)
+	if err != nil {
+		return err
+	}
 
+	// Remove only the default route(s) on THIS interface.
+	if err := m.deleteDefaultRoutes(link.Attrs().Index); err != nil {
+		return fmt.Errorf("clearing existing default route on %q: %w", iface, err)
+	}
+
+	if err := vnl.RouteAdd(route); err != nil {
+		return fmt.Errorf("adding default route via %q dev %q: %w", gw, iface, err)
+	}
+	return nil
+}
+
+// buildDefaultRoute resolves iface and returns the netlink default route to
+// install. See buildDefaultRouteForLink.
+func buildDefaultRoute(iface, gw string, metric int) (*vnl.Route, error) {
+	link, err := vnl.LinkByName(iface)
+	if err != nil {
+		return nil, fmt.Errorf("resolving interface %q: %w", iface, err)
+	}
+	return buildDefaultRouteForLink(link, gw, metric)
+}
+
+// buildDefaultRouteForLink builds a netlink IPv4 default route on link. Dst is
+// set explicitly to 0.0.0.0/0 (required for device-only routes). A gateway
+// yields scope UNIVERSE; an empty gateway yields a device-only route (scope
+// LINK).
+func buildDefaultRouteForLink(link vnl.Link, gw string, metric int) (*vnl.Route, error) {
 	route := &vnl.Route{
 		LinkIndex: link.Attrs().Index,
-		Dst:       defaultV4Net(), // explicit 0.0.0.0/0 (required for device-only routes)
+		Dst:       defaultV4Net(),
 		Family:    vnl.FAMILY_V4,
 		Table:     unix.RT_TABLE_MAIN,
 		Priority:  metric,
 	}
+	if gw != "" {
+		gwIP := net.ParseIP(gw)
+		if gwIP == nil {
+			return nil, fmt.Errorf("invalid gateway address %q", gw)
+		}
+		if gwIP.To4() == nil {
+			return nil, fmt.Errorf("gateway %q is not an IPv4 address", gw)
+		}
+		route.Gw = gwIP
+		route.Scope = vnl.SCOPE_UNIVERSE
+	} else {
+		route.Scope = vnl.SCOPE_LINK
+	}
+	return route, nil
+}
 
+// deleteDefaultRoutes removes IPv4 default routes from the main table. When
+// linkIndex is 0, every default route is removed; otherwise only default routes
+// on that link. Missing-route deletions are not treated as errors.
+func (m *RouteManager) deleteDefaultRoutes(linkIndex int) error {
+	routes, err := vnl.RouteListFiltered(vnl.FAMILY_V4, &vnl.Route{Table: unix.RT_TABLE_MAIN}, vnl.RT_FILTER_TABLE)
+	if err != nil {
+		return fmt.Errorf("listing routes: %w", err)
+	}
+	for i := range routes {
+		if !isDefaultDst(routes[i].Dst) {
+			continue
+		}
+		if linkIndex != 0 && routes[i].LinkIndex != linkIndex {
+			continue
+		}
+		if err := vnl.RouteDel(&routes[i]); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("deleting default route: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetDefaultRouteForIface returns the IPv4 default route whose outgoing
+// interface is iface, or an error if none exists on that interface.
+func (m *RouteManager) GetDefaultRouteForIface(iface string) (*types.Route, error) {
+	link, err := vnl.LinkByName(iface)
+	if err != nil {
+		return nil, fmt.Errorf("resolving interface %q: %w", iface, err)
+	}
+	routes, err := vnl.RouteListFiltered(vnl.FAMILY_V4, &vnl.Route{Table: unix.RT_TABLE_MAIN}, vnl.RT_FILTER_TABLE)
+	if err != nil {
+		return nil, fmt.Errorf("listing routes: %w", err)
+	}
+	linkIdx := link.Attrs().Index
+	for i := range routes {
+		r := &routes[i]
+		if !isDefaultDst(r.Dst) || r.LinkIndex != linkIdx {
+			continue
+		}
+		out, err := toRoute(r)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("no default route on interface %q", iface)
+}
+
+// AddRoute adds a route to destination (CIDR) via gw on iface. When gw is "",
+// a device-scoped (onlink) route is added.
+func (m *RouteManager) AddRoute(iface, destination, gw string) error {
+	link, err := vnl.LinkByName(iface)
+	if err != nil {
+		return fmt.Errorf("resolving interface %q: %w", iface, err)
+	}
+	dst, err := parseDestination(destination)
+	if err != nil {
+		return err
+	}
+
+	route := &vnl.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		Family:    vnl.FAMILY_V4,
+		Table:     unix.RT_TABLE_MAIN,
+	}
 	if gw != "" {
 		gwIP := net.ParseIP(gw)
 		if gwIP == nil {
@@ -86,34 +218,30 @@ func (m *RouteManager) ReplaceDefault(iface, gw string, metric int) error {
 		route.Gw = gwIP
 		route.Scope = vnl.SCOPE_UNIVERSE
 	} else {
-		// Device-only default route (e.g. wg0): no gateway, link scope.
 		route.Scope = vnl.SCOPE_LINK
 	}
 
-	// Remove any existing IPv4 default routes so exactly one remains afterward.
-	if err := m.deleteDefaultRoutes(); err != nil {
-		return fmt.Errorf("clearing existing default route: %w", err)
-	}
-
 	if err := vnl.RouteAdd(route); err != nil {
-		return fmt.Errorf("adding default route via %q dev %q: %w", gw, iface, err)
+		return fmt.Errorf("adding route %s via %q dev %q: %w", destination, gw, iface, err)
 	}
 	return nil
 }
 
-// deleteDefaultRoutes removes every IPv4 default route from the main table.
-// Missing-route deletions are not treated as errors.
-func (m *RouteManager) deleteDefaultRoutes() error {
-	routes, err := vnl.RouteListFiltered(vnl.FAMILY_V4, &vnl.Route{Table: unix.RT_TABLE_MAIN}, vnl.RT_FILTER_TABLE)
+// FlushRoutes removes all IPv4 routes associated with iface. Missing-route
+// deletions are not treated as errors.
+func (m *RouteManager) FlushRoutes(iface string) error {
+	link, err := vnl.LinkByName(iface)
 	if err != nil {
-		return fmt.Errorf("listing routes: %w", err)
+		return fmt.Errorf("resolving interface %q: %w", iface, err)
+	}
+	// RouteList filtered by link returns the routes whose oif is this link.
+	routes, err := vnl.RouteList(link, vnl.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("listing routes for %q: %w", iface, err)
 	}
 	for i := range routes {
-		if !isDefaultDst(routes[i].Dst) {
-			continue
-		}
 		if err := vnl.RouteDel(&routes[i]); err != nil && !errors.Is(err, unix.ESRCH) {
-			return fmt.Errorf("deleting default route: %w", err)
+			return fmt.Errorf("deleting route on %q: %w", iface, err)
 		}
 	}
 	return nil
@@ -134,6 +262,22 @@ func (m *RouteManager) ListRoutes() ([]types.Route, error) {
 		out = append(out, *r)
 	}
 	return out, nil
+}
+
+// parseDestination parses a route destination that may be either CIDR notation
+// (e.g. "10.0.0.0/8") or a bare IPv4 host address (e.g. "10.0.0.5", treated as
+// /32), matching the flexibility of `ip route add <dest>`.
+func parseDestination(destination string) (*net.IPNet, error) {
+	if _, dst, err := net.ParseCIDR(destination); err == nil {
+		return dst, nil
+	}
+	if ip := net.ParseIP(destination); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			return &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}, nil
+		}
+		return nil, fmt.Errorf("destination %q is not an IPv4 address", destination)
+	}
+	return nil, fmt.Errorf("invalid destination %q: not a CIDR or IP address", destination)
 }
 
 // defaultV4Net returns the 0.0.0.0/0 network used as an explicit default-route

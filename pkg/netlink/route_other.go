@@ -30,8 +30,28 @@ func (m *RouteManager) GetDefaultRoute() (*types.Route, error) {
 	return nil, ErrUnsupported
 }
 
+// GetDefaultRouteForIface always returns ErrUnsupported on non-Linux platforms.
+func (m *RouteManager) GetDefaultRouteForIface(iface string) (*types.Route, error) {
+	return nil, ErrUnsupported
+}
+
 // ReplaceDefault always returns ErrUnsupported on non-Linux platforms.
 func (m *RouteManager) ReplaceDefault(iface, gw string, metric int) error {
+	return ErrUnsupported
+}
+
+// SetDefaultForIface always returns ErrUnsupported on non-Linux platforms.
+func (m *RouteManager) SetDefaultForIface(iface, gw string, metric int) error {
+	return ErrUnsupported
+}
+
+// AddRoute always returns ErrUnsupported on non-Linux platforms.
+func (m *RouteManager) AddRoute(iface, destination, gw string) error {
+	return ErrUnsupported
+}
+
+// FlushRoutes always returns ErrUnsupported on non-Linux platforms.
+func (m *RouteManager) FlushRoutes(iface string) error {
 	return ErrUnsupported
 }
 

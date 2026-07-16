@@ -320,9 +320,25 @@ type RouteManager interface {
 	// exists. The returned Route correctly represents both gateway and device-only
 	// default routes (see Route).
 	GetDefaultRoute() (*Route, error)
-	// ReplaceDefault installs (or replaces) the IPv4 default route. If gw is "",
-	// a device-only default route via iface is installed. metric of 0 means unset.
+	// GetDefaultRouteForIface returns the IPv4 default route whose outgoing
+	// interface is iface, or an error if none exists on that interface.
+	GetDefaultRouteForIface(iface string) (*Route, error)
+	// ReplaceDefault installs (or replaces) THE IPv4 default route: it clears
+	// every existing default route, then installs one via iface. If gw is "",
+	// a device-only default route is installed. metric of 0 means unset. Use
+	// this when there must be exactly one default route (e.g. VPN restore).
 	ReplaceDefault(iface, gw string, metric int) error
+	// SetDefaultForIface installs the IPv4 default route via iface, replacing
+	// only the default route already on THAT interface and leaving any default
+	// routes on other interfaces intact. Use this for per-interface config that
+	// must coexist with other links (multi-homing). metric of 0 means unset.
+	SetDefaultForIface(iface, gw string, metric int) error
+	// AddRoute adds a route to destination (CIDR) via gw on iface. If gw is "",
+	// a device-scoped route is added. Returns an error if the route already
+	// exists.
+	AddRoute(iface, destination, gw string) error
+	// FlushRoutes removes all IPv4 routes associated with iface.
+	FlushRoutes(iface string) error
 	// ListRoutes returns all IPv4 routes in the main table.
 	ListRoutes() ([]Route, error)
 }
