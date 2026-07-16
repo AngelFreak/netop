@@ -3,6 +3,8 @@ package dhcpclient
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -287,51 +289,62 @@ func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
 }
 
 func TestAcquire_WithHostname_Dhclient(t *testing.T) {
+	tmp := t.TempDir()
+	conf := tmp + "/dhclient.wlan0.conf"
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = false
 	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["timeout 60 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases "+tmp+"/dhclient.wlan0.leases"] = ""
+	executor.commands["rm -f "+conf] = ""
+	executor.commands["timeout 60 dhclient -v -1 -cf "+conf+" wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.runtimeDir = tmp
 
 	err := manager.Acquire("wlan0", "myhost")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "-cf /run/net/dhclient.wlan0.conf")
+	// The dhclient config (written natively) is referenced via -cf.
+	executor.assertCommandExecuted(t, "-cf "+conf)
+	// The config file was actually written with the hostname.
+	data, readErr := os.ReadFile(conf)
+	assert.NoError(t, readErr)
+	assert.Contains(t, string(data), `send host-name "myhost";`)
 }
 
 func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 	// Verify different interfaces use different config files (no race condition)
+	tmp1 := t.TempDir()
+	conf1 := tmp1 + "/dhclient.eth0.conf"
 	executor1 := newMockExecutor()
 	executor1.hasCommands["udhcpc"] = false
 	executor1.hasCommands["dhclient"] = true
 	executor1.commands["pkill -9 -f udhcpc.*eth0"] = ""
 	executor1.commands["pkill -9 -f dhclient.*eth0"] = ""
-	executor1.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases /run/net/dhclient.eth0.leases"] = ""
-	executor1.commands["rm -f /run/net/dhclient.eth0.conf"] = ""
-	executor1.commands["install -m 0600 /dev/stdin /run/net/dhclient.eth0.conf"] = ""
-	executor1.commands["timeout 60 dhclient -v -1 -cf /run/net/dhclient.eth0.conf eth0"] = ""
+	executor1.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases "+tmp1+"/dhclient.eth0.leases"] = ""
+	executor1.commands["rm -f "+conf1] = ""
+	executor1.commands["timeout 60 dhclient -v -1 -cf "+conf1+" eth0"] = ""
 	executor1.commands["ip addr show eth0"] = "inet 10.0.0.50/24"
 	logger1 := &mockLogger{}
 	manager1 := NewManager(executor1, logger1)
+	manager1.runtimeDir = tmp1
 
+	tmp2 := t.TempDir()
+	conf2 := tmp2 + "/dhclient.wlan0.conf"
 	executor2 := newMockExecutor()
 	executor2.hasCommands["udhcpc"] = false
 	executor2.hasCommands["dhclient"] = true
 	executor2.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor2.commands["pkill -9 -f dhclient.*wlan0"] = ""
-	executor2.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
-	executor2.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor2.commands["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = ""
-	executor2.commands["timeout 15 dhclient -v -1 -cf /run/net/dhclient.wlan0.conf wlan0"] = ""
+	executor2.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases "+tmp2+"/dhclient.wlan0.leases"] = ""
+	executor2.commands["rm -f "+conf2] = ""
+	executor2.commands["timeout 15 dhclient -v -1 -cf "+conf2+" wlan0"] = ""
 	executor2.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger2 := &mockLogger{}
 	manager2 := NewManager(executor2, logger2)
+	manager2.runtimeDir = tmp2
 
 	err1 := manager1.Acquire("eth0", "host1")
 	err2 := manager2.Acquire("wlan0", "host2")
@@ -518,13 +531,11 @@ func TestAcquire_DhclientConfigCreationFailure(t *testing.T) {
 	executor.hasCommands["dhclient"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	// Simulate config creation failure
-	executor.errors["install -m 0600 /dev/stdin /run/net/dhclient.wlan0.conf"] = errors.New("permission denied")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	// Point the runtime dir at a non-existent directory so the native config
+	// write (WriteSecureFile) fails.
+	manager.runtimeDir = filepath.Join(t.TempDir(), "does-not-exist")
 
 	// When hostname is specified, config creation failure should be a hard error
 	err := manager.Acquire("wlan0", "myhost")
