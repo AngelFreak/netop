@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 )
@@ -43,6 +44,7 @@ type Manager struct {
 	iface              string
 	associationTimeout time.Duration // Configurable for testing, defaults to 30s
 	dhcpClient         types.DHCPClientManager
+	linkMgr            types.LinkManager // netlink-backed link access (interface up/down)
 }
 
 // NewManager creates a new WiFi manager
@@ -53,6 +55,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, iface string
 		iface:              iface,
 		associationTimeout: 30 * time.Second, // Default timeout
 		dhcpClient:         dhcpClient,
+		linkMgr:            netlink.NewLinkManager(),
 	}
 }
 
@@ -68,7 +71,7 @@ func (m *Manager) Scan() ([]types.WiFiNetwork, error) {
 	m.logger.Info("Scanning for WiFi networks", "interface", m.iface)
 
 	// Bring interface up if needed
-	_, err := m.executor.Execute("ip", "link", "set", m.iface, "up")
+	err := m.linkMgr.SetUp(m.iface)
 	if err != nil {
 		m.logger.Warn("Failed to bring interface up", "error", err)
 	}
@@ -176,7 +179,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	m.executor.Execute("ip", "route", "flush", "dev", m.iface)
 
 	// Bring interface up before starting wpa_supplicant
-	_, err = m.executor.Execute("ip", "link", "set", m.iface, "up")
+	err = m.linkMgr.SetUp(m.iface)
 	if err != nil {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
@@ -243,7 +246,7 @@ func (m *Manager) Disconnect() error {
 	}
 
 	// Bring interface down
-	if _, err := m.executor.Execute("ip", "link", "set", m.iface, "down"); err != nil {
+	if err := m.linkMgr.SetDown(m.iface); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)
 	}
 
@@ -448,7 +451,7 @@ func (m *Manager) detectNetworkSecurity(ssid string) string {
 	// Cache was empty or SSID not found — do a fresh scan.
 	// This happens when the interface was cycled (e.g. MAC change) before connect.
 	// Ensure interface is up first — SetMAC may have cycled it.
-	m.executor.Execute("ip", "link", "set", m.iface, "up")
+	m.linkMgr.SetUp(m.iface)
 	// Brief delay for the driver to initialize after interface up
 	time.Sleep(200 * time.Millisecond)
 	m.logger.Debug("Scan cache empty, running fresh scan for security detection")

@@ -21,6 +21,7 @@ var ErrUnsupported = errors.New("netlink route operations are only supported on 
 var (
 	_ types.RouteManager = (*RouteManager)(nil)
 	_ types.AddrManager  = (*AddrManager)(nil)
+	_ types.LinkManager  = (*LinkManager)(nil)
 )
 
 // RouteManager is the non-Linux stub implementation of types.RouteManager.

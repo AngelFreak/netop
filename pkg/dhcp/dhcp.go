@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/types"
 )
 
@@ -21,8 +22,9 @@ type dhcpManagerImpl struct {
 	leasesFile      string
 	stateFile       string // Persists interface and outInterface for crash recovery
 	currentConfig   *types.DHCPServerConfig
-	outInterface    string // Interface for NAT routing (e.g., wlan0)
-	prevIPForward   string // ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
+	outInterface    string            // Interface for NAT routing (e.g., wlan0)
+	prevIPForward   string            // ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
+	linkMgr         types.LinkManager // netlink-backed link access (interface up/down)
 }
 
 // NewDHCPManager creates a new DHCP server manager
@@ -34,6 +36,7 @@ func NewDHCPManager(executor types.SystemExecutor, logger types.Logger) types.DH
 		dnsmasqConfFile: types.RuntimeDir + "/dnsmasq-dhcp.conf",
 		leasesFile:      types.RuntimeDir + "/dnsmasq-dhcp.leases",
 		stateFile:       types.RuntimeDir + "/dhcp-state",
+		linkMgr:         netlink.NewLinkManager(),
 	}
 }
 
@@ -52,12 +55,12 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 	}
 
 	// Bring interface down
-	if _, err := d.executor.Execute("ip", "link", "set", config.Interface, "down"); err != nil {
+	if err := d.linkMgr.SetDown(config.Interface); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)
 	}
 
 	// Bring interface up
-	if _, err := d.executor.Execute("ip", "link", "set", config.Interface, "up"); err != nil {
+	if err := d.linkMgr.SetUp(config.Interface); err != nil {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
 
@@ -137,7 +140,7 @@ func (d *dhcpManagerImpl) Stop() error {
 		}
 
 		// Bring interface down
-		if _, err := d.executor.Execute("ip", "link", "set", d.currentConfig.Interface, "down"); err != nil {
+		if err := d.linkMgr.SetDown(d.currentConfig.Interface); err != nil {
 			d.logger.Warn("Failed to bring interface down", "error", err.Error())
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/types"
 )
 
@@ -22,8 +23,9 @@ type hotspotManagerImpl struct {
 	dnsmasqConfFile string
 	stateFile       string // Persists hotspot interface and outInterface for crash recovery
 	currentConfig   *types.HotspotConfig
-	outInterface    string // Interface for NAT routing (e.g., eth0)
-	prevIPForward   string // /proc/.../ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
+	outInterface    string            // Interface for NAT routing (e.g., eth0)
+	prevIPForward   string            // /proc/.../ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
+	linkMgr         types.LinkManager // netlink-backed link access (interface up/down)
 }
 
 // NewHotspotManager creates a new hotspot manager
@@ -36,6 +38,7 @@ func NewHotspotManager(executor types.SystemExecutor, logger types.Logger) types
 		hostapdConfFile: types.RuntimeDir + "/hostapd.conf",
 		dnsmasqConfFile: types.RuntimeDir + "/dnsmasq-hotspot.conf",
 		stateFile:       types.RuntimeDir + "/hotspot-state",
+		linkMgr:         netlink.NewLinkManager(),
 	}
 }
 
@@ -111,7 +114,7 @@ func (h *hotspotManagerImpl) Start(config *types.HotspotConfig) error {
 // setupInterface brings up the interface and configures IP (with cleanup on failure)
 func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 	// Bring interface down
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", config.Interface, "down"); err != nil {
+	if err := h.linkMgr.SetDown(config.Interface); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)
 	}
 
@@ -121,7 +124,7 @@ func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 	}
 
 	// Bring interface up
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", config.Interface, "up"); err != nil {
+	if err := h.linkMgr.SetUp(config.Interface); err != nil {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
 
@@ -131,7 +134,7 @@ func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 		netmask = "24"
 	}
 	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", config.Gateway+"/"+netmask, "dev", config.Interface); err != nil {
-		h.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", config.Interface, "down")
+		h.linkMgr.SetDown(config.Interface)
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
 
@@ -141,7 +144,7 @@ func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 // cleanupInterface cleans up interface after a failure
 func (h *hotspotManagerImpl) cleanupInterface(iface string) {
 	h.executor.ExecuteWithTimeout(2*time.Second, "ip", "addr", "flush", "dev", iface)
-	h.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "set", iface, "down")
+	h.linkMgr.SetDown(iface)
 }
 
 // waitForHostapd waits for hostapd to start (up to 5 seconds)
@@ -293,7 +296,7 @@ func (h *hotspotManagerImpl) Stop() error {
 		}
 
 		// Bring interface down
-		if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", h.currentConfig.Interface, "down"); err != nil {
+		if err := h.linkMgr.SetDown(h.currentConfig.Interface); err != nil {
 			h.logger.Warn("Failed to bring interface down", "error", err.Error())
 		}
 
@@ -303,7 +306,7 @@ func (h *hotspotManagerImpl) Stop() error {
 		}
 
 		// Bring interface back up
-		if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "link", "set", h.currentConfig.Interface, "up"); err != nil {
+		if err := h.linkMgr.SetUp(h.currentConfig.Interface); err != nil {
 			h.logger.Warn("Failed to bring interface up", "error", err.Error())
 		}
 	}
