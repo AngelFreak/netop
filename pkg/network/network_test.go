@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,69 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// immutableRecorder records lock/unlock intent. The immutable flag on
+// resolv.conf is now applied via the injected setImmutable func (replacing the
+// old `chattr +i/-i` shell-outs), so tests observe lock/unlock by pointing
+// setImmutable at a recorder instead of asserting on executor commands.
+type immutableCall struct {
+	Path      string
+	Immutable bool
+}
+
+type immutableRecorder struct {
+	calls []immutableCall
+}
+
+func (r *immutableRecorder) set(path string, immutable bool) error {
+	r.calls = append(r.calls, immutableCall{Path: path, Immutable: immutable})
+	return nil
+}
+
+// sawLock reports whether the recorder saw a lock (immutable=true) for path.
+func (r *immutableRecorder) sawLock(path string) bool {
+	for _, c := range r.calls {
+		if c.Path == path && c.Immutable {
+			return true
+		}
+	}
+	return false
+}
+
+// sawUnlock reports whether the recorder saw an unlock (immutable=false) for path.
+func (r *immutableRecorder) sawUnlock(path string) bool {
+	for _, c := range r.calls {
+		if c.Path == path && !c.Immutable {
+			return true
+		}
+	}
+	return false
+}
+
+// orderedImmutableRecorder records the sequence position of the first unlock and
+// last lock via a shared monotonic counter, so a test can assert lock/unlock
+// ordering relative to the resolv.conf clear write (which goes through the
+// executor, a separate sink). Replaces the old index-in-executedCmds tracking
+// that assumed chattr ran through the executor.
+type orderedImmutableRecorder struct {
+	unlockAt int
+	lockAt   int
+	clearAt  int
+}
+
+// set returns a setImmutable func that stamps each call with the next sequence
+// number from now(): the first unlock and the last lock are retained.
+func (r *orderedImmutableRecorder) set(now func() int) func(string, bool) error {
+	return func(path string, immutable bool) error {
+		n := now()
+		if immutable {
+			r.lockAt = n // keep the last lock (the post-DHCP one)
+		} else if r.unlockAt == 0 {
+			r.unlockAt = n // keep the first unlock (before DHCP)
+		}
+		return nil
+	}
+}
+
 // Mock implementations with strict mode - fails on unexpected commands
 type mockSystemExecutor struct {
 	commands       map[string]string
@@ -57,6 +121,10 @@ type mockSystemExecutor struct {
 	inputsReceived map[string]string // Track inputs received by ExecuteWithInput
 	hasCommands    map[string]bool   // which commands are "installed"
 	failOnPattern  string            // If set, fail any command containing this substring
+	// onExecuteWithInput, if set, is called with the full command string at the
+	// start of ExecuteWithInput. Lets a test observe the relative timing of a
+	// write (e.g. the resolv.conf clear) against other recorded events.
+	onExecuteWithInput func(fullCmd string)
 }
 
 func newStrictMockExecutor() *mockSystemExecutor {
@@ -127,6 +195,9 @@ func (m *mockSystemExecutor) ExecuteWithInput(cmd string, input string, args ...
 	m.executedCmds = append(m.executedCmds, fullCmd)
 	if m.inputsReceived != nil {
 		m.inputsReceived[fullCmd] = input
+	}
+	if m.onExecuteWithInput != nil {
+		m.onExecuteWithInput(fullCmd)
 	}
 
 	// Check failOnPattern
@@ -249,59 +320,61 @@ func TestNewManager(t *testing.T) {
 func TestSetDNS(t *testing.T) {
 	t.Run("empty servers unlocks resolv.conf for DHCP", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		// Should unlock resolv.conf so DHCP can write DNS servers
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: rec.set, resolvConfPath: resolv}
 
 		err := manager.SetDNS([]string{})
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+		// Should unlock resolv.conf so DHCP can write DNS servers.
+		assert.True(t, rec.sawUnlock(resolv), "should unlock resolv.conf for DHCP")
 	})
 
 	t.Run("dhcp keyword unlocks resolv.conf for DHCP", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		// Should unlock resolv.conf so DHCP can write DNS servers
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: rec.set, resolvConfPath: resolv}
 
 		err := manager.SetDNS([]string{"dhcp"})
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+		// Should unlock resolv.conf so DHCP can write DNS servers.
+		assert.True(t, rec.sawUnlock(resolv), "should unlock resolv.conf for DHCP")
 	})
 
 	t.Run("valid servers writes resolv.conf with correct content", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["tee /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
+		executor.commands["tee "+resolv] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: rec.set, resolvConfPath: resolv}
 
 		err := manager.SetDNS([]string{"8.8.8.8", "1.1.1.1"})
 		assert.NoError(t, err)
 
-		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
-		executor.assertCommandExecuted(t, "tee /etc/resolv.conf")
-		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
-		executor.assertInputContains(t, "tee /etc/resolv.conf", "nameserver 8.8.8.8")
-		executor.assertInputContains(t, "tee /etc/resolv.conf", "nameserver 1.1.1.1")
+		assert.True(t, rec.sawUnlock(resolv), "should unlock resolv.conf before writing")
+		executor.assertCommandExecuted(t, "tee "+resolv)
+		assert.True(t, rec.sawLock(resolv), "should lock resolv.conf after writing custom DNS")
+		executor.assertInputContains(t, "tee "+resolv, "nameserver 8.8.8.8")
+		executor.assertInputContains(t, "tee "+resolv, "nameserver 1.1.1.1")
 	})
 
 	t.Run("invalid IP addresses are filtered out", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["tee /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
+		executor.commands["tee "+resolv] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: rec.set, resolvConfPath: resolv}
 
 		err := manager.SetDNS([]string{"invalid", "8.8.8.8", "not-an-ip"})
 		assert.NoError(t, err)
 
 		// Only valid IP should be in output
-		input := executor.inputsReceived["tee /etc/resolv.conf"]
+		input := executor.inputsReceived["tee "+resolv]
 		assert.Contains(t, input, "nameserver 8.8.8.8")
 		assert.NotContains(t, input, "invalid")
 		assert.NotContains(t, input, "not-an-ip")
@@ -319,10 +392,11 @@ func TestSetDNS(t *testing.T) {
 
 	t.Run("tee failure returns error", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.errors["tee /etc/resolv.conf"] = fmt.Errorf("permission denied")
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
+		executor.errors["tee "+resolv] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: rec.set, resolvConfPath: resolv}
 
 		err := manager.SetDNS([]string{"8.8.8.8"})
 		assert.Error(t, err)
@@ -331,39 +405,43 @@ func TestSetDNS(t *testing.T) {
 
 	t.Run("does not lock resolv.conf when DNS is DHCP", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, &mockDHCPClient{})
 		manager.routeMgr = newFakeRoutes()
 		manager.addrMgr = newFakeAddrs()
 		manager.linkMgr = newFakeLinks()
+		manager.setImmutable = rec.set
+		manager.resolvConfPath = resolv
 
 		err := manager.SetDNS([]string{"dhcp"})
 		assert.NoError(t, err)
 
 		// Should unlock but NOT re-lock — DHCP needs to write resolv.conf,
 		// and external VPN tools (NetBird, Tailscale) also need to modify it
-		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
-		executor.assertCommandNotExecuted(t, "chattr +i /etc/resolv.conf")
+		assert.True(t, rec.sawUnlock(resolv), "should unlock resolv.conf for DHCP")
+		assert.False(t, rec.sawLock(resolv), "must NOT lock resolv.conf when DNS is dhcp")
 	})
 
 	t.Run("only locks resolv.conf when custom DNS is set", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
-		executor.commands["rm -f /run/net/staging.conf"] = ""
-		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
+		resolv := filepath.Join(t.TempDir(), "resolv.conf")
+		executor.commands["tee "+resolv] = ""
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, &mockDHCPClient{})
 		manager.routeMgr = newFakeRoutes()
 		manager.addrMgr = newFakeAddrs()
 		manager.linkMgr = newFakeLinks()
+		manager.setImmutable = rec.set
+		manager.resolvConfPath = resolv
 
 		err := manager.SetDNS([]string{"8.8.8.8"})
 		assert.NoError(t, err)
 
 		// Should lock when custom DNS is set — prevents DHCP from overwriting
-		executor.assertCommandExecuted(t, "chattr +i /etc/resolv.conf")
+		assert.True(t, rec.sawLock(resolv), "should lock resolv.conf when custom DNS is set")
 	})
 }
 
@@ -373,21 +451,23 @@ func TestSetDNS(t *testing.T) {
 func TestLockDNS_RecordsOwnership(t *testing.T) {
 	tmp := t.TempDir()
 	executor := newMockExecutor()
-	executor.commands["chattr +i /etc/resolv.conf"] = ""
+	rec := &immutableRecorder{}
 	logger := &mockLogger{}
-	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+	// clearDNS() writes to a hardcoded /etc/resolv.conf, so use the default
+	// resolv.conf path (empty -> /etc/resolv.conf) and match the tee key.
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned", setImmutable: rec.set}
 
 	assert.False(t, manager.isDNSOwned())
 	manager.LockDNS()
 	assert.True(t, manager.isDNSOwned(), "LockDNS must mark ownership so ClearDNS can later unlock")
+	assert.True(t, rec.sawLock("/etc/resolv.conf"), "LockDNS must lock resolv.conf")
 
 	// A subsequent clear must actually unlock and drop ownership.
-	executor.commands["chattr -i /etc/resolv.conf"] = ""
 	executor.commands["tee /etc/resolv.conf"] = ""
 	cleared, err := manager.ClearDNSIfOwned()
 	assert.NoError(t, err)
 	assert.True(t, cleared)
-	executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+	assert.True(t, rec.sawUnlock("/etc/resolv.conf"), "ClearDNS must unlock resolv.conf")
 	assert.False(t, manager.isDNSOwned())
 }
 
@@ -415,14 +495,14 @@ func TestResolvConfHasNameserver(t *testing.T) {
 func TestDHCPRenew_UnlocksResolvConf(t *testing.T) {
 	tmp := t.TempDir()
 	executor := newMockExecutor()
-	executor.commands["chattr -i /etc/resolv.conf"] = ""
+	rec := &immutableRecorder{}
 	logger := &mockLogger{}
-	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dhcpClient: &mockDHCPClient{}, dnsOwnershipPath: tmp + "/dns-owned"}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dhcpClient: &mockDHCPClient{}, dnsOwnershipPath: tmp + "/dns-owned", setImmutable: rec.set}
 	manager.markDNSOwned()
 
 	err := manager.DHCPRenew("eth0", "")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+	assert.True(t, rec.sawUnlock("/etc/resolv.conf"), "DHCPRenew must unlock resolv.conf")
 	assert.False(t, manager.isDNSOwned(), "ownership must be released so DHCP DNS takes effect")
 }
 
@@ -630,9 +710,8 @@ func TestStartDHCP(t *testing.T) {
 func TestDHCPRenew(t *testing.T) {
 	t.Run("success - delegates to DHCPClientManager", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient, setImmutable: (&immutableRecorder{}).set}
 
 		err := manager.DHCPRenew("wlan0", "test-hostname")
 		assert.NoError(t, err)
@@ -640,9 +719,8 @@ func TestDHCPRenew(t *testing.T) {
 
 	t.Run("failure - propagates error from DHCPClientManager", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{renewErr: fmt.Errorf("renew failed")}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient, setImmutable: (&immutableRecorder{}).set}
 
 		err := manager.DHCPRenew("wlan0", "")
 		assert.Error(t, err)
@@ -849,7 +927,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["hostname test-host"] = ""
 		logger := &mockLogger{}
 		links := newFakeLinks()
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -874,7 +952,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 	t.Run("wireless with BSSID pinning", func(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -894,14 +972,13 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 
 	t.Run("wired connection with DHCP", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["rm -f /run/net/staging.conf"] = ""
 		executor.commands["tee /run/net/staging.conf"] = ""
 		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		dhcpClient := &mockDHCPClient{}
 		links := newFakeLinks()
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger, dhcpClient: dhcpClient, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -919,7 +996,6 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// After suspend/resume, stale IPs and routes remain on the interface.
 		// Verify that wired connect flushes them before bringing the interface up.
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["rm -f /run/net/staging.conf"] = ""
 		executor.commands["tee /run/net/staging.conf"] = ""
 		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
@@ -927,7 +1003,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		dhcpClient := &mockDHCPClient{}
 		routes := newFakeRoutes()
 		addrs := newFakeAddrs()
-		manager := &Manager{routeMgr: routes, addrMgr: addrs, linkMgr: newFakeLinks(), executor: executor, logger: logger, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: routes, addrMgr: addrs, linkMgr: newFakeLinks(), executor: executor, logger: logger, dhcpClient: dhcpClient, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -947,7 +1023,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
 		addrs := newFakeAddrs()
-		manager := &Manager{routeMgr: routes, addrMgr: addrs, linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: routes, addrMgr: addrs, linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -969,7 +1045,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -989,13 +1065,12 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr flush dev eth0"] = ""
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["rm -f /run/net/staging.conf"] = ""
 		executor.commands["tee /run/net/staging.conf"] = ""
+		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1015,16 +1090,15 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// immutable file, so the post-DHCP lock must be skipped here.
 		tmp := t.TempDir()
 		executor := newMockExecutor()
+		rec := &immutableRecorder{}
 		executor.commands["ip addr flush dev eth0"] = ""
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		executor.commands["ip route add default via 192.168.1.1 dev eth0"] = ""
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
 		// resolv.conf still holds only the placeholder (no DHCP client ran).
 		executor.commands["cat /etc/resolv.conf"] = "# Waiting for DHCP\n"
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned", setImmutable: rec.set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1036,23 +1110,15 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		err := manager.ConnectToConfiguredNetwork(config, "", nil)
 		assert.NoError(t, err)
 
-		unlockCalled := false
 		clearCalled := false
-		lockCalled := false
 		for _, cmd := range executor.executedCmds {
-			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
-				unlockCalled = true
-			}
 			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
 				clearCalled = true
 			}
-			if strings.Contains(cmd, "chattr +i") && strings.Contains(cmd, "resolv.conf") {
-				lockCalled = true
-			}
 		}
-		assert.True(t, unlockCalled, "should unlock resolv.conf for DHCP DNS")
+		assert.True(t, rec.sawUnlock("/etc/resolv.conf"), "should unlock resolv.conf for DHCP DNS")
 		assert.True(t, clearCalled, "should clear resolv.conf before DHCP runs")
-		assert.False(t, lockCalled, "must NOT lock the placeholder-only resolv.conf")
+		assert.False(t, rec.sawLock("/etc/resolv.conf"), "must NOT lock the placeholder-only resolv.conf")
 		assert.False(t, manager.isDNSOwned(), "must not claim DNS ownership when nothing was written")
 		assert.Contains(t, executor.inputsReceived["tee /etc/resolv.conf"], "Waiting for DHCP")
 	})
@@ -1063,13 +1129,22 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// The fix: lock resolv.conf with chattr +i AFTER DHCP completes.
 		tmp := t.TempDir()
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
-		executor.commands["chattr +i /etc/resolv.conf"] = ""
+		rec := &orderedImmutableRecorder{}
 		executor.commands["tee /etc/resolv.conf"] = ""
 		// DHCP wrote a real nameserver, so the post-DHCP lock must fire.
 		executor.commands["cat /etc/resolv.conf"] = "nameserver 192.168.1.1\n"
 		logger := &mockLogger{}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+		// The immutable setter and the resolv.conf clear (tee) share a monotonic
+		// clock so we can assert their relative ordering across the two sinks.
+		var seq int
+		next := func() int { seq++; return seq }
+		manager.setImmutable = rec.set(next)
+		executor.onExecuteWithInput = func(cmd string) {
+			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") && rec.clearAt == 0 {
+				rec.clearAt = next()
+			}
+		}
 
 		// No DNS configured = DHCP handles DNS
 		config := &types.NetworkConfig{
@@ -1087,30 +1162,11 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Verify the sequence: unlock -> clear -> (DHCP via wifi connect) -> lock
-		unlockIdx := -1
-		clearIdx := -1
-		lockIdx := -1
-		for i, cmd := range executor.executedCmds {
-			if strings.Contains(cmd, "chattr -i") && strings.Contains(cmd, "resolv.conf") {
-				if unlockIdx == -1 {
-					unlockIdx = i
-				}
-			}
-			if strings.Contains(cmd, "tee") && strings.Contains(cmd, "resolv.conf") {
-				if clearIdx == -1 {
-					clearIdx = i
-				}
-			}
-			if strings.Contains(cmd, "chattr +i") && strings.Contains(cmd, "resolv.conf") {
-				lockIdx = i // last lock is the one after connection
-			}
-		}
-
-		assert.True(t, unlockIdx >= 0, "should unlock resolv.conf before DHCP")
-		assert.True(t, clearIdx >= 0, "should clear resolv.conf before DHCP")
-		assert.True(t, lockIdx >= 0, "should lock resolv.conf after DHCP to prevent netbird overwrite")
-		assert.True(t, unlockIdx < clearIdx, "unlock should come before clear")
-		assert.True(t, clearIdx < lockIdx, "lock should come after clear (i.e., after DHCP)")
+		assert.True(t, rec.unlockAt > 0, "should unlock resolv.conf before DHCP")
+		assert.True(t, rec.clearAt > 0, "should clear resolv.conf before DHCP")
+		assert.True(t, rec.lockAt > 0, "should lock resolv.conf after DHCP to prevent netbird overwrite")
+		assert.True(t, rec.unlockAt < rec.clearAt, "unlock should come before clear")
+		assert.True(t, rec.clearAt < rec.lockAt, "lock should come after clear (i.e., after DHCP)")
 		// The post-DHCP lock must record ownership so `net stop` can unlock it.
 		assert.True(t, manager.isDNSOwned(), "DHCP-DNS lock must mark ownership")
 	})
@@ -1119,7 +1175,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, dhcpClient: dhcpClient, setImmutable: (&immutableRecorder{}).set}
 
 		// Test wired connection with no interface - system may or may not have eth* interfaces
 		config := &types.NetworkConfig{
@@ -1176,54 +1232,63 @@ func (m *mockWiFiManagerImpl) GetInterface() string {
 func TestClearDNS(t *testing.T) {
 	t.Run("success - removes immutable attribute when netop owns DNS", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
+		rec := &immutableRecorder{}
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
 			executor:         executor,
 			logger:           logger,
 			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+			setImmutable:     rec.set,
 		}
 
 		manager.markDNSOwned()
 
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "chattr -i /etc/resolv.conf")
+		assert.True(t, rec.sawUnlock("/etc/resolv.conf"), "ClearDNS must unlock resolv.conf")
 	})
 
 	t.Run("chattr fails but continues - file not locked", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
+		// Unlock fails (e.g. filesystem doesn't support immutable) but ClearDNS
+		// must still succeed.
+		setImmutable := func(path string, immutable bool) error {
+			return fmt.Errorf("Operation not supported")
+		}
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
 			executor:         executor,
 			logger:           logger,
 			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+			setImmutable:     setImmutable,
 		}
 
 		manager.markDNSOwned()
 
-		// Should still succeed - chattr failure is expected on some filesystems
+		// Should still succeed - immutable-clear failure is expected on some filesystems
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
 	})
 
 	t.Run("no-op when netop does not own DNS", func(t *testing.T) {
 		executor := newMockExecutor()
+		rec := &immutableRecorder{}
 		logger := &mockLogger{}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
 			executor:         executor,
 			logger:           logger,
 			dnsOwnershipPath: t.TempDir() + "/dns-owned",
+			setImmutable:     rec.set,
 		}
 
 		// No markDNSOwned() call — DNS is not owned by netop
 		err := manager.ClearDNS()
 		assert.NoError(t, err)
 		// Should NOT have touched resolv.conf
-		executor.assertCommandNotExecuted(t, "chattr -i /etc/resolv.conf")
+		assert.False(t, rec.sawUnlock("/etc/resolv.conf"), "must not unlock resolv.conf when DNS is not owned")
+		executor.assertCommandNotExecuted(t, "tee /etc/resolv.conf")
 	})
 }
 
@@ -1247,9 +1312,10 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureReturnsError(t *testing.T) {
 	executor.commands["cat /sys/class/net/eth0/carrier"] = "1"
 	logger := &mockLogger{}
 	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
-		executor:   executor,
-		logger:     logger,
-		dhcpClient: &mockDHCPClient{acquireErr: fmt.Errorf("no lease obtained")},
+		executor:     executor,
+		logger:       logger,
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("no lease obtained")},
+		setImmutable: (&immutableRecorder{}).set,
 	}
 
 	config := &types.NetworkConfig{Interface: "eth0"} // wired: no SSID, no static Addr
@@ -1407,9 +1473,8 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 func TestDHCPRenew_ErrorPaths(t *testing.T) {
 	t.Run("dhcp renew fails", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{renewErr: assert.AnError}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient, setImmutable: (&immutableRecorder{}).set}
 
 		err := manager.DHCPRenew("eth0", "")
 		assert.Error(t, err)
@@ -1443,7 +1508,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -1466,7 +1531,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -1510,7 +1575,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1529,7 +1594,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			commands: map[string]string{},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, setImmutable: (&immutableRecorder{}).set}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
