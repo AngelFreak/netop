@@ -45,6 +45,7 @@ type Manager struct {
 	associationTimeout time.Duration // Configurable for testing, defaults to 30s
 	dhcpClient         types.DHCPClientManager
 	linkMgr            types.LinkManager // netlink-backed link access (interface up/down)
+	runtimeDir         string            // overridable for tests; defaults to types.RuntimeDir
 }
 
 // NewManager creates a new WiFi manager
@@ -56,7 +57,18 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, iface string
 		associationTimeout: 30 * time.Second, // Default timeout
 		dhcpClient:         dhcpClient,
 		linkMgr:            netlink.NewLinkManager(),
+		runtimeDir:         types.RuntimeDir,
 	}
+}
+
+// wpaConfigPath returns the path for the wpa_supplicant config file. The
+// runtime dir is overridable in tests.
+func (m *Manager) wpaConfigPath() string {
+	dir := m.runtimeDir
+	if dir == "" {
+		dir = types.RuntimeDir
+	}
+	return dir + "/wpa_supplicant.conf"
 }
 
 // SetAssociationTimeout configures the WiFi association timeout from user config.
@@ -151,7 +163,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	m.logger.Debug("Generated WPA config", "ssid", ssid, "hasBSSID", bssid != "", "security", security)
 
 	// Write config to temp file in secure runtime directory
-	tempConfig := types.RuntimeDir + "/wpa_supplicant.conf"
+	tempConfig := m.wpaConfigPath()
 	// Remove any existing file to avoid permission issues
 	_, err = m.executor.Execute("rm", "-f", tempConfig)
 	if err != nil {
@@ -628,7 +640,7 @@ func (m *Manager) decodeSSID(ssid string) string {
 // Uses install command to atomically create file with correct permissions
 // avoiding TOCTOU race where file exists briefly with wrong permissions
 func (m *Manager) writeFile(path, content string) error {
-	return system.WriteSecureFile(m.executor, path, content)
+	return system.WriteSecureFile(path, content)
 }
 
 func (m *Manager) readFile(path string) (string, error) {

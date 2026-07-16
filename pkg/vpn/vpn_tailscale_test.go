@@ -40,12 +40,13 @@ func TestConnectTailscale_MissingBinary(t *testing.T) {
 }
 
 func TestConnectTailscale_Success(t *testing.T) {
+	tmpDir := t.TempDir()
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip route show default":                                                   "default via 192.168.1.1 dev eth0",
-			"tailscale up --auth-key=file:/run/net/tailscale-authkey":                 "",
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			"tailscale up --auth-key=file:" + tmpDir + "/tailscale-authkey":           "",
 			"tailscale set --accept-dns=false --exit-node=us-1 --accept-routes=false": "",
-			"tailscale status --json":                                                 `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
+			"tailscale status --json": `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
 		},
 	}
 	logger := &mockLogger{}
@@ -58,14 +59,14 @@ func TestConnectTailscale_Success(t *testing.T) {
 			},
 		},
 	}
-	manager := NewManager(executor, logger, configMgr)
+	manager := NewManagerWithDir(executor, logger, configMgr, tmpDir)
 
 	err := manager.Connect("ts")
 	assert.NoError(t, err)
 
 	// The auth key must be passed via file:, never as an argv token, so it
 	// isn't visible in `ps`. The key value must not appear in any command.
-	executor.assertCommandExecuted(t, "tailscale up --auth-key=file:/run/net/tailscale-authkey")
+	executor.assertCommandExecuted(t, "tailscale up --auth-key=file:"+tmpDir+"/tailscale-authkey")
 	executor.assertCommandExecuted(t, "tailscale set --accept-dns=false --exit-node=us-1 --accept-routes=false")
 	for _, cmd := range executor.executedCommands {
 		assert.NotContains(t, cmd, "tskey-auth-xxxxx", "auth key must never appear in a command argument")

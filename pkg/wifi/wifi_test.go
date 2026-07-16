@@ -227,6 +227,7 @@ freq: 2412
 
 func TestConnect(t *testing.T) {
 	t.Run("reconnects even if already connected to different network", func(t *testing.T) {
+		tmp := t.TempDir()
 		// When connected to a different network, disconnect first
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
@@ -238,9 +239,9 @@ SSID: OtherSSID`,
 				"ip addr flush dev wlan0":     "",
 				"ip route flush dev wlan0":    "",
 				// Reconnect commands
-				"mkdir -p /run/wpa_supplicant":                               "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status":                                    "wpa_state=COMPLETED\nssid=TestSSID",
+				"mkdir -p /run/wpa_supplicant":                                  "",
+				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
+				"wpa_cli -i wlan0 status":                                       "wpa_state=COMPLETED\nssid=TestSSID",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0": "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
@@ -251,19 +252,21 @@ SSID: OtherSSID`,
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.runtimeDir = tmp
 
 		err := manager.Connect("TestSSID", "password", "")
 		assert.NoError(t, err)
 	})
 
 	t.Run("needs connection", func(t *testing.T) {
+		tmp := t.TempDir()
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"iw wlan0 link": "Not connected",
 				// Interface-specific wpa_supplicant termination
-				"wpa_cli -i wlan0 terminate":                                 "",
-				"mkdir -p /run/wpa_supplicant":                               "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
+				"wpa_cli -i wlan0 terminate":                                    "",
+				"mkdir -p /run/wpa_supplicant":                                  "",
+				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0":   "",
 				"pkill -9 -f dhclient.*wlan0": "",
@@ -276,26 +279,29 @@ SSID: OtherSSID`,
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.runtimeDir = tmp
 
 		err := manager.Connect("TestSSID", "password", "")
 		assert.NoError(t, err)
 	})
 
 	t.Run("association timeout", func(t *testing.T) {
+		tmp := t.TempDir()
 		// Test that timeout is properly handled when network is unavailable
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"iw wlan0 link": "Not connected",
 				// Interface-specific wpa_supplicant termination
-				"wpa_cli -i wlan0 terminate":                                 "",
-				"mkdir -p /run/wpa_supplicant":                               "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status":                                    "wpa_state=SCANNING", // Never completes
+				"wpa_cli -i wlan0 terminate":                                    "",
+				"mkdir -p /run/wpa_supplicant":                                  "",
+				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
+				"wpa_cli -i wlan0 status":                                       "wpa_state=SCANNING", // Never completes
 			},
 		}
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.runtimeDir = tmp
 		manager.associationTimeout = 1 * time.Second // Short timeout for test
 
 		err := manager.Connect("UnavailableSSID", "password", "")
@@ -329,16 +335,17 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	// After suspend/resume, wpa_supplicant is dead so getCurrentSSID() returns empty.
 	// The full Disconnect() cleanup is skipped, but stale IPs and routes remain
 	// on the interface. Verify that ConnectWithBSSID() always flushes them.
+	tmp := t.TempDir()
 	executor := &recordingExecutor{
 		mockSystemExecutor: mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":                                              "Not connected", // post-hibernation: no current SSID
-				"wpa_cli -i wlan0 terminate":                                 "",
-				"ip addr flush dev wlan0":                                    "",
-				"ip route flush dev wlan0":                                   "",
-				"mkdir -p /run/wpa_supplicant":                               "",
-				"wpa_supplicant -B -i wlan0 -c /run/net/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status":                                    "wpa_state=COMPLETED\nssid=TestSSID",
+				"iw wlan0 link":                "Not connected", // post-hibernation: no current SSID
+				"wpa_cli -i wlan0 terminate":   "",
+				"ip addr flush dev wlan0":      "",
+				"ip route flush dev wlan0":     "",
+				"mkdir -p /run/wpa_supplicant": "",
+				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
+				"wpa_cli -i wlan0 status": "wpa_state=COMPLETED\nssid=TestSSID",
 			},
 		},
 	}
@@ -346,6 +353,7 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 	links := &fake.LinkManager{}
 	manager.linkMgr = links
+	manager.runtimeDir = tmp
 
 	err := manager.Connect("TestSSID", "password", "")
 	assert.NoError(t, err)

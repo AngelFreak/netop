@@ -1018,7 +1018,7 @@ func (m *Manager) getCurrentGateway() (gateway, iface string) {
 // Uses install command to atomically create file with correct permissions
 // avoiding TOCTOU race where file exists briefly with wrong permissions
 func (m *Manager) writeFile(path, content string) error {
-	return system.WriteSecureFile(m.executor, path, content)
+	return system.WriteSecureFile(path, content)
 }
 
 // writeSecretFile writes a credential to a 0600 file named <name> in the
