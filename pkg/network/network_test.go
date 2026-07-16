@@ -24,6 +24,14 @@ func newFakeRoutes() *fake.RouteManager {
 	}
 }
 
+// newFakeAddrs returns a fake AddrManager. Address operations (flush/add,
+// GetConnectionInfo IP read) go through the AddrManager (netlink) rather than
+// the executor, so tests inject this to keep those paths deterministic and off
+// the real kernel.
+func newFakeAddrs() *fake.AddrManager {
+	return &fake.AddrManager{}
+}
+
 func TestMain(m *testing.M) {
 	// Disable the wired-settle delay during tests — it's a real-world
 	// hardware workaround that adds 1.5s per wired connect path and would
@@ -222,6 +230,7 @@ func TestNewManager(t *testing.T) {
 	dhcpClient := &mockDHCPClient{}
 	manager := NewManager(executor, logger, dhcpClient)
 	manager.routeMgr = newFakeRoutes()
+	manager.addrMgr = newFakeAddrs()
 	assert.NotNil(t, manager)
 	assert.Equal(t, executor, manager.executor)
 	assert.Equal(t, logger, manager.logger)
@@ -234,7 +243,7 @@ func TestSetDNS(t *testing.T) {
 		// Should unlock resolv.conf so DHCP can write DNS servers
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{})
 		assert.NoError(t, err)
@@ -246,7 +255,7 @@ func TestSetDNS(t *testing.T) {
 		// Should unlock resolv.conf so DHCP can write DNS servers
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"dhcp"})
 		assert.NoError(t, err)
@@ -259,7 +268,7 @@ func TestSetDNS(t *testing.T) {
 		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"8.8.8.8", "1.1.1.1"})
 		assert.NoError(t, err)
@@ -277,7 +286,7 @@ func TestSetDNS(t *testing.T) {
 		executor.commands["tee /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"invalid", "8.8.8.8", "not-an-ip"})
 		assert.NoError(t, err)
@@ -292,7 +301,7 @@ func TestSetDNS(t *testing.T) {
 	t.Run("all invalid IPs returns error", func(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"invalid", "not-an-ip"})
 		assert.Error(t, err)
@@ -304,7 +313,7 @@ func TestSetDNS(t *testing.T) {
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.errors["tee /etc/resolv.conf"] = fmt.Errorf("permission denied")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetDNS([]string{"8.8.8.8"})
 		assert.Error(t, err)
@@ -317,6 +326,7 @@ func TestSetDNS(t *testing.T) {
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, &mockDHCPClient{})
 		manager.routeMgr = newFakeRoutes()
+		manager.addrMgr = newFakeAddrs()
 
 		err := manager.SetDNS([]string{"dhcp"})
 		assert.NoError(t, err)
@@ -336,6 +346,7 @@ func TestSetDNS(t *testing.T) {
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, &mockDHCPClient{})
 		manager.routeMgr = newFakeRoutes()
+		manager.addrMgr = newFakeAddrs()
 
 		err := manager.SetDNS([]string{"8.8.8.8"})
 		assert.NoError(t, err)
@@ -353,7 +364,7 @@ func TestLockDNS_RecordsOwnership(t *testing.T) {
 	executor := newMockExecutor()
 	executor.commands["chattr +i /etc/resolv.conf"] = ""
 	logger := &mockLogger{}
-	manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
 
 	assert.False(t, manager.isDNSOwned())
 	manager.LockDNS()
@@ -376,13 +387,13 @@ func TestResolvConfHasNameserver(t *testing.T) {
 	t.Run("placeholder only - false", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["cat /etc/resolv.conf"] = "# Waiting for DHCP\n"
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 		assert.False(t, manager.resolvConfHasNameserver())
 	})
 	t.Run("has nameserver - true", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["cat /etc/resolv.conf"] = "# comment\nnameserver 192.168.1.1\n"
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 		assert.True(t, manager.resolvConfHasNameserver())
 	})
 }
@@ -395,7 +406,7 @@ func TestDHCPRenew_UnlocksResolvConf(t *testing.T) {
 	executor := newMockExecutor()
 	executor.commands["chattr -i /etc/resolv.conf"] = ""
 	logger := &mockLogger{}
-	manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger, dhcpClient: &mockDHCPClient{}, dnsOwnershipPath: tmp + "/dns-owned"}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger, dhcpClient: &mockDHCPClient{}, dnsOwnershipPath: tmp + "/dns-owned"}
 	manager.markDNSOwned()
 
 	err := manager.DHCPRenew("eth0", "")
@@ -411,7 +422,7 @@ func TestSetMAC(t *testing.T) {
 		executor.commands["ip link set wlan0 address aa:bb:cc:dd:ee:ff"] = ""
 		executor.commands["ip link set wlan0 up"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "aa:bb:cc:dd:ee:ff")
 		assert.NoError(t, err)
@@ -433,7 +444,7 @@ func TestSetMAC(t *testing.T) {
 		}
 		// Accept any ip link commands
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "random")
 		assert.NoError(t, err)
@@ -461,7 +472,7 @@ func TestSetMAC(t *testing.T) {
 			inputsReceived: make(map[string]string),
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "00:11:??:??:??:??")
 		assert.NoError(t, err)
@@ -483,7 +494,7 @@ func TestSetMAC(t *testing.T) {
 		executor.commands["ip link set wlan0 address 00:11:22:33:44:55"] = ""
 		executor.commands["ip link set wlan0 up"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "permanent")
 		assert.NoError(t, err)
@@ -497,7 +508,7 @@ func TestSetMAC(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.errors["ethtool -P wlan0"] = assert.AnError
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "permanent")
 		assert.Error(t, err)
@@ -508,7 +519,7 @@ func TestSetMAC(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["ethtool -P wlan0"] = "Invalid output"
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "permanent")
 		assert.Error(t, err)
@@ -523,7 +534,7 @@ func TestGetMAC(t *testing.T) {
 		executor.commands["ip link show wlan0"] = `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DORMANT group default qlen 1000
     link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff`
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		mac, err := manager.GetMAC("wlan0")
 		assert.NoError(t, err)
@@ -536,7 +547,7 @@ func TestGetMAC(t *testing.T) {
 		executor.commands["ip link show eth0"] = `3: eth0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state DOWN mode DEFAULT group default qlen 1000
     link/ether 11:22:33:44:55:66 brd ff:ff:ff:ff:ff:ff`
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		mac, err := manager.GetMAC("eth0")
 		assert.NoError(t, err)
@@ -547,7 +558,7 @@ func TestGetMAC(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["ip link show wlan0"] = `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP`
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		_, err := manager.GetMAC("wlan0")
 		assert.Error(t, err)
@@ -558,7 +569,7 @@ func TestGetMAC(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["ip link show wlan0"] = `    link/ether`
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		_, err := manager.GetMAC("wlan0")
 		assert.Error(t, err)
@@ -568,19 +579,18 @@ func TestGetMAC(t *testing.T) {
 func TestSetIP(t *testing.T) {
 	t.Run("full config with addr and gateway", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		executor.commands["ip addr flush dev wlan0"] = ""
-		executor.commands["ip addr add 192.168.1.100/24 dev wlan0"] = ""
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger}
+		addrs := newFakeAddrs()
+		manager := &Manager{routeMgr: routes, addrMgr: addrs, executor: executor, logger: logger}
 
 		err := manager.SetIP("wlan0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.NoError(t, err)
 
-		// Address ops still go through the executor: flush addr, add addr.
-		assert.Len(t, executor.executedCmds, 2)
-		assert.Equal(t, "ip addr flush dev wlan0", executor.executedCmds[0])
-		assert.Equal(t, "ip addr add 192.168.1.100/24 dev wlan0", executor.executedCmds[1])
+		// Address ops go through the AddrManager: flush, then add.
+		assert.Equal(t, []string{"wlan0"}, addrs.Flushed)
+		assert.Len(t, addrs.Added, 1)
+		assert.Equal(t, fake.AddrCall{Iface: "wlan0", CIDR: "192.168.1.100/24"}, addrs.Added[0])
 
 		// The default route goes through the RouteManager (per-interface replace).
 		assert.Len(t, routes.SetForIface, 1)
@@ -593,7 +603,7 @@ func TestAddRoute(t *testing.T) {
 		executor := newStrictMockExecutor()
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger}
+		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.AddRoute("wlan0", "10.0.0.0/24", "192.168.1.1")
 		assert.NoError(t, err)
@@ -607,7 +617,7 @@ func TestFlushRoutes(t *testing.T) {
 		executor := newStrictMockExecutor()
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger}
+		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.FlushRoutes("wlan0")
 		assert.NoError(t, err)
@@ -618,7 +628,7 @@ func TestFlushRoutes(t *testing.T) {
 func TestStartDHCP(t *testing.T) {
 	t.Run("success - delegates to DHCPClientManager", func(t *testing.T) {
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{routeMgr: newFakeRoutes(), dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), dhcpClient: dhcpClient}
 
 		err := manager.StartDHCP("wlan0", "test-hostname")
 		assert.NoError(t, err)
@@ -626,7 +636,7 @@ func TestStartDHCP(t *testing.T) {
 
 	t.Run("failure - propagates error from DHCPClientManager", func(t *testing.T) {
 		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhcp failed")}
-		manager := &Manager{routeMgr: newFakeRoutes(), dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), dhcpClient: dhcpClient}
 
 		err := manager.StartDHCP("wlan0", "")
 		assert.Error(t, err)
@@ -639,7 +649,7 @@ func TestDHCPRenew(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("wlan0", "test-hostname")
 		assert.NoError(t, err)
@@ -649,7 +659,7 @@ func TestDHCPRenew(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{renewErr: fmt.Errorf("renew failed")}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("wlan0", "")
 		assert.Error(t, err)
@@ -669,7 +679,7 @@ func TestFindWirelessInterface(t *testing.T) {
 		type managed
 		channel 6 (2437 MHz), width: 20 MHz, center1: 2437 MHz`
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		result, err := manager.findWirelessInterface()
 		assert.NoError(t, err)
@@ -680,7 +690,7 @@ func TestFindWirelessInterface(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["iw dev"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		_, err := manager.findWirelessInterface()
 		assert.Error(t, err)
@@ -691,7 +701,7 @@ func TestFindWirelessInterface(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.errors["iw dev"] = fmt.Errorf("iw: command not found")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		_, err := manager.findWirelessInterface()
 		assert.Error(t, err)
@@ -699,19 +709,19 @@ func TestFindWirelessInterface(t *testing.T) {
 }
 
 func TestGenerateRandomMAC(t *testing.T) {
-	manager := &Manager{routeMgr: newFakeRoutes()}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs()}
 	mac := manager.generateRandomMAC()
 	assert.Regexp(t, `^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`, mac)
 }
 
 func TestGenerateMacBookProMAC(t *testing.T) {
-	manager := &Manager{routeMgr: newFakeRoutes()}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs()}
 	mac := manager.generateMacBookProMAC()
 	assert.Regexp(t, `^ac:bc:32:[0-9a-f]{2}(:[0-9a-f]{2}){2}$`, mac)
 }
 
 func TestExpandMACTemplate(t *testing.T) {
-	manager := &Manager{routeMgr: newFakeRoutes()}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs()}
 	result := manager.expandMACTemplate("00:??:??:??:??:??")
 	assert.Regexp(t, `^00:[0-9a-f]{2}(:[0-9a-f]{2}){4}$`, result)
 }
@@ -721,7 +731,7 @@ func TestWriteFile(t *testing.T) {
 	t.Run("success - writes temp and moves to target", func(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.writeFile("/etc/test.conf", "test content")
 		assert.NoError(t, err)
@@ -737,7 +747,7 @@ func TestWriteFile(t *testing.T) {
 		executor := newMockExecutor()
 		executor.failOnPattern = "tee"
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.writeFile("/etc/test.conf", "test content")
 		assert.Error(t, err)
@@ -749,7 +759,7 @@ func TestWriteFileDirect(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["tee /tmp/test"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.writeFileDirect("/tmp/test", "content")
 		assert.NoError(t, err)
@@ -763,7 +773,7 @@ func TestWriteFileDirect(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.errors["tee /tmp/test"] = fmt.Errorf("no space left")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.writeFileDirect("/tmp/test", "content")
 		assert.Error(t, err)
@@ -774,7 +784,7 @@ func TestWriteFileDirect(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["tee /tmp/multiline"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		content := "line1\nline2\nline3"
 		err := manager.writeFileDirect("/tmp/multiline", content)
@@ -791,7 +801,7 @@ func TestSetHostname(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["hostname test-host"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetHostname("test-host")
 		assert.NoError(t, err)
@@ -802,7 +812,7 @@ func TestSetHostname(t *testing.T) {
 		executor := newStrictMockExecutor()
 		// No commands expected for empty hostname
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetHostname("")
 		assert.NoError(t, err)
@@ -813,7 +823,7 @@ func TestSetHostname(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.errors["hostname fail-host"] = fmt.Errorf("hostname: you must be root to change the host name")
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetHostname("fail-host")
 		assert.Error(t, err)
@@ -823,7 +833,7 @@ func TestSetHostname(t *testing.T) {
 
 func TestDetectInterface(t *testing.T) {
 	t.Run("configured interface", func(t *testing.T) {
-		manager := &Manager{routeMgr: newFakeRoutes(), logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), logger: &mockLogger{}}
 		config := &types.NetworkConfig{Interface: "eth0"}
 		result := manager.detectInterface(config)
 		assert.Equal(t, "eth0", result)
@@ -831,7 +841,7 @@ func TestDetectInterface(t *testing.T) {
 
 	t.Run("wireless auto-detect", func(t *testing.T) {
 		executor := newMockExecutor()
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 		config := &types.NetworkConfig{SSID: "test-network"}
 		// This will try to detect from actual system interfaces
 		result := manager.detectInterface(config)
@@ -841,36 +851,12 @@ func TestDetectInterface(t *testing.T) {
 
 	t.Run("wired auto-detect", func(t *testing.T) {
 		executor := newMockExecutor()
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 		config := &types.NetworkConfig{}
 		// This will try to detect from actual system interfaces
 		result := manager.detectInterface(config)
 		// Result could be empty or a detected interface
 		assert.True(t, result == "" || len(result) > 0)
-	})
-}
-
-func TestParseIPAddress(t *testing.T) {
-	manager := &Manager{routeMgr: newFakeRoutes(), logger: &mockLogger{}}
-
-	t.Run("valid IP", func(t *testing.T) {
-		output := `1: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>
-    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0`
-		ip := manager.parseIPAddress(output)
-		assert.NotNil(t, ip)
-		assert.Equal(t, "192.168.1.100", ip.String())
-	})
-
-	t.Run("no IP", func(t *testing.T) {
-		output := "no inet here"
-		ip := manager.parseIPAddress(output)
-		assert.Nil(t, ip)
-	})
-
-	t.Run("invalid CIDR", func(t *testing.T) {
-		output := "inet invalidip"
-		ip := manager.parseIPAddress(output)
-		assert.Nil(t, ip)
 	})
 }
 
@@ -882,7 +868,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip link set wlan0 up"] = ""
 		executor.commands["hostname test-host"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -909,7 +895,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip link set wlan0 down"] = ""
 		executor.commands["ip link set wlan0 up"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -936,7 +922,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger, dhcpClient: dhcpClient}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -954,7 +940,6 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// After suspend/resume, stale IPs and routes remain on the interface.
 		// Verify that wired connect flushes them before bringing the interface up.
 		executor := newMockExecutor()
-		executor.commands["ip addr flush dev eth0"] = ""
 		executor.commands["ip link set eth0 up"] = ""
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["rm -f /run/net/staging.conf"] = ""
@@ -963,7 +948,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		logger := &mockLogger{}
 		dhcpClient := &mockDHCPClient{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger, dhcpClient: dhcpClient}
+		addrs := newFakeAddrs()
+		manager := &Manager{routeMgr: routes, addrMgr: addrs, executor: executor, logger: logger, dhcpClient: dhcpClient}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -972,35 +958,19 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		err := manager.ConnectToConfiguredNetwork(config, "", nil)
 		assert.NoError(t, err)
 
-		// Verify flush commands were called (addr via executor, routes via RouteManager)
-		executor.assertCommandExecuted(t, "ip addr flush dev eth0")
+		// Stale state is flushed before the interface is brought up: address
+		// flush via the AddrManager, route flush via the RouteManager.
+		assert.Contains(t, addrs.Flushed, "eth0", "addresses should be flushed on eth0")
 		assert.Contains(t, routes.Flushed, "eth0", "routes should be flushed on eth0")
-
-		// Verify addr flush happens before interface up (route flush is a separate
-		// RouteManager call and not part of the executor command stream).
-		flushAddrIdx := -1
-		ifaceUpIdx := -1
-		for i, cmd := range executor.executedCmds {
-			switch cmd {
-			case "ip addr flush dev eth0":
-				if flushAddrIdx == -1 {
-					flushAddrIdx = i
-				}
-			case "ip link set eth0 up":
-				ifaceUpIdx = i
-			}
-		}
-		assert.True(t, flushAddrIdx < ifaceUpIdx, "flush addr should come before interface up")
 	})
 
 	t.Run("static IP configuration", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["ip link set eth0 up"] = ""
-		executor.commands["ip addr flush dev eth0"] = ""
-		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger}
+		addrs := newFakeAddrs()
+		manager := &Manager{routeMgr: routes, addrMgr: addrs, executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1010,7 +980,8 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 
 		err := manager.ConnectToConfiguredNetwork(config, "", nil)
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "ip addr add 192.168.1.100/24 dev eth0")
+		// Static address added via the AddrManager.
+		assert.Contains(t, addrs.Added, fake.AddrCall{Iface: "eth0", CIDR: "192.168.1.100/24"})
 		// Default route installed per-interface via the RouteManager, with metric.
 		assert.Contains(t, routes.SetForIface, fake.ReplaceCall{Iface: "eth0", Gw: "192.168.1.1", Metric: 100})
 	})
@@ -1022,7 +993,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["ip addr add 192.168.1.100/24 dev eth0"] = ""
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger}
+		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1049,7 +1020,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor.commands["mv /run/net/staging.conf /etc/resolv.conf"] = ""
 		executor.commands["chattr +i /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1079,7 +1050,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// resolv.conf still holds only the placeholder (no DHCP client ran).
 		executor.commands["cat /etc/resolv.conf"] = "# Waiting for DHCP\n"
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1126,7 +1097,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		// DHCP wrote a real nameserver, so the post-DHCP lock must fire.
 		executor.commands["cat /etc/resolv.conf"] = "nameserver 192.168.1.1\n"
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger, dnsOwnershipPath: tmp + "/dns-owned"}
 
 		// No DNS configured = DHCP handles DNS
 		config := &types.NetworkConfig{
@@ -1176,7 +1147,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
 		dhcpClient := &mockDHCPClient{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger, dhcpClient: dhcpClient}
 
 		// Test wired connection with no interface - system may or may not have eth* interfaces
 		config := &types.NetworkConfig{
@@ -1236,7 +1207,7 @@ func TestClearDNS(t *testing.T) {
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(),
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(),
 			executor:         executor,
 			logger:           logger,
 			dnsOwnershipPath: t.TempDir() + "/dns-owned",
@@ -1254,7 +1225,7 @@ func TestClearDNS(t *testing.T) {
 		executor.errors["chattr -i /etc/resolv.conf"] = fmt.Errorf("Operation not supported")
 		executor.commands["tee /etc/resolv.conf"] = ""
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(),
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(),
 			executor:         executor,
 			logger:           logger,
 			dnsOwnershipPath: t.TempDir() + "/dns-owned",
@@ -1270,7 +1241,7 @@ func TestClearDNS(t *testing.T) {
 	t.Run("no-op when netop does not own DNS", func(t *testing.T) {
 		executor := newMockExecutor()
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(),
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(),
 			executor:         executor,
 			logger:           logger,
 			dnsOwnershipPath: t.TempDir() + "/dns-owned",
@@ -1287,7 +1258,7 @@ func TestClearDNS(t *testing.T) {
 func TestStartDHCP_ErrorPath(t *testing.T) {
 	t.Run("dhcp acquire fails - returns error", func(t *testing.T) {
 		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed")}
-		manager := &Manager{routeMgr: newFakeRoutes(), dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), dhcpClient: dhcpClient}
 
 		err := manager.StartDHCP("eth0", "")
 		assert.Error(t, err)
@@ -1304,7 +1275,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureReturnsError(t *testing.T) {
 	executor.commands["ip link set eth0 up"] = ""
 	executor.commands["cat /sys/class/net/eth0/carrier"] = "1"
 	logger := &mockLogger{}
-	manager := &Manager{routeMgr: newFakeRoutes(),
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(),
 		executor:   executor,
 		logger:     logger,
 		dhcpClient: &mockDHCPClient{acquireErr: fmt.Errorf("no lease obtained")},
@@ -1326,7 +1297,7 @@ func TestSetMAC_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "aa:bb:cc:dd:ee:ff")
 		assert.Error(t, err)
@@ -1343,7 +1314,7 @@ func TestSetMAC_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "aa:bb:cc:dd:ee:ff")
 		assert.Error(t, err)
@@ -1361,7 +1332,7 @@ func TestSetMAC_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "aa:bb:cc:dd:ee:ff")
 		assert.Error(t, err)
@@ -1376,7 +1347,7 @@ func TestSetMAC_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		// Empty MAC should generate a random one
 		err := manager.SetMAC("wlan0", "")
@@ -1393,7 +1364,7 @@ func TestGetMAC_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		_, err := manager.GetMAC("wlan0")
 		assert.Error(t, err)
@@ -1407,7 +1378,7 @@ func TestGetMAC_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		_, err := manager.GetMAC("wlan0")
 		assert.Error(t, err)
@@ -1417,33 +1388,20 @@ func TestGetMAC_ErrorPaths(t *testing.T) {
 func TestSetIP_ErrorPaths(t *testing.T) {
 	t.Run("flush fails but continues", func(t *testing.T) {
 		// Flush failure is just a warning, doesn't stop execution
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip addr add 192.168.1.100/24 dev eth0":         "",
-				"ip route add default via 192.168.1.1 dev eth0": "",
-			},
-			errors: map[string]error{
-				"ip addr flush dev eth0": assert.AnError,
-			},
-		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		addrs := newFakeAddrs()
+		addrs.FlushErr = assert.AnError
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: addrs, executor: &mockSystemExecutor{}, logger: logger}
 
 		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.NoError(t, err) // Flush failure is just logged, not returned
 	})
 
 	t.Run("add addr fails", func(t *testing.T) {
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"ip addr flush dev eth0": "",
-			},
-			errors: map[string]error{
-				"ip addr add 192.168.1.100/24 dev eth0": assert.AnError,
-			},
-		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		addrs := newFakeAddrs()
+		addrs.AddErr = assert.AnError
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: addrs, executor: &mockSystemExecutor{}, logger: logger}
 
 		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.Error(t, err)
@@ -1460,7 +1418,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 		logger := &mockLogger{}
 		routes := newFakeRoutes()
 		routes.SetForIfaceErr = assert.AnError
-		manager := &Manager{routeMgr: routes, executor: executor, logger: logger}
+		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetIP("eth0", "192.168.1.100/24", "192.168.1.1", 0)
 		assert.Error(t, err)
@@ -1475,7 +1433,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetIP("eth0", "192.168.1.100/24", "", 0)
 		assert.NoError(t, err)
@@ -1489,7 +1447,7 @@ func TestSetIP_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		err := manager.SetIP("eth0", "", "192.168.1.1", 0)
 		assert.NoError(t, err)
@@ -1501,7 +1459,7 @@ func TestDHCPRenew_ErrorPaths(t *testing.T) {
 		executor := newMockExecutor()
 		executor.commands["chattr -i /etc/resolv.conf"] = ""
 		dhcpClient := &mockDHCPClient{renewErr: assert.AnError}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}, dhcpClient: dhcpClient}
 
 		err := manager.DHCPRenew("eth0", "")
 		assert.Error(t, err)
@@ -1519,7 +1477,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1538,7 +1496,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -1561,7 +1519,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -1581,15 +1539,13 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 	t.Run("static IP fails on addr add", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"ip link set eth0 up":    "",
-				"ip addr flush dev eth0": "",
-			},
-			errors: map[string]error{
-				"ip addr add 192.168.1.100/24 dev eth0": assert.AnError,
+				"ip link set eth0 up": "",
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		addrs := newFakeAddrs()
+		addrs.AddErr = assert.AnError
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: addrs, executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1612,7 +1568,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "eth0",
@@ -1631,7 +1587,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			commands: map[string]string{},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 		config := &types.NetworkConfig{
 			Interface: "wlan0",
@@ -1651,7 +1607,7 @@ func TestAddRoute_Error(t *testing.T) {
 	logger := &mockLogger{}
 	routes := newFakeRoutes()
 	routes.AddErr = assert.AnError
-	manager := &Manager{routeMgr: routes, executor: &mockSystemExecutor{}, logger: logger}
+	manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), executor: &mockSystemExecutor{}, logger: logger}
 
 	err := manager.AddRoute("eth0", "10.0.0.0/24", "192.168.1.1")
 	assert.Error(t, err)
@@ -1661,7 +1617,7 @@ func TestFlushRoutes_Error(t *testing.T) {
 	logger := &mockLogger{}
 	routes := newFakeRoutes()
 	routes.FlushErr = assert.AnError
-	manager := &Manager{routeMgr: routes, executor: &mockSystemExecutor{}, logger: logger}
+	manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), executor: &mockSystemExecutor{}, logger: logger}
 
 	err := manager.FlushRoutes("eth0")
 	assert.Error(t, err)
@@ -1674,7 +1630,7 @@ func TestFindWirelessInterface_MultipleInterfaces(t *testing.T) {
 		},
 	}
 	logger := &mockLogger{}
-	manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: logger}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: logger}
 
 	result, err := manager.findWirelessInterface()
 	assert.NoError(t, err)
@@ -1682,7 +1638,7 @@ func TestFindWirelessInterface_MultipleInterfaces(t *testing.T) {
 }
 
 func TestExpandMACTemplate_FullTemplate(t *testing.T) {
-	manager := &Manager{routeMgr: newFakeRoutes()}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs()}
 
 	// Test with all question marks
 	result := manager.expandMACTemplate("??:??:??:??:??:??")
@@ -1695,7 +1651,7 @@ func TestExpandMACTemplate_FullTemplate(t *testing.T) {
 }
 
 func TestGenerateRandomMAC_IsLocallyAdministered(t *testing.T) {
-	manager := &Manager{routeMgr: newFakeRoutes()}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs()}
 
 	// Generate multiple MACs and verify they're locally administered
 	for i := 0; i < 10; i++ {
@@ -1752,7 +1708,7 @@ func TestGetConnectionInfo_PopulatesSSID(t *testing.T) {
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	executor.commands["cat /etc/resolv.conf"] = "nameserver 1.1.1.1\n"
 	executor.commands["iw dev wlan0 link"] = "Connected to aa:bb:cc:dd:ee:ff\n\tSSID: CoffeeShop\n\tfreq: 2412"
-	manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 
 	conn, err := manager.GetConnectionInfo("wlan0")
 	assert.NoError(t, err)
@@ -1766,7 +1722,7 @@ func TestGetConnectionInfo_NoSSIDForWired(t *testing.T) {
 	executor.commands["ip addr show eth0"] = "inet 10.0.0.5/24"
 	executor.commands["cat /etc/resolv.conf"] = "nameserver 1.1.1.1\n"
 	executor.errors["iw dev eth0 link"] = fmt.Errorf("nl80211 not found (not a wireless interface)")
-	manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 
 	conn, err := manager.GetConnectionInfo("eth0")
 	assert.NoError(t, err)
@@ -1778,21 +1734,21 @@ func TestGetConnectionInfo_NoSSIDForWired(t *testing.T) {
 func TestDisconnect(t *testing.T) {
 	t.Run("full sequence succeeds", func(t *testing.T) {
 		executor := newMockExecutor()
-		executor.commands["ip addr flush dev eth0"] = ""
 		executor.commands["ip link set eth0 down"] = ""
 		dhcp := &mockDHCPClient{}
 		routes := newFakeRoutes()
-		manager := &Manager{routeMgr: routes, executor: executor, logger: &mockLogger{}, dhcpClient: dhcp}
+		addrs := newFakeAddrs()
+		manager := &Manager{routeMgr: routes, addrMgr: addrs, executor: executor, logger: &mockLogger{}, dhcpClient: dhcp}
 
 		err := manager.Disconnect("eth0")
 		assert.NoError(t, err)
-		executor.assertCommandExecuted(t, "ip addr flush dev eth0")
+		assert.Contains(t, addrs.Flushed, "eth0", "addresses should be flushed on eth0")
 		assert.Contains(t, routes.Flushed, "eth0", "routes should be flushed on eth0")
 		executor.assertCommandExecuted(t, "ip link set eth0 down")
 	})
 
 	t.Run("invalid interface name is rejected", func(t *testing.T) {
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: newMockExecutor(), logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: newMockExecutor(), logger: &mockLogger{}}
 		err := manager.Disconnect("eth0; rm -rf /")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid interface")
@@ -1801,7 +1757,7 @@ func TestDisconnect(t *testing.T) {
 	t.Run("link-down failure returns error", func(t *testing.T) {
 		executor := newMockExecutor()
 		executor.errors["ip link set eth0 down"] = fmt.Errorf("device busy")
-		manager := &Manager{routeMgr: newFakeRoutes(), executor: executor, logger: &mockLogger{}}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), executor: executor, logger: &mockLogger{}}
 		err := manager.Disconnect("eth0")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to bring interface down")

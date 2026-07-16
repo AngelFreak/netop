@@ -20,6 +20,13 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 )
 
+// Compile-time assertions that the netlink implementations satisfy the typed
+// manager interfaces.
+var (
+	_ types.RouteManager = (*RouteManager)(nil)
+	_ types.AddrManager  = (*AddrManager)(nil)
+)
+
 // RouteManager is the Linux/netlink implementation of types.RouteManager.
 type RouteManager struct{}
 

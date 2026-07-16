@@ -9,6 +9,9 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 )
 
+// Compile-time assertion that the fake satisfies the interface.
+var _ types.RouteManager = (*RouteManager)(nil)
+
 // RouteManager is an in-memory fake implementation of types.RouteManager.
 //
 // Configure Routes to control what GetDefaultRoute/ListRoutes return. Calls to

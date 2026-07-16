@@ -27,6 +27,7 @@ type Manager struct {
 	logger        types.Logger
 	configMgr     types.ConfigManager
 	routeMgr      types.RouteManager // netlink-backed routing table access (gateway detection, route restore)
+	addrMgr       types.AddrManager  // netlink-backed interface address access (WireGuard iface IP)
 	endpointRoute string             // Stores the VPN endpoint IP for cleanup on disconnect
 	runtimeDir    string             // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex         // Protects endpointRoute and serializes Connect/Disconnect/state file operations
@@ -61,6 +62,7 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		logger:         logger,
 		configMgr:      configMgr,
 		routeMgr:       netlink.NewRouteManager(),
+		addrMgr:        netlink.NewAddrManager(),
 		runtimeDir:     runtimeDir,
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
@@ -913,7 +915,7 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 
 	// Set IP address if specified (use replace to handle existing addresses)
 	if config.Address != "" {
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "replace", config.Address, "dev", iface)
+		err = m.addrMgr.Replace(iface, config.Address)
 		if err != nil {
 			// Clean up interface on failure
 			m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "del", iface)

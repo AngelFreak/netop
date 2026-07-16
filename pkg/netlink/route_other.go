@@ -16,6 +16,13 @@ import (
 // platforms, where rtnetlink is unavailable.
 var ErrUnsupported = errors.New("netlink route operations are only supported on Linux")
 
+// Compile-time assertions that the stub implementations satisfy the typed
+// manager interfaces.
+var (
+	_ types.RouteManager = (*RouteManager)(nil)
+	_ types.AddrManager  = (*AddrManager)(nil)
+)
+
 // RouteManager is the non-Linux stub implementation of types.RouteManager.
 type RouteManager struct{}
 

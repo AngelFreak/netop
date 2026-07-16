@@ -27,6 +27,7 @@ type Manager struct {
 	logger           types.Logger
 	dhcpClient       types.DHCPClientManager
 	routeMgr         types.RouteManager // netlink-backed routing table access
+	addrMgr          types.AddrManager  // netlink-backed interface address access
 	dnsOwnershipPath string             // overridable for tests; defaults to types.RuntimeDir/dns-owned
 }
 
@@ -37,6 +38,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		logger:           logger,
 		dhcpClient:       dhcpClient,
 		routeMgr:         netlink.NewRouteManager(),
+		addrMgr:          netlink.NewAddrManager(),
 		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
 	}
 }
@@ -290,8 +292,7 @@ func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
 	}
 
 	// Flush existing addresses
-	_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "flush", "dev", iface)
-	if err != nil {
+	if err := m.addrMgr.Flush(iface); err != nil {
 		m.logger.Warn("Failed to flush addresses", "error", err)
 	}
 
@@ -309,8 +310,7 @@ func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
 		}
 
 		// Add IP address
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", addr, "dev", iface)
-		if err != nil {
+		if err := m.addrMgr.Add(iface, addr); err != nil {
 			return fmt.Errorf("failed to set IP address: %w", err)
 		}
 	}
@@ -650,10 +650,6 @@ func (m *Manager) waitForCarrier(iface string, timeout time.Duration) bool {
 	return false
 }
 
-func (m *Manager) parseIPAddress(output string) net.IP {
-	return system.ParseIPFromOutput(output)
-}
-
 // ConnectToConfiguredNetwork connects to a network based on the provided configuration
 func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	// Detect interface if not configured
@@ -747,7 +743,7 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			// `route del default` (which would silently delete a VPN's default
 			// route — e.g. a `gateway: true` WireGuard tunnel — when the user
 			// reconnects wired).
-			m.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
+			m.addrMgr.Flush(config.Interface)
 			m.routeMgr.FlushRoutes(config.Interface)
 
 			m.logger.Info("Bringing up wired interface", "interface", config.Interface)
@@ -854,12 +850,11 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 	m.logger.Debug("Getting connection info", "interface", iface)
 
-	// Get IP address
-	ipOutput, err := m.executor.Execute("ip", "addr", "show", iface)
+	// Get IP address (netlink).
+	ip, err := m.addrMgr.GetFirstIPv4(iface)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get IP addresses: %w", err)
 	}
-	ip := m.parseIPAddress(ipOutput)
 
 	// Get gateway from the interface's default route (netlink).
 	var gateway net.IP
@@ -943,7 +938,7 @@ func (m *Manager) Disconnect(iface string) error {
 	if m.dhcpClient != nil {
 		_ = m.dhcpClient.Release(iface)
 	}
-	m.executor.Execute("ip", "addr", "flush", "dev", iface)
+	m.addrMgr.Flush(iface)
 	m.routeMgr.FlushRoutes(iface)
 	if _, err := m.executor.Execute("ip", "link", "set", iface, "down"); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)

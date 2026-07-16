@@ -342,3 +342,22 @@ type RouteManager interface {
 	// ListRoutes returns all IPv4 routes in the main table.
 	ListRoutes() ([]Route, error)
 }
+
+// AddrManager provides structured access to interface IPv4 addresses via
+// netlink, replacing text-parsing of `ip addr`. Read operations (GetFirstIPv4)
+// are unprivileged; write operations (Add/Replace/Flush) require CAP_NET_ADMIN.
+// Implementations must return a clear error (never panic) when netlink is
+// restricted.
+type AddrManager interface {
+	// GetFirstIPv4 returns the first IPv4 address assigned to iface (without the
+	// prefix length), or nil if the interface has no IPv4 address. Replaces
+	// parsing the first `inet` line of `ip addr show`.
+	GetFirstIPv4(iface string) (net.IP, error)
+	// Add assigns the CIDR address (e.g. "10.0.0.1/24") to iface.
+	Add(iface, cidr string) error
+	// Replace assigns the CIDR address to iface, replacing any existing address
+	// with the same prefix (like `ip addr replace`).
+	Replace(iface, cidr string) error
+	// Flush removes all IPv4 addresses from iface.
+	Flush(iface string) error
+}

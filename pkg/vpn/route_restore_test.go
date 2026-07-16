@@ -13,6 +13,7 @@ func newRouteTestManager(t *testing.T, rm *fake.RouteManager) *Manager {
 	t.Helper()
 	m := NewManagerWithDir(&mockSystemExecutor{}, &mockLogger{}, &mockConfigManager{}, t.TempDir())
 	m.routeMgr = rm
+	m.addrMgr = newFakeAddrs()
 	return m
 }
 
