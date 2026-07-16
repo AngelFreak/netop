@@ -282,3 +282,82 @@ type DHCPClientManager interface {
 	Release(iface string) error
 	Renew(iface string, hostname string) error
 }
+
+// Route describes a single routing table entry in structured form. It replaces
+// the fragile text parsing of `ip route show` output.
+//
+// A default route has Dst == nil (or the "default"/0.0.0.0/0 destination). Such a
+// route may be either:
+//   - via a gateway:  Gw is set (e.g. "192.168.1.1")  — a normal LAN default route
+//   - device-only:    Gw == "" and Iface is set        — e.g. `default dev wg0`
+//
+// Callers MUST branch on route existence and the Gw/Iface fields, NOT on
+// "Gw != \"\" && Iface != \"\"" — a device-only default route has an empty Gw and
+// is still a valid, restorable route. Mishandling this is the motivating bug.
+type Route struct {
+	// Dst is the destination network in CIDR form. Empty means the default route.
+	Dst string
+	// Gw is the gateway IP as a string, or "" for a device-only route.
+	Gw string
+	// Iface is the outgoing interface name (may be "" if unresolved).
+	Iface string
+	// Metric is the route priority (0 if unset).
+	Metric int
+}
+
+// IsDefault reports whether this route is the default route (destination 0/0).
+func (r Route) IsDefault() bool {
+	return r.Dst == "" || r.Dst == "default" || r.Dst == "0.0.0.0/0" || r.Dst == "::/0"
+}
+
+// RouteManager provides structured access to the kernel routing table via
+// netlink, replacing text-parsing of the `ip route` command. Read operations
+// (GetDefaultRoute, ListRoutes) are unprivileged; write operations require
+// CAP_NET_ADMIN, which net already holds. Implementations must return a clear
+// error (never panic) when netlink is restricted (e.g. some containers).
+type RouteManager interface {
+	// GetDefaultRoute returns the current IPv4 default route, or an error if none
+	// exists. The returned Route correctly represents both gateway and device-only
+	// default routes (see Route).
+	GetDefaultRoute() (*Route, error)
+	// GetDefaultRouteForIface returns the IPv4 default route whose outgoing
+	// interface is iface, or an error if none exists on that interface.
+	GetDefaultRouteForIface(iface string) (*Route, error)
+	// ReplaceDefault installs (or replaces) THE IPv4 default route: it clears
+	// every existing default route, then installs one via iface. If gw is "",
+	// a device-only default route is installed. metric of 0 means unset. Use
+	// this when there must be exactly one default route (e.g. VPN restore).
+	ReplaceDefault(iface, gw string, metric int) error
+	// SetDefaultForIface installs the IPv4 default route via iface, replacing
+	// only the default route already on THAT interface and leaving any default
+	// routes on other interfaces intact. Use this for per-interface config that
+	// must coexist with other links (multi-homing). metric of 0 means unset.
+	SetDefaultForIface(iface, gw string, metric int) error
+	// AddRoute adds a route to destination (CIDR) via gw on iface. If gw is "",
+	// a device-scoped route is added. Returns an error if the route already
+	// exists.
+	AddRoute(iface, destination, gw string) error
+	// FlushRoutes removes all IPv4 routes associated with iface.
+	FlushRoutes(iface string) error
+	// ListRoutes returns all IPv4 routes in the main table.
+	ListRoutes() ([]Route, error)
+}
+
+// AddrManager provides structured access to interface IPv4 addresses via
+// netlink, replacing text-parsing of `ip addr`. Read operations (GetFirstIPv4)
+// are unprivileged; write operations (Add/Replace/Flush) require CAP_NET_ADMIN.
+// Implementations must return a clear error (never panic) when netlink is
+// restricted.
+type AddrManager interface {
+	// GetFirstIPv4 returns the first IPv4 address assigned to iface (without the
+	// prefix length), or nil if the interface has no IPv4 address. Replaces
+	// parsing the first `inet` line of `ip addr show`.
+	GetFirstIPv4(iface string) (net.IP, error)
+	// Add assigns the CIDR address (e.g. "10.0.0.1/24") to iface.
+	Add(iface, cidr string) error
+	// Replace assigns the CIDR address to iface, replacing any existing address
+	// with the same prefix (like `ip addr replace`).
+	Replace(iface, cidr string) error
+	// Flush removes all IPv4 addresses from iface.
+	Flush(iface string) error
+}

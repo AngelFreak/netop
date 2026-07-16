@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 )
@@ -25,7 +26,9 @@ type Manager struct {
 	executor         types.SystemExecutor
 	logger           types.Logger
 	dhcpClient       types.DHCPClientManager
-	dnsOwnershipPath string // overridable for tests; defaults to types.RuntimeDir/dns-owned
+	routeMgr         types.RouteManager // netlink-backed routing table access
+	addrMgr          types.AddrManager  // netlink-backed interface address access
+	dnsOwnershipPath string             // overridable for tests; defaults to types.RuntimeDir/dns-owned
 }
 
 // NewManager creates a new network manager
@@ -34,6 +37,8 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		executor:         executor,
 		logger:           logger,
 		dhcpClient:       dhcpClient,
+		routeMgr:         netlink.NewRouteManager(),
+		addrMgr:          netlink.NewAddrManager(),
 		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
 	}
 }
@@ -287,8 +292,7 @@ func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
 	}
 
 	// Flush existing addresses
-	_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "flush", "dev", iface)
-	if err != nil {
+	if err := m.addrMgr.Flush(iface); err != nil {
 		m.logger.Warn("Failed to flush addresses", "error", err)
 	}
 
@@ -306,8 +310,7 @@ func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
 		}
 
 		// Add IP address
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", addr, "dev", iface)
-		if err != nil {
+		if err := m.addrMgr.Add(iface, addr); err != nil {
 			return fmt.Errorf("failed to set IP address: %w", err)
 		}
 	}
@@ -318,19 +321,11 @@ func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
 			return fmt.Errorf("invalid gateway %q: must be a valid IP address", gateway)
 		}
 
-		// Remove any pre-existing default route on this interface so `ip route
-		// add` doesn't fail with "File exists" on reconnects. Errors here are
-		// expected (often no route to delete) and ignored.
-		m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "del", "default", "dev", iface)
-
-		// Add default route, with metric when set so multiple links coexist
-		// deterministically (lower metric wins).
-		args := []string{"route", "add", "default", "via", gateway, "dev", iface}
-		if metric > 0 {
-			args = append(args, "metric", fmt.Sprintf("%d", metric))
-		}
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", args...)
-		if err != nil {
+		// Install the default route with metric when set so multiple links
+		// coexist deterministically (lower metric wins). SetDefaultForIface
+		// replaces only THIS interface's default route, leaving other
+		// interfaces' defaults intact — preserving multi-homing.
+		if err := m.routeMgr.SetDefaultForIface(iface, gateway, metric); err != nil {
 			return fmt.Errorf("failed to set gateway: %w", err)
 		}
 	}
@@ -342,16 +337,14 @@ func (m *Manager) SetIP(iface, addr, gateway string, metric int) error {
 func (m *Manager) AddRoute(iface, destination, gateway string) error {
 	m.logger.Info("Adding route", "destination", destination, "gateway", gateway, "interface", iface)
 
-	_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "add", destination, "via", gateway, "dev", iface)
-	return err
+	return m.routeMgr.AddRoute(iface, destination, gateway)
 }
 
 // FlushRoutes removes all routes
 func (m *Manager) FlushRoutes(iface string) error {
 	m.logger.Info("Flushing routes", "interface", iface)
 
-	_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "flush", "dev", iface)
-	return err
+	return m.routeMgr.FlushRoutes(iface)
 }
 
 // SetHostname sets the system hostname
@@ -657,10 +650,6 @@ func (m *Manager) waitForCarrier(iface string, timeout time.Duration) bool {
 	return false
 }
 
-func (m *Manager) parseIPAddress(output string) net.IP {
-	return system.ParseIPFromOutput(output)
-}
-
 // ConnectToConfiguredNetwork connects to a network based on the provided configuration
 func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	// Detect interface if not configured
@@ -754,8 +743,8 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			// `route del default` (which would silently delete a VPN's default
 			// route — e.g. a `gateway: true` WireGuard tunnel — when the user
 			// reconnects wired).
-			m.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
-			m.executor.Execute("ip", "route", "flush", "dev", config.Interface)
+			m.addrMgr.Flush(config.Interface)
+			m.routeMgr.FlushRoutes(config.Interface)
 
 			m.logger.Info("Bringing up wired interface", "interface", config.Interface)
 			_, err := m.executor.Execute("ip", "link", "set", config.Interface, "up")
@@ -861,19 +850,19 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 func (m *Manager) GetConnectionInfo(iface string) (*types.Connection, error) {
 	m.logger.Debug("Getting connection info", "interface", iface)
 
-	// Get IP address
-	ipOutput, err := m.executor.Execute("ip", "addr", "show", iface)
+	// Get IP address (netlink).
+	ip, err := m.addrMgr.GetFirstIPv4(iface)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get IP addresses: %w", err)
 	}
-	ip := m.parseIPAddress(ipOutput)
 
-	// Get gateway
-	routeOutput, err := m.executor.Execute("ip", "route", "show", "dev", iface)
-	if err != nil {
-		m.logger.Debug("Failed to get routes", "error", err)
+	// Get gateway from the interface's default route (netlink).
+	var gateway net.IP
+	if route, rerr := m.routeMgr.GetDefaultRouteForIface(iface); rerr != nil {
+		m.logger.Debug("Failed to get default route", "iface", iface, "error", rerr)
+	} else if route.Gw != "" {
+		gateway = net.ParseIP(route.Gw)
 	}
-	gateway := m.parseGateway(routeOutput)
 
 	// Get DNS servers
 	dns, err := m.getDNSServers()
@@ -917,32 +906,22 @@ func (m *Manager) applyDefaultRouteMetric(iface string, metric int) {
 	if metric <= 0 {
 		return
 	}
-	output, err := m.executor.Execute("ip", "route", "show", "default", "dev", iface)
-	if err != nil || strings.TrimSpace(output) == "" {
+	route, err := m.routeMgr.GetDefaultRouteForIface(iface)
+	if err != nil {
+		// No default route on this interface yet (or netlink error) — nothing
+		// to re-tag with a metric.
 		return
 	}
-	// Parse "default via 10.1.0.1 dev enx... [metric N]" — grab the gateway.
-	fields := strings.Fields(output)
-	var gateway string
-	for i, f := range fields {
-		if f == "via" && i+1 < len(fields) {
-			gateway = fields[i+1]
-			break
-		}
-	}
-	if gateway == "" {
-		m.logger.Debug("No gateway in default route, skipping metric", "iface", iface, "route", output)
+	if route.Gw == "" {
+		m.logger.Debug("No gateway in default route, skipping metric", "iface", iface)
 		return
 	}
-	// Check if metric is already set to the desired value — avoid churn.
-	for i, f := range fields {
-		if f == "metric" && i+1 < len(fields) && fields[i+1] == fmt.Sprintf("%d", metric) {
-			return
-		}
+	// Skip if the metric is already set to the desired value — avoid churn.
+	if route.Metric == metric {
+		return
 	}
-	m.logger.Debug("Applying default route metric", "iface", iface, "gateway", gateway, "metric", metric)
-	m.executor.Execute("ip", "route", "del", "default", "dev", iface)
-	if _, err := m.executor.Execute("ip", "route", "add", "default", "via", gateway, "dev", iface, "metric", fmt.Sprintf("%d", metric)); err != nil {
+	m.logger.Debug("Applying default route metric", "iface", iface, "gateway", route.Gw, "metric", metric)
+	if err := m.routeMgr.SetDefaultForIface(iface, route.Gw, metric); err != nil {
 		m.logger.Warn("Failed to reinstall default route with metric", "iface", iface, "error", err)
 	}
 }
@@ -959,8 +938,8 @@ func (m *Manager) Disconnect(iface string) error {
 	if m.dhcpClient != nil {
 		_ = m.dhcpClient.Release(iface)
 	}
-	m.executor.Execute("ip", "addr", "flush", "dev", iface)
-	m.executor.Execute("ip", "route", "flush", "dev", iface)
+	m.addrMgr.Flush(iface)
+	m.routeMgr.FlushRoutes(iface)
 	if _, err := m.executor.Execute("ip", "link", "set", iface, "down"); err != nil {
 		return fmt.Errorf("failed to bring interface down: %w", err)
 	}
@@ -1006,11 +985,6 @@ func (m *Manager) DisconnectAll() []string {
 		torn = append(torn, name)
 	}
 	return torn
-}
-
-// parseGateway extracts the default gateway from ip route output
-func (m *Manager) parseGateway(output string) net.IP {
-	return system.ParseGatewayFromOutput(output)
 }
 
 // getDNSServers reads DNS servers from /etc/resolv.conf

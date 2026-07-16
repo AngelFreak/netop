@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 	"golang.org/x/crypto/curve25519"
@@ -25,9 +26,11 @@ type Manager struct {
 	executor      types.SystemExecutor
 	logger        types.Logger
 	configMgr     types.ConfigManager
-	endpointRoute string     // Stores the VPN endpoint IP for cleanup on disconnect
-	runtimeDir    string     // Directory for runtime files (active-vpn state file)
-	mu            sync.Mutex // Protects endpointRoute and serializes Connect/Disconnect/state file operations
+	routeMgr      types.RouteManager // netlink-backed routing table access (gateway detection, route restore)
+	addrMgr       types.AddrManager  // netlink-backed interface address access (WireGuard iface IP)
+	endpointRoute string             // Stores the VPN endpoint IP for cleanup on disconnect
+	runtimeDir    string             // Directory for runtime files (active-vpn state file)
+	mu            sync.Mutex         // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 
 	// Status verification polling for daemon-based VPNs (tailscale, netbird).
 	// Their "up" command can return before the tunnel is established, so we
@@ -58,6 +61,8 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		executor:       executor,
 		logger:         logger,
 		configMgr:      configMgr,
+		routeMgr:       netlink.NewRouteManager(),
+		addrMgr:        netlink.NewAddrManager(),
 		runtimeDir:     runtimeDir,
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
@@ -341,13 +346,15 @@ func (m *Manager) removeEndpointRoute(state *vpnState) {
 
 // restoreDefaultRouteFromState restores the default route using saved state
 func (m *Manager) restoreDefaultRouteFromState(state *vpnState) {
-	// Use saved original gateway from state if available
-	if state != nil && state.OriginalGateway != "" && state.OriginalInterface != "" {
+	// A route is restorable as long as we know its outgoing interface. The
+	// gateway may legitimately be empty for a device-only default route (e.g.
+	// the original route was `default dev wg0`). Branching on interface (not
+	// gateway) is what lets device-only routes be restored instead of silently
+	// dropped.
+	if state != nil && state.OriginalInterface != "" {
 		m.logger.Debug("Restoring default route from saved state",
 			"gateway", state.OriginalGateway, "interface", state.OriginalInterface)
-		_, err := m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace",
-			"default", "via", state.OriginalGateway, "dev", state.OriginalInterface)
-		if err != nil {
+		if err := m.routeMgr.ReplaceDefault(state.OriginalInterface, state.OriginalGateway, 0); err != nil {
 			m.logger.Debug("Failed to restore default route from state", "error", err)
 			// Fall back to heuristic detection
 			m.restoreDefaultRoute()
@@ -362,8 +369,10 @@ func (m *Manager) restoreDefaultRouteFromState(state *vpnState) {
 // restoreDefaultRoute finds the physical network interface and restores the default route
 // This is the legacy/fallback method when no saved state is available
 func (m *Manager) restoreDefaultRoute() {
-	// Find the gateway from existing routes (VPN endpoint route points to original gateway)
-	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show")
+	// Find a route via a physical interface (VPN endpoint routes point to the
+	// original gateway). Skip VPN interfaces so we don't restore the tunnel we
+	// just tore down.
+	routes, err := m.routeMgr.ListRoutes()
 	if err != nil {
 		m.logger.Debug("Failed to get routes", "error", err)
 		return
@@ -371,38 +380,21 @@ func (m *Manager) restoreDefaultRoute() {
 
 	var gateway, iface string
 
-	// Look for routes that have "via" - these point to the original gateway
-	// Skip routes via VPN interfaces (wg*, tun*)
-	for _, line := range strings.Split(output, "\n") {
-		parts := strings.Fields(line)
-		if len(parts) < 5 {
+	// Look for routes that have a gateway ("via") on a physical interface —
+	// these point to the original upstream gateway.
+	for _, r := range routes {
+		if r.Gw == "" || r.Iface == "" {
 			continue
 		}
 
-		// Look for "X.X.X.X via Y.Y.Y.Y dev ethX" pattern
-		var routeGw, routeIface string
-		for i, part := range parts {
-			if part == "via" && i+1 < len(parts) {
-				routeGw = parts[i+1]
-			}
-			if part == "dev" && i+1 < len(parts) {
-				routeIface = parts[i+1]
-			}
-		}
-
-		// Skip VPN interfaces (WireGuard, OpenVPN, Tailscale, NetBird)
-		if strings.HasPrefix(routeIface, "wg") || strings.HasPrefix(routeIface, "tun") ||
-			strings.HasPrefix(routeIface, "tailscale") || strings.HasPrefix(routeIface, "wt") ||
-			strings.HasPrefix(routeIface, "utun") {
+		if isVPNInterface(r.Iface) {
 			continue
 		}
 
-		// Found a route with gateway via physical interface
-		if routeGw != "" && routeIface != "" {
-			gateway = routeGw
-			iface = routeIface
-			break
-		}
+		// Found a route with gateway via physical interface.
+		gateway = r.Gw
+		iface = r.Iface
+		break
 	}
 
 	if gateway == "" || iface == "" {
@@ -412,10 +404,18 @@ func (m *Manager) restoreDefaultRoute() {
 
 	// Restore default route
 	m.logger.Debug("Restoring default route", "gateway", gateway, "interface", iface)
-	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", "default", "via", gateway, "dev", iface)
-	if err != nil {
+	if err := m.routeMgr.ReplaceDefault(iface, gateway, 0); err != nil {
 		m.logger.Debug("Failed to restore default route", "error", err)
 	}
+}
+
+// isVPNInterface reports whether an interface name looks like a VPN tunnel
+// (WireGuard, OpenVPN, Tailscale, NetBird), which should be skipped when
+// searching for the original physical upstream route.
+func isVPNInterface(iface string) bool {
+	return strings.HasPrefix(iface, "wg") || strings.HasPrefix(iface, "tun") ||
+		strings.HasPrefix(iface, "tailscale") || strings.HasPrefix(iface, "wt") ||
+		strings.HasPrefix(iface, "utun")
 }
 
 // killProcess kills processes matching a pattern, with SIGKILL fallback if graceful shutdown fails
@@ -915,7 +915,7 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 
 	// Set IP address if specified (use replace to handle existing addresses)
 	if config.Address != "" {
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "replace", config.Address, "dev", iface)
+		err = m.addrMgr.Replace(iface, config.Address)
 		if err != nil {
 			// Clean up interface on failure
 			m.executor.ExecuteWithTimeout(2*time.Second, "ip", "link", "del", iface)
@@ -1016,38 +1016,19 @@ func (m *Manager) extractEndpoint(config string) string {
 	return ""
 }
 
-// getCurrentGateway returns the current default gateway IP and interface
+// getCurrentGateway returns the current default gateway IP and interface via
+// netlink. For a normal LAN default route both are set (e.g. "192.168.1.1",
+// "eth0"). For a device-only default route such as `default dev wg0` the
+// gateway is "" and only iface is set — callers must handle that case (see
+// restoreDefaultRouteFromState). Returns ("", "") if there is no default route
+// or netlink is unavailable.
 func (m *Manager) getCurrentGateway() (gateway, iface string) {
-	// Try "ip route show default" first (most direct)
-	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show", "default")
-	if err != nil || strings.TrimSpace(output) == "" {
-		// Fallback: parse all routes looking for default
-		output, err = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show")
-		if err != nil {
-			return "", ""
-		}
+	route, err := m.routeMgr.GetDefaultRoute()
+	if err != nil {
+		m.logger.Debug("Failed to get default route", "error", err)
+		return "", ""
 	}
-
-	// Parse routes looking for "default via X.X.X.X dev IFACE" pattern
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "default") {
-			continue
-		}
-		parts := strings.Fields(line)
-		for i, part := range parts {
-			if part == "via" && i+1 < len(parts) {
-				gateway = parts[i+1]
-			}
-			if part == "dev" && i+1 < len(parts) {
-				iface = parts[i+1]
-			}
-		}
-		if gateway != "" && iface != "" {
-			return gateway, iface
-		}
-	}
-	return gateway, iface
+	return route.Gw, route.Iface
 }
 
 // writeFile writes content to a file with secure permissions (0600)
