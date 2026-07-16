@@ -197,18 +197,17 @@ func (m *RouteManager) GetDefaultRouteForIface(iface string) (*types.Route, erro
 	return nil, fmt.Errorf("no default route on interface %q", iface)
 }
 
-// AddRoute adds a route to destination (CIDR) via gw on iface. When gw is "",
-// a device-scoped (onlink) route is added.
-func (m *RouteManager) AddRoute(iface, destination, gw string) error {
+// buildRoute constructs a netlink route to destination (CIDR or bare host IP)
+// via gw on iface. When gw is "", a device-scoped (link-scope) route is built.
+func buildRoute(iface, destination, gw string) (*vnl.Route, error) {
 	link, err := vnl.LinkByName(iface)
 	if err != nil {
-		return fmt.Errorf("resolving interface %q: %w", iface, err)
+		return nil, fmt.Errorf("resolving interface %q: %w", iface, err)
 	}
 	dst, err := parseDestination(destination)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	route := &vnl.Route{
 		LinkIndex: link.Attrs().Index,
 		Dst:       dst,
@@ -218,19 +217,59 @@ func (m *RouteManager) AddRoute(iface, destination, gw string) error {
 	if gw != "" {
 		gwIP := net.ParseIP(gw)
 		if gwIP == nil {
-			return fmt.Errorf("invalid gateway address %q", gw)
+			return nil, fmt.Errorf("invalid gateway address %q", gw)
 		}
 		if gwIP.To4() == nil {
-			return fmt.Errorf("gateway %q is not an IPv4 address", gw)
+			return nil, fmt.Errorf("gateway %q is not an IPv4 address", gw)
 		}
 		route.Gw = gwIP
 		route.Scope = vnl.SCOPE_UNIVERSE
 	} else {
 		route.Scope = vnl.SCOPE_LINK
 	}
+	return route, nil
+}
 
+// AddRoute adds a route to destination (CIDR) via gw on iface. When gw is "",
+// a device-scoped (onlink) route is added.
+func (m *RouteManager) AddRoute(iface, destination, gw string) error {
+	route, err := buildRoute(iface, destination, gw)
+	if err != nil {
+		return err
+	}
 	if err := vnl.RouteAdd(route); err != nil {
 		return fmt.Errorf("adding route %s via %q dev %q: %w", destination, gw, iface, err)
+	}
+	return nil
+}
+
+// ReplaceRoute installs a route to destination via gw on iface, replacing any
+// existing route to the same destination.
+func (m *RouteManager) ReplaceRoute(iface, destination, gw string) error {
+	route, err := buildRoute(iface, destination, gw)
+	if err != nil {
+		return err
+	}
+	if err := vnl.RouteReplace(route); err != nil {
+		return fmt.Errorf("replacing route %s via %q dev %q: %w", destination, gw, iface, err)
+	}
+	return nil
+}
+
+// DelRoute removes the route to destination. Missing routes (ESRCH) are not
+// treated as errors.
+func (m *RouteManager) DelRoute(destination string) error {
+	dst, err := parseDestination(destination)
+	if err != nil {
+		return err
+	}
+	route := &vnl.Route{
+		Dst:    dst,
+		Family: vnl.FAMILY_V4,
+		Table:  unix.RT_TABLE_MAIN,
+	}
+	if err := vnl.RouteDel(route); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("deleting route %s: %w", destination, err)
 	}
 	return nil
 }

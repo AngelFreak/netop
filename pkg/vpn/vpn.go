@@ -330,7 +330,7 @@ func (m *Manager) removeEndpointRoute(state *vpnState) {
 	m.endpointRoute = ""
 	if endpointRoute != "" {
 		m.logger.Debug("Removing VPN endpoint route", "endpoint", endpointRoute)
-		_, _ = m.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "del", endpointRoute)
+		_ = m.routeMgr.DelRoute(endpointRoute)
 	}
 }
 
@@ -934,7 +934,7 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		if endpointIP != "" && origGW != "" && origIface != "" {
 			// Add route to VPN endpoint via original gateway
 			m.logger.Debug("Adding route to VPN endpoint", "endpoint", endpointIP, "gateway", origGW, "interface", origIface)
-			_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", endpointIP, "via", origGW, "dev", origIface)
+			err = m.routeMgr.ReplaceRoute(origIface, endpointIP, origGW)
 			if err != nil {
 				m.logger.Warn("Failed to add route to VPN endpoint", "error", err)
 			} else {
@@ -947,7 +947,7 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		// The original gateway was already saved by Connect() before calling connectWireGuard,
 		// so disconnect can restore it. If there was no original gateway, warn but proceed —
 		// the user explicitly enabled gateway mode.
-		_, err = m.executor.ExecuteWithTimeout(5*time.Second, "ip", "route", "replace", "default", "dev", iface)
+		err = m.routeMgr.ReplaceDefault(iface, "", 0)
 		if err != nil {
 			m.logger.Warn("Failed to set default route", "error", err)
 		}

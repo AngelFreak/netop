@@ -44,8 +44,10 @@ type Manager struct {
 	iface              string
 	associationTimeout time.Duration // Configurable for testing, defaults to 30s
 	dhcpClient         types.DHCPClientManager
-	linkMgr            types.LinkManager // netlink-backed link access (interface up/down)
-	runtimeDir         string            // overridable for tests; defaults to types.RuntimeDir
+	linkMgr            types.LinkManager  // netlink-backed link access (interface up/down)
+	addrMgr            types.AddrManager  // netlink-backed interface address access
+	routeMgr           types.RouteManager // netlink-backed routing table access
+	runtimeDir         string             // overridable for tests; defaults to types.RuntimeDir
 }
 
 // NewManager creates a new WiFi manager
@@ -57,6 +59,8 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, iface string
 		associationTimeout: 30 * time.Second, // Default timeout
 		dhcpClient:         dhcpClient,
 		linkMgr:            netlink.NewLinkManager(),
+		addrMgr:            netlink.NewAddrManager(),
+		routeMgr:           netlink.NewRouteManager(),
 		runtimeDir:         types.RuntimeDir,
 	}
 }
@@ -187,8 +191,8 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// this interface, so we don't need a separate global `route del default`
 	// (which would silently delete a VPN's default route — e.g. a
 	// `gateway: true` WireGuard tunnel — when the user reconnects WiFi).
-	m.executor.Execute("ip", "addr", "flush", "dev", m.iface)
-	m.executor.Execute("ip", "route", "flush", "dev", m.iface)
+	m.addrMgr.Flush(m.iface)
+	m.routeMgr.FlushRoutes(m.iface)
 
 	// Bring interface up before starting wpa_supplicant
 	err = m.linkMgr.SetUp(m.iface)
@@ -248,12 +252,12 @@ func (m *Manager) Disconnect() error {
 	m.terminateDhcpClients()
 
 	// Flush all IP addresses from interface
-	if _, err := m.executor.Execute("ip", "addr", "flush", "dev", m.iface); err != nil {
+	if err := m.addrMgr.Flush(m.iface); err != nil {
 		m.logger.Debug("Failed to flush IP addresses", "error", err)
 	}
 
 	// Flush all routes for this interface
-	if _, err := m.executor.Execute("ip", "route", "flush", "dev", m.iface); err != nil {
+	if err := m.routeMgr.FlushRoutes(m.iface); err != nil {
 		m.logger.Debug("Failed to flush routes", "error", err)
 	}
 
@@ -271,21 +275,19 @@ func (m *Manager) ListConnections() ([]types.Connection, error) {
 
 	var connections []types.Connection
 
-	// Get IP addresses
-	ipOutput, err := m.executor.Execute("ip", "addr", "show", m.iface)
+	// Get IP address (netlink)
+	ip, err := m.addrMgr.GetFirstIPv4(m.iface)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get IP addresses: %w", err)
 	}
 
-	ip := m.parseIPAddress(ipOutput)
-
-	// Get routes for gateway
-	routeOutput, err := m.executor.Execute("ip", "route", "show", "dev", m.iface)
-	if err != nil {
-		m.logger.Debug("Failed to get routes", "error", err)
+	// Get the interface's default-route gateway (netlink)
+	var gateway net.IP
+	if route, rerr := m.routeMgr.GetDefaultRouteForIface(m.iface); rerr != nil {
+		m.logger.Debug("Failed to get default route", "error", rerr)
+	} else if route.Gw != "" {
+		gateway = net.ParseIP(route.Gw)
 	}
-
-	gateway := m.parseGateway(routeOutput)
 
 	// Get current SSID
 	ssid, err := m.getCurrentSSID()
@@ -564,14 +566,6 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 
 func (m *Manager) obtainDHCP(hostname string) error {
 	return m.dhcpClient.Acquire(m.iface, hostname)
-}
-
-func (m *Manager) parseIPAddress(output string) net.IP {
-	return system.ParseIPFromOutput(output)
-}
-
-func (m *Manager) parseGateway(output string) net.IP {
-	return system.ParseGatewayFromOutput(output)
 }
 
 func (m *Manager) getCurrentSSID() (string, error) {
