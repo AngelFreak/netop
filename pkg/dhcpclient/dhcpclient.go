@@ -57,14 +57,25 @@ type Manager struct {
 	executor    types.SystemExecutor
 	logger      types.Logger
 	dhcpTimeout time.Duration // Configurable overall DHCP timeout (0 = use defaults)
+	runtimeDir  string        // overridable for tests; defaults to types.RuntimeDir
 }
 
 // NewManager creates a new DHCP client manager
 func NewManager(executor types.SystemExecutor, logger types.Logger) *Manager {
 	return &Manager{
-		executor: executor,
-		logger:   logger,
+		executor:   executor,
+		logger:     logger,
+		runtimeDir: types.RuntimeDir,
 	}
+}
+
+// runDir returns the runtime directory for dhclient/udhcpc files (overridable
+// in tests).
+func (m *Manager) runDir() string {
+	if m.runtimeDir != "" {
+		return m.runtimeDir
+	}
+	return types.RuntimeDir
 }
 
 // SetDHCPTimeout configures the DHCP acquisition timeout from user config.
@@ -183,7 +194,7 @@ func (m *Manager) Release(iface string) error {
 	// Prefer graceful shutdown via pidfile: SIGTERM lets udhcpc send a
 	// DHCPRELEASE (via -R) and clean up the lease on the server side. Fall
 	// back to pkill -9 if pidfile is missing or the process is already dead.
-	pidFile := udhcpcPidFile(iface)
+	pidFile := m.udhcpcPidFile(iface)
 	if data, err := os.ReadFile(pidFile); err == nil {
 		pid := strings.TrimSpace(string(data))
 		if pid != "" {
@@ -207,7 +218,7 @@ func (m *Manager) Release(iface string) error {
 	// Clean up lease files
 	leaseFiles := []string{
 		"/var/lib/dhcp/dhclient." + iface + ".leases",
-		types.RuntimeDir + "/dhclient." + iface + ".leases",
+		m.runDir() + "/dhclient." + iface + ".leases",
 	}
 	for _, f := range leaseFiles {
 		if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "rm", "-f", f); err != nil {
@@ -216,7 +227,7 @@ func (m *Manager) Release(iface string) error {
 	}
 
 	// Clean up interface-specific dhclient config
-	confFile := types.RuntimeDir + "/dhclient." + iface + ".conf"
+	confFile := m.runDir() + "/dhclient." + iface + ".conf"
 	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "rm", "-f", confFile); err != nil {
 		m.logger.Debug("Failed to remove dhclient config", "file", confFile, "error", err)
 	}
@@ -236,8 +247,8 @@ func (m *Manager) Renew(iface string, hostname string) error {
 }
 
 // udhcpcPidFile returns the pidfile path for udhcpc on the given interface.
-func udhcpcPidFile(iface string) string {
-	return types.RuntimeDir + "/udhcpc." + iface + ".pid"
+func (m *Manager) udhcpcPidFile(iface string) string {
+	return m.runDir() + "/udhcpc." + iface + ".pid"
 }
 
 // acquireUdhcpc uses udhcpc (BusyBox) for DHCP acquisition.
@@ -263,7 +274,7 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 	// -A: seconds to wait before re-trying after a full discover cycle
 	// NOTE: no -q — udhcpc must stay running to renew the lease.
 	args := []string{
-		"-i", iface, "-n", "-p", udhcpcPidFile(iface), "-R", "-B",
+		"-i", iface, "-n", "-p", m.udhcpcPidFile(iface), "-R", "-B",
 		"-t", fmt.Sprintf("%d", UdhcpcDiscoverRetries),
 		"-T", fmt.Sprintf("%d", UdhcpcDiscoverTimeout),
 		"-A", fmt.Sprintf("%d", UdhcpcTryAgain),
@@ -300,8 +311,8 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 		// Create interface-specific dhclient.conf to avoid race conditions
 		// with concurrent DHCP operations on different interfaces
 		confContent := fmt.Sprintf("send host-name \"%s\";\n", hostname)
-		dhclientConf := types.RuntimeDir + "/dhclient." + iface + ".conf"
-		if _, err := m.executor.ExecuteWithInput("install", confContent, "-m", "0600", "/dev/stdin", dhclientConf); err != nil {
+		dhclientConf := m.runDir() + "/dhclient." + iface + ".conf"
+		if err := system.WriteSecureFile(dhclientConf, confContent); err != nil {
 			// Hostname was explicitly requested but we can't create config - this is a hard error
 			return fmt.Errorf("failed to create dhclient config for hostname: %w", err)
 		}

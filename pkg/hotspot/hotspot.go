@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/angelfreak/net/pkg/firewall"
 	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
@@ -24,9 +25,10 @@ type hotspotManagerImpl struct {
 	dnsmasqConfFile string
 	stateFile       string // Persists hotspot interface and outInterface for crash recovery
 	currentConfig   *types.HotspotConfig
-	outInterface    string            // Interface for NAT routing (e.g., eth0)
-	prevIPForward   string            // /proc/.../ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
-	linkMgr         types.LinkManager // netlink-backed link access (interface up/down)
+	outInterface    string                // Interface for NAT routing (e.g., eth0)
+	prevIPForward   string                // /proc/.../ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
+	linkMgr         types.LinkManager     // netlink-backed link access (interface up/down)
+	firewall        types.FirewallManager // go-iptables-backed NAT rules; nil until first use / injected in tests
 }
 
 // NewHotspotManager creates a new hotspot manager
@@ -41,6 +43,21 @@ func NewHotspotManager(executor types.SystemExecutor, logger types.Logger) types
 		stateFile:       types.RuntimeDir + "/hotspot-state",
 		linkMgr:         netlink.NewLinkManager(),
 	}
+}
+
+// firewallMgr returns the FirewallManager, constructing the go-iptables-backed
+// one on first use. It is a field so tests can inject a fake. Returns an error
+// if iptables is unavailable.
+func (h *hotspotManagerImpl) firewallMgr() (types.FirewallManager, error) {
+	if h.firewall != nil {
+		return h.firewall, nil
+	}
+	fw, err := firewall.New()
+	if err != nil {
+		return nil, err
+	}
+	h.firewall = fw
+	return h.firewall, nil
 }
 
 // Start starts the WiFi hotspot with the given configuration
@@ -185,24 +202,14 @@ func (h *hotspotManagerImpl) setupNAT(hotspotIface string) error {
 
 	h.logger.Debug("Setting up NAT", "outInterface", outIface, "hotspotInterface", hotspotIface)
 
-	// Remove existing rules first to prevent duplicates from repeated Start/Stop cycles
-	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
-	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-i", hotspotIface, "-j", "ACCEPT")
-	h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-
-	// Setup NAT masquerade
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "iptables", "-t", "nat", "-A", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE"); err != nil {
-		return fmt.Errorf("failed to setup masquerade: %w", err)
+	// Install MASQUERADE + FORWARD rules idempotently (AppendUnique), replacing
+	// the previous delete-then-add iptables command lines.
+	fw, err := h.firewallMgr()
+	if err != nil {
+		return fmt.Errorf("failed to set up NAT: %w", err)
 	}
-
-	// Allow forwarding from hotspot interface
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "iptables", "-A", "FORWARD", "-i", hotspotIface, "-j", "ACCEPT"); err != nil {
-		h.logger.Warn("Failed to setup forward rule", "error", err.Error())
-	}
-
-	// Allow established connections back
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "iptables", "-A", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
-		h.logger.Warn("Failed to setup established forward rule", "error", err.Error())
+	if err := fw.EnableNAT(hotspotIface, outIface); err != nil {
+		return fmt.Errorf("failed to set up NAT: %w", err)
 	}
 
 	h.outInterface = outIface
@@ -233,10 +240,12 @@ func (h *hotspotManagerImpl) detectOutInterface(exclude string) string {
 func (h *hotspotManagerImpl) cleanupNAT(hotspotIface string) {
 	outIface := h.outInterface
 	if outIface != "" {
-		// Remove NAT rules (ignore errors - rules may not exist)
-		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-t", "nat", "-D", "POSTROUTING", "-o", outIface, "-j", "MASQUERADE")
-		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-i", hotspotIface, "-j", "ACCEPT")
-		h.executor.ExecuteWithTimeout(2*time.Second, "iptables", "-D", "FORWARD", "-o", hotspotIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		// Remove NAT rules (missing rules are tolerated by DisableNAT).
+		if fw, err := h.firewallMgr(); err == nil {
+			if err := fw.DisableNAT(hotspotIface, outIface); err != nil {
+				h.logger.Warn("Failed to remove NAT rules", "error", err.Error())
+			}
+		}
 	}
 
 	// Restore IP forwarding to its pre-hotspot value rather than forcing it
