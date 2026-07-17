@@ -15,12 +15,12 @@ import (
 	"github.com/angelfreak/net/tests/integration/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestWireGuardConnect_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 	testutil.SkipIfNoWireGuard(t)
-	testutil.SkipIfMissingCmd(t, "wg")
 	testutil.SkipIfMissingCmd(t, "ip")
 
 	ns := testutil.NewTestNamespace(t)
@@ -50,7 +50,6 @@ func TestWireGuardConnect_Integration(t *testing.T) {
 func TestWireGuardWithPeer_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 	testutil.SkipIfNoWireGuard(t)
-	testutil.SkipIfMissingCmd(t, "wg")
 
 	ns := testutil.NewTestNamespace(t)
 
@@ -79,7 +78,6 @@ func TestWireGuardWithPeer_Integration(t *testing.T) {
 func TestWireGuardDisconnect_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 	testutil.SkipIfNoWireGuard(t)
-	testutil.SkipIfMissingCmd(t, "wg")
 
 	ns := testutil.NewTestNamespace(t)
 
@@ -106,7 +104,6 @@ func TestWireGuardDisconnect_Integration(t *testing.T) {
 func TestVPNManagerConnect_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 	testutil.SkipIfNoWireGuard(t)
-	testutil.SkipIfMissingCmd(t, "wg")
 
 	// Ensure runtime directory exists
 	runtimeDir := types.RuntimeDir
@@ -184,7 +181,6 @@ func TestVPNManagerConnect_Integration(t *testing.T) {
 func TestVPNManagerList_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 	testutil.SkipIfNoWireGuard(t)
-	testutil.SkipIfMissingCmd(t, "wg")
 
 	// Clean up before test
 	_ = exec.Command("ip", "link", "del", "wg-list-test").Run()
@@ -264,22 +260,16 @@ func TestVPNManagerList_Integration(t *testing.T) {
 }
 
 // generateTestKeyPair generates a WireGuard key pair for testing.
+// generateTestKeyPair generates a WireGuard key pair using wgtypes (the same
+// library the production code now uses), so the test no longer depends on the
+// `wg` binary — matching the fact that the manager itself no longer shells out
+// to `wg`.
 func generateTestKeyPair() (privateKey, publicKey string, err error) {
-	output, err := exec.Command("wg", "genkey").Output()
+	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		return "", "", err
 	}
-	privateKey = strings.TrimSpace(string(output))
-
-	cmd := exec.Command("wg", "pubkey")
-	cmd.Stdin = strings.NewReader(privateKey)
-	output, err = cmd.Output()
-	if err != nil {
-		return "", "", err
-	}
-	publicKey = strings.TrimSpace(string(output))
-
-	return privateKey, publicKey, nil
+	return key.String(), key.PublicKey().String(), nil
 }
 
 // testConfigManager implements types.ConfigManager for integration tests
