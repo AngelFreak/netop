@@ -4,13 +4,20 @@
 
 **Goal:** Detect captive portals (e.g. Amtrak_WiFi) after connect, on demand via `net portal`, and in `net status` — printing the actual portal login URL.
 
-**Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled; classification of the response (204/`success` body → online, 30x/511 → portal with `Location` URL, garbage 200 → portal, transport error → offline). Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect`, standalone `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
+**Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; 3xx or 511 → portal (login URL from `Location`); 200 with unexpected body → portal (DNS-hijack style); transport errors **and all other HTTP statuses (4xx/5xx)** → offline, so a probe-endpoint outage is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect`, standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
 **Tech Stack:** Go stdlib `net/http` + `httptest` (no new dependencies), cobra, testify.
 
 **Design doc:** `docs/plans/2026-07-17-captive-portal-design.md`
 
-**Design deviation note:** the design says "when PortalURL is empty the CLI prints the probe URL". Instead, the Detector itself falls back to the probe URL in `PortalURL` when no `Location` is available — keeps the interface minimal and every caller correct.
+**Verified facts this plan relies on** (checked against the tree at `3923607`+):
+
+- Config is loaded in `rootCmd.PersistentPreRun` → `initializeManagers()` (`cmd/net/main.go:75-77`, LoadConfig at `main.go:238`), which cobra runs **before** any command's `Run` — so `createApp()`/`createPortalDetector()` always see a loaded config in real runs. The nil-config fallback only covers load failures.
+- `os.Exit` inside cobra `Run` is the repo-wide convention (`status.go:14`, `connect.go:37`, every command file). `net portal` follows it; testable logic lives in `App.RunPortal`.
+- Root elevation: `commandNeedsRootArgs` (`cmd/net/main.go:~130`) exempts only `help, completion, status, show, list` — `portal` MUST be added there or it re-execs under sudo.
+- `gopkg.in/yaml.v3` (used by viper v1.18.2 here) parses unquoted `check: off` as the **string** `"off"`, not a boolean (verified empirically). The config test below locks this.
+- `newTestApp()` (`cmd/net/app_test.go:321`) leaves `testConfigManager.config` **nil**; connect tests must inject their own `testConfigManager` (mirror `TestApp_RunConnect_DirectSSID:436`).
+- `trackingVPNManager` (`app_test.go:1240`) embeds `testVPNManager` and only tracks `Disconnect`; Task 5 extends it.
 
 ---
 
@@ -59,7 +66,7 @@ func (t *TimeoutConfig) GetPortalTimeout() time.Duration {
 }
 ```
 
-Add types + interface (near `WiFiNetwork`/manager interfaces):
+Add types + interface (near the manager interfaces):
 
 ```go
 // PortalStatus classifies internet reachability as seen by the portal probe.
@@ -70,23 +77,27 @@ const (
 	PortalStatusOnline PortalStatus = iota
 	// PortalStatusPortal means a captive portal intercepted the probe.
 	PortalStatusPortal
-	// PortalStatusOffline means the probe got no HTTP response at all.
+	// PortalStatusOffline means the probe failed or returned a non-portal error
+	// status — no working internet, but no portal positively identified either.
 	PortalStatusOffline
 )
 
 // PortalResult is the outcome of a captive-portal probe.
 type PortalResult struct {
 	Status PortalStatus
-	// PortalURL is the address to open in a browser to reach the portal login.
-	// It is the redirect Location when the portal provided one, otherwise the
-	// probe URL itself (which the portal will intercept). Empty when online.
+	// PortalURL is the portal's login URL taken from the redirect Location
+	// header, when the portal provided one. Empty when the portal didn't
+	// redirect (DNS-hijack style) — open ProbeURL in a browser instead.
 	PortalURL string
+	// ProbeURL is the probe endpoint that was used. When PortalURL is empty,
+	// opening ProbeURL in a browser will trigger the portal's redirect.
+	ProbeURL string
 }
 
 // PortalDetector probes for internet connectivity and captive portals.
-// Transport failures are reported as PortalStatusOffline, not as errors;
-// Check returns a non-nil error only for misconfiguration (e.g. an https
-// probe URL, which portals cannot intercept).
+// Transport failures and unexpected error statuses are reported as
+// PortalStatusOffline, not as errors; Check returns a non-nil error only for
+// misconfiguration (e.g. an https probe URL, which portals cannot intercept).
 type PortalDetector interface {
 	Check() (PortalResult, error)
 }
@@ -106,17 +117,18 @@ git commit -m "feat(types): portal detector interface and portal probe timeout"
 
 ---
 
-### Task 2: config — `common.portal` section
+### Task 2: config — `common.portal` section with nested validation
 
 **Files:**
 - Modify: `pkg/types/types.go` (CommonConfig + PortalConfig struct)
-- Modify: `pkg/config/config.go:26-32` (validCommonFields)
+- Modify: `pkg/config/config.go` (validCommonFields, validPortalFields, nested validation)
 - Test: `pkg/config/config_test.go`
 
-**Step 1: Write the failing test** (append to `pkg/config/config_test.go`, follow the existing temp-file test pattern in that file)
+**Step 1: Write the failing tests** (append to `pkg/config/config_test.go`; check the file for the existing temp-config helper / constructor names and mirror them exactly)
 
 ```go
 func TestPortalConfigParsing(t *testing.T) {
+	// NB: `check: off` is deliberately unquoted — yaml.v3 must keep it a string.
 	configContent := `
 common:
   portal:
@@ -125,26 +137,41 @@ common:
   timeouts:
     portal: 7
 `
-	tmpFile := createTempConfig(t, configContent) // use the file's existing helper; if named differently, match it
-	defer os.Remove(tmpFile)
-
-	cm := NewManager(&testLogger{})
-	cfg, err := cm.LoadConfig(tmpFile)
+	// ...temp-file + LoadConfig boilerplate per existing tests...
 	assert.NoError(t, err)
 	assert.Equal(t, "off", cfg.Common.Portal.Check)
 	assert.Equal(t, "http://example.com/probe", cfg.Common.Portal.URL)
 	assert.Equal(t, 7*time.Second, cfg.Common.Timeouts.GetPortalTimeout())
 }
+
+func TestPortalConfigUnknownFieldRejected(t *testing.T) {
+	configContent := `
+common:
+  portal:
+    chek: off
+`
+	// ...LoadConfig...
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "chek")
+}
+
+func TestPortalConfigBadCheckValueRejected(t *testing.T) {
+	configContent := `
+common:
+  portal:
+    check: sometimes
+`
+	// ...LoadConfig...
+	assert.Error(t, err)
+}
 ```
 
-Note: check `config_test.go` for the actual helper/constructor names (`NewManager`, logger stub, temp-config helper) and mirror them exactly.
+**Step 2: Run to verify failure**
 
-**Step 2: Run test to verify it fails**
+Run: `go test ./pkg/config/ -run TestPortalConfig -v`
+Expected: FAIL — `cfg.Common.Portal` undefined / `portal` rejected as unknown common field
 
-Run: `go test ./pkg/config/ -run TestPortalConfigParsing -v`
-Expected: FAIL — `cfg.Common.Portal` undefined, and/or validation rejects unknown field `portal`
-
-**Step 3: Write minimal implementation**
+**Step 3: Implement**
 
 `pkg/types/types.go` — add to `CommonConfig`:
 
@@ -157,23 +184,32 @@ New struct after `TimeoutConfig`:
 ```go
 // PortalConfig controls captive-portal detection.
 type PortalConfig struct {
-	// Check is "auto" (default: probe after connect) or "off" (skip the
-	// automatic connect-time check; `net portal` and `net status` still probe).
+	// Check is "auto" (default: probe after connect and in status) or "off"
+	// (skip those automatic checks; `net portal` always probes on demand).
 	Check string `yaml:"check" mapstructure:"check"`
 	// URL is the plain-http probe endpoint. Empty means the built-in default.
 	URL string `yaml:"url" mapstructure:"url"`
 }
+
+// CheckDisabled reports whether automatic portal checks are turned off.
+func (p *PortalConfig) CheckDisabled() bool {
+	return p.Check == "off"
+}
 ```
 
-`pkg/config/config.go` — add to `validCommonFields`:
+`pkg/config/config.go`:
 
 ```go
-		"portal":   true,
+	// Valid fields for PortalConfig
+	validPortalFields = map[string]bool{
+		"check": true,
+		"url":   true,
+	}
 ```
 
-(Nested subfields are not validated for `timeouts` today; keep `portal` consistent with that.)
+Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), when the common map contains a `portal` key that is itself a map, validate its subfields against `validPortalFields` (same `validateFields` helper, section name `common.portal`), and reject a `check` value that is a string other than `""`, `"auto"`, or `"off"`. (Nested `timeouts` subfields are historically unvalidated — `portal` is stricter on purpose: a typo in `check`/`url` silently re-enables probing or probes the wrong host, per review.)
 
-**Step 4: Run test to verify it passes**
+**Step 4: Run to verify pass**
 
 Run: `go test ./pkg/config/ ./pkg/types/`
 Expected: PASS (all — watch for existing validation tests that enumerate common fields)
@@ -182,7 +218,7 @@ Expected: PASS (all — watch for existing validation tests that enumerate commo
 
 ```bash
 git add pkg/types/types.go pkg/config/config.go pkg/config/config_test.go
-git commit -m "feat(config): common.portal section and portal timeout"
+git commit -m "feat(config): common.portal section with validated fields"
 ```
 
 ---
@@ -207,6 +243,8 @@ import (
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
+
+var _ types.PortalDetector = (*Detector)(nil)
 
 type testLogger struct{}
 
@@ -253,6 +291,7 @@ func TestCheck_Portal_RedirectAbsolute(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusPortal, result.Status)
 	assert.Equal(t, "http://portal.example.com/login?res=notyet", result.PortalURL)
+	assert.Equal(t, srv.URL, result.ProbeURL)
 }
 
 func TestCheck_Portal_RedirectRelative(t *testing.T) {
@@ -274,11 +313,11 @@ func TestCheck_Portal_511(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	d := newTestDetector(srv.URL)
-	result, err := d.Check()
+	result, err := newTestDetector(srv.URL).Check()
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusPortal, result.Status)
-	assert.Equal(t, srv.URL, result.PortalURL) // no Location → probe URL fallback
+	assert.Empty(t, result.PortalURL) // no Location — caller falls back to ProbeURL
+	assert.Equal(t, srv.URL, result.ProbeURL)
 }
 
 func TestCheck_Portal_HijackedOK(t *testing.T) {
@@ -290,7 +329,32 @@ func TestCheck_Portal_HijackedOK(t *testing.T) {
 	result, err := newTestDetector(srv.URL).Check()
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusPortal, result.Status)
-	assert.Equal(t, srv.URL, result.PortalURL)
+	assert.Empty(t, result.PortalURL)
+	assert.Equal(t, srv.URL, result.ProbeURL)
+}
+
+func TestCheck_Offline_ServerError(t *testing.T) {
+	// A broken probe endpoint (CDN outage, corporate block page with 5xx)
+	// must NOT be reported as a captive portal.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOffline, result.Status)
+}
+
+func TestCheck_Offline_NotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOffline, result.Status)
 }
 
 func TestCheck_Offline_ConnectionRefused(t *testing.T) {
@@ -301,6 +365,36 @@ func TestCheck_Offline_ConnectionRefused(t *testing.T) {
 	result, err := newTestDetector(url).Check()
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusOffline, result.Status)
+}
+
+func TestCheck_Offline_Timeout(t *testing.T) {
+	blocked := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-blocked // hold the request open past the detector timeout
+	}))
+	defer func() { close(blocked); srv.Close() }()
+
+	d := New(srv.URL, 200*time.Millisecond, &testLogger{})
+	start := time.Now()
+	result, err := d.Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOffline, result.Status)
+	assert.Less(t, time.Since(start), 2*time.Second) // honored the timeout
+}
+
+func TestCheck_Portal_MalformedLocationNotEchoed(t *testing.T) {
+	// A hostile AP could stuff terminal escape sequences into Location.
+	// Unparseable Locations must never be passed through raw.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://bad.example.com/\x1b]0;pwned\x07")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
+	assert.NotContains(t, result.PortalURL, "\x1b")
 }
 
 func TestCheck_HTTPSRejected(t *testing.T) {
@@ -368,8 +462,8 @@ func New(probeURL string, timeout time.Duration, logger types.Logger) *Detector 
 }
 
 // Check probes the endpoint and classifies the response. Transport failures
-// mean PortalStatusOffline (nil error); an error is returned only for a
-// misconfigured probe URL.
+// and unexpected error statuses mean PortalStatusOffline (nil error); an
+// error is returned only for a misconfigured probe URL.
 func (d *Detector) Check() (types.PortalResult, error) {
 	u, err := url.Parse(d.probeURL)
 	if err != nil {
@@ -396,7 +490,7 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	resp, err := client.Get(d.probeURL)
 	if err != nil {
 		d.logger.Debug("Portal probe got no response", "url", d.probeURL, "error", err)
-		return types.PortalResult{Status: types.PortalStatusOffline}, nil
+		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
 	}
 	defer resp.Body.Close()
 
@@ -404,47 +498,56 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	d.logger.Debug("Portal probe response", "status", resp.StatusCode)
 
 	switch {
-	case resp.StatusCode == http.StatusNoContent:
-		return types.PortalResult{Status: types.PortalStatusOnline}, nil
-	case resp.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == "success":
-		return types.PortalResult{Status: types.PortalStatusOnline}, nil
+	case resp.StatusCode == http.StatusNoContent,
+		resp.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == "success":
+		return types.PortalResult{Status: types.PortalStatusOnline, ProbeURL: d.probeURL}, nil
 	case resp.StatusCode >= 300 && resp.StatusCode < 400,
 		resp.StatusCode == http.StatusNetworkAuthenticationRequired:
-		return types.PortalResult{Status: types.PortalStatusPortal, PortalURL: d.portalURL(resp)}, nil
+		return types.PortalResult{
+			Status:    types.PortalStatusPortal,
+			PortalURL: d.locationURL(resp),
+			ProbeURL:  d.probeURL,
+		}, nil
+	case resp.StatusCode == http.StatusOK:
+		// 200 with an unexpected body: something rewrote the response
+		// (DNS-hijack style portals do this). No login URL known.
+		return types.PortalResult{Status: types.PortalStatusPortal, ProbeURL: d.probeURL}, nil
 	default:
-		// Unexpected 200 body or any other status: something rewrote the
-		// response (DNS-hijack style portals do this).
-		return types.PortalResult{Status: types.PortalStatusPortal, PortalURL: d.probeURL}, nil
+		// 4xx/5xx (except 511): the probe endpoint itself is broken or
+		// blocked. Don't cry "portal" over a CDN outage.
+		d.logger.Debug("Portal probe returned unexpected status, treating as offline", "status", resp.StatusCode)
+		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
 	}
 }
 
-// portalURL returns the redirect target (resolved against the probe URL for
-// relative Locations), or the probe URL itself when the portal sent none.
-func (d *Detector) portalURL(resp *http.Response) string {
+// locationURL returns the redirect target, resolved against the probe URL for
+// relative Locations. Returns "" for missing or unparseable Locations — raw
+// header bytes from a hostile AP must never reach the user's terminal.
+func (d *Detector) locationURL(resp *http.Response) string {
 	loc := resp.Header.Get("Location")
 	if loc == "" {
-		return d.probeURL
+		return ""
 	}
 	ref, err := url.Parse(loc)
 	if err != nil {
-		return loc
+		d.logger.Debug("Portal sent unparseable Location, ignoring", "error", err)
+		return ""
 	}
 	return resp.Request.URL.ResolveReference(ref).String()
 }
 ```
+
+Note on the escape-injection test: `url.Parse` accepts some control characters
+by percent-encoding them via `String()` re-serialization, and rejects others.
+Either path keeps raw ESC bytes out of the output — the assertion is
+`NotContains "\x1b"`, not a specific encoding.
 
 **Step 4: Run to verify pass**
 
 Run: `go test ./pkg/portal/ -v`
 Expected: all PASS
 
-**Step 5: Compile-time interface assertion** — add to `portal_test.go`:
-
-```go
-var _ types.PortalDetector = (*Detector)(nil)
-```
-
-**Step 6: Commit**
+**Step 5: Commit**
 
 ```bash
 git add pkg/portal/
@@ -453,23 +556,28 @@ git commit -m "feat(portal): native HTTP captive-portal detector"
 
 ---
 
-### Task 4: `net portal` command
+### Task 4: `net portal` command (root-exempt)
 
 **Files:**
 - Modify: `cmd/net/app.go:16-35` (App struct)
-- Create: `cmd/net/portal.go`
 - Modify: `cmd/net/app.go` (RunPortal method)
-- Test: `cmd/net/app_test.go`
+- Create: `cmd/net/portal.go`
+- Modify: `cmd/net/main.go` (`commandNeedsRootArgs` exempt list, ~line 130)
+- Test: `cmd/net/app_test.go`, `cmd/net/main_test.go`
 
-**Step 1: Write the failing tests** (append to `cmd/net/app_test.go`; add the mock next to the other test managers)
+**Step 1: Write the failing tests**
+
+Append to `cmd/net/app_test.go` (mock next to the other test managers):
 
 ```go
 type testPortalDetector struct {
 	result types.PortalResult
 	err    error
+	called bool
 }
 
 func (d *testPortalDetector) Check() (types.PortalResult, error) {
+	d.called = true
 	return d.result, d.err
 }
 
@@ -483,18 +591,32 @@ func TestApp_RunPortal_Online(t *testing.T) {
 	assert.Contains(t, stdout.String(), "Internet: ok")
 }
 
-func TestApp_RunPortal_PortalDetected(t *testing.T) {
+func TestApp_RunPortal_PortalWithLoginURL(t *testing.T) {
 	app, stdout, _ := newTestApp()
 	app.PortalDet = &testPortalDetector{result: types.PortalResult{
 		Status:    types.PortalStatusPortal,
 		PortalURL: "http://portal.example.com/login",
+		ProbeURL:  "http://probe.example.com/",
 	}}
 
 	status, err := app.RunPortal()
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusPortal, status)
 	assert.Contains(t, stdout.String(), "Captive portal detected")
-	assert.Contains(t, stdout.String(), "http://portal.example.com/login")
+	assert.Contains(t, stdout.String(), "Log in at: http://portal.example.com/login")
+}
+
+func TestApp_RunPortal_PortalWithoutLoginURL(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.PortalDet = &testPortalDetector{result: types.PortalResult{
+		Status:   types.PortalStatusPortal,
+		ProbeURL: "http://probe.example.com/",
+	}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, status)
+	assert.Contains(t, stdout.String(), "Open http://probe.example.com/ in a browser")
 }
 
 func TestApp_RunPortal_Offline(t *testing.T) {
@@ -514,10 +636,17 @@ func TestApp_RunPortal_NoDetector(t *testing.T) {
 }
 ```
 
+Append cases to the `TestCommandNeedsRootArgs` table in `cmd/net/main_test.go` (match the existing table shape):
+
+```go
+	{"portal is exempt", []string{"portal"}, false},
+	{"portal with iface flag is exempt", []string{"--iface", "wlan0", "portal"}, false},
+```
+
 **Step 2: Run to verify failure**
 
-Run: `go test ./cmd/net/ -run TestApp_RunPortal -v`
-Expected: compile error — `app.PortalDet`, `app.RunPortal` undefined
+Run: `go test ./cmd/net/ -run 'TestApp_RunPortal|TestCommandNeedsRootArgs' -v`
+Expected: compile error (`app.PortalDet`, `app.RunPortal` undefined); after stubbing, root-exemption cases FAIL
 
 **Step 3: Implement**
 
@@ -545,7 +674,11 @@ func (a *App) RunPortal() (types.PortalStatus, error) {
 	switch result.Status {
 	case types.PortalStatusPortal:
 		a.println("Captive portal detected!")
-		a.printf("  Log in at: %s\n", result.PortalURL)
+		if result.PortalURL != "" {
+			a.printf("  Log in at: %s\n", result.PortalURL)
+		} else {
+			a.printf("  Open %s in a browser to trigger the portal login page\n", result.ProbeURL)
+		}
 	case types.PortalStatusOffline:
 		a.println("Internet: unreachable (no response from probe)")
 	default:
@@ -555,7 +688,15 @@ func (a *App) RunPortal() (types.PortalStatus, error) {
 }
 ```
 
-`cmd/net/portal.go` (new file, mirror `status.go` structure):
+`cmd/net/main.go` — add `"portal"` to the root-exempt switch (the probe is
+plain HTTP; no CAP_NET_ADMIN needed):
+
+```go
+		case "help", "completion", "status", "show", "list", "portal":
+```
+
+`cmd/net/portal.go` (new file; `Run` + `os.Exit` is this repo's command
+convention — see status.go):
 
 ```go
 package main
@@ -572,6 +713,10 @@ var portalCmd = &cobra.Command{
 	Short: "Check for a captive portal on the current connection",
 	Long: `Probe a connectivity-check URL to determine whether the current network
 has working internet or a captive portal intercepting traffic.
+
+A captive portal is reported only on positive evidence (redirect, HTTP 511,
+or a rewritten response body). Probe failures and server errors are reported
+as "unreachable" — if the probe endpoint itself is down, that is not a portal.
 
 Exit codes: 0 = online, 2 = captive portal detected, 1 = offline or error.`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -595,14 +740,14 @@ func init() {
 
 **Step 4: Run to verify pass**
 
-Run: `go test ./cmd/net/ -run TestApp_RunPortal -v`
+Run: `go test ./cmd/net/ -run 'TestApp_RunPortal|TestCommandNeedsRootArgs' -v`
 Expected: PASS
 
 **Step 5: Commit**
 
 ```bash
-git add cmd/net/app.go cmd/net/portal.go cmd/net/app_test.go
-git commit -m "feat(cli): net portal command with scripting exit codes"
+git add cmd/net/app.go cmd/net/portal.go cmd/net/main.go cmd/net/app_test.go cmd/net/main_test.go
+git commit -m "feat(cli): root-exempt net portal command with scripting exit codes"
 ```
 
 ---
@@ -610,20 +755,54 @@ git commit -m "feat(cli): net portal command with scripting exit codes"
 ### Task 5: connect + status integration
 
 **Files:**
-- Modify: `cmd/net/app.go` (`RunConnect` around line 281-288, `RunStatus`)
+- Modify: `cmd/net/app.go` (`RunConnect` tail ~line 281-288, `RunStatus`, new helper)
 - Test: `cmd/net/app_test.go`
 
-**Step 1: Write the failing tests**
+**Step 1: Write the failing tests** (complete and compile-ready; setups mirror `TestApp_RunConnect_DirectSSID` and `TestApp_RunConnect_WithVPNIntegration`)
+
+First extend `trackingVPNManager` (`app_test.go:1240`) to also track connects:
+
+```go
+// trackingVPNManager tracks Disconnect and Connect calls
+type trackingVPNManager struct {
+	testVPNManager
+	disconnectCalled bool
+	connectCalled    bool
+	lastConnectName  string
+}
+
+func (v *trackingVPNManager) Disconnect(name string) error {
+	v.disconnectCalled = true
+	return nil
+}
+
+func (v *trackingVPNManager) Connect(name string) error {
+	v.connectCalled = true
+	v.lastConnectName = name
+	return nil
+}
+```
+
+(Check whether existing tests assert on `trackingVPNManager` behavior that a
+`Connect` override would change — `testVPNManager.Connect` is a no-op success,
+so overriding with another no-op success is behavior-preserving.)
+
+New tests:
 
 ```go
 func TestApp_RunConnect_PortalWarning(t *testing.T) {
 	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
 	app.PortalDet = &testPortalDetector{result: types.PortalResult{
 		Status:    types.PortalStatusPortal,
 		PortalURL: "http://portal.example.com/login",
+		ProbeURL:  "http://probe.example.com/",
 	}}
 
-	err := app.RunConnect("TestNetwork", "password")
+	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
 	assert.Contains(t, stderr.String(), "captive portal detected")
 	assert.Contains(t, stderr.String(), "http://portal.example.com/login")
@@ -631,34 +810,57 @@ func TestApp_RunConnect_PortalWarning(t *testing.T) {
 
 func TestApp_RunConnect_PortalCheckOff(t *testing.T) {
 	app, _, stderr := newTestApp()
-	// configure check: off via the test config manager's config
-	cfg := app.ConfigMgr.GetConfig()
-	cfg.Common.Portal.Check = "off"
-	app.PortalDet = &testPortalDetector{result: types.PortalResult{Status: types.PortalStatusPortal, PortalURL: "http://x"}}
+	det := &testPortalDetector{result: types.PortalResult{Status: types.PortalStatusPortal, PortalURL: "http://x", ProbeURL: "http://p"}}
+	app.PortalDet = det
+	app.ConfigMgr = &testConfigManager{
+		config:     &types.Config{Common: types.CommonConfig{Portal: types.PortalConfig{Check: "off"}}},
+		networkErr: errors.New("not found"),
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
 
-	err := app.RunConnect("TestNetwork", "password")
+	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
+	assert.False(t, det.called, "portal check must be skipped when check: off")
 	assert.NotContains(t, stderr.String(), "captive portal")
 }
 
 func TestApp_RunConnect_NilDetectorNoCrash(t *testing.T) {
-	app, _, _ := newTestApp() // PortalDet nil — must not panic
-	err := app.RunConnect("TestNetwork", "password")
+	app, stdout, _ := newTestApp() // PortalDet nil — must not panic
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Connected!")
 }
 
 func TestApp_RunConnect_PortalStillConnectsVPN(t *testing.T) {
-	// use the existing trackingVPNManager pattern to assert VPN attempt still happens
 	app, _, stderr := newTestApp()
 	tracker := &trackingVPNManager{}
 	app.VPNMgr = tracker
-	// give the test config manager a network with a VPN configured (mirror existing VPN test setup in this file)
-	app.PortalDet = &testPortalDetector{result: types.PortalResult{Status: types.PortalStatusPortal, PortalURL: "http://x"}}
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Networks: map[string]types.NetworkConfig{"home": {SSID: "Home", VPN: "myvpn"}},
+			VPN:      map[string]types.VPNConfig{"myvpn": {Type: "wireguard"}},
+		},
+		networkConfig: &types.NetworkConfig{SSID: "Home", VPN: "myvpn"},
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{result: types.PortalResult{
+		Status: types.PortalStatusPortal, PortalURL: "http://x", ProbeURL: "http://p",
+	}}
 
-	err := app.RunConnect("TestNetwork", "password")
+	err := app.RunConnect("home", "")
 	assert.NoError(t, err)
-	assert.Contains(t, stderr.String(), "VPN will")
-	// assert tracker recorded a Connect call — mirror field names from trackingVPNManager
+	assert.True(t, tracker.connectCalled, "VPN attempt must still happen after portal warning")
+	assert.Equal(t, "myvpn", tracker.lastConnectName)
+	assert.Contains(t, stderr.String(), "may not come up until")
 }
 
 func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
@@ -666,36 +868,56 @@ func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
 	app.PortalDet = &testPortalDetector{result: types.PortalResult{
 		Status:    types.PortalStatusPortal,
 		PortalURL: "http://portal.example.com/login",
+		ProbeURL:  "http://probe.example.com/",
 	}}
 
 	err := app.RunStatus()
 	assert.NoError(t, err)
-	assert.Contains(t, stdout.String(), "Internet:")
-	assert.Contains(t, stdout.String(), "captive portal (http://portal.example.com/login)")
+	assert.Contains(t, stdout.String(), "Internet:  captive portal (http://portal.example.com/login)")
+}
+
+func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	det := &testPortalDetector{result: types.PortalResult{Status: types.PortalStatusOnline}}
+	app.PortalDet = det
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{Common: types.CommonConfig{Portal: types.PortalConfig{Check: "off"}}},
+	}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.False(t, det.called)
+	assert.NotContains(t, stdout.String(), "Internet:")
 }
 ```
 
-Note: `TestApp_RunConnect_PortalCheckOff` requires the test config manager to return a non-nil config — check `testConfigManager` in `app_test.go` and set its config field the way other tests do. Adjust test-network names to whatever `testWiFiManager`/`testConfigManager` already support (look at existing `TestApp_RunConnect_*` tests and copy their setup).
-
 **Step 2: Run to verify failure**
 
-Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunStatus_ShowsInternet|TestApp_RunConnect_NilDetector' -v`
-Expected: FAIL (no warning printed / no Internet line)
+Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunConnect_NilDetector|TestApp_RunStatus_ShowsInternet|TestApp_RunStatus_PortalCheckOff' -v`
+Expected: FAIL (no warning printed / no Internet line); the NilDetector test may already pass — keep it as a regression guard
 
 **Step 3: Implement**
 
-`cmd/net/app.go` — private helper near `connectVPN`:
+`cmd/net/app.go` — helpers near `connectVPN`:
 
 ```go
-// checkPortalAfterConnect probes for a captive portal right after a
-// connection comes up, unless disabled via common.portal.check: off.
-// Never fatal — prints warnings to stderr only. Reports whether a portal
-// was detected so RunConnect can add a VPN hint.
-func (a *App) checkPortalAfterConnect() bool {
+// portalCheckEnabled reports whether automatic portal probing is enabled
+// (a detector is wired and config doesn't say check: off).
+func (a *App) portalCheckEnabled() bool {
 	if a.PortalDet == nil {
 		return false
 	}
-	if cfg := a.ConfigMgr.GetConfig(); cfg != nil && cfg.Common.Portal.Check == "off" {
+	if cfg := a.ConfigMgr.GetConfig(); cfg != nil && cfg.Common.Portal.CheckDisabled() {
+		return false
+	}
+	return true
+}
+
+// checkPortalAfterConnect probes for a captive portal right after a
+// connection comes up. Never fatal — prints warnings to stderr only.
+// Reports whether a portal was detected so RunConnect can add a VPN hint.
+func (a *App) checkPortalAfterConnect() bool {
+	if !a.portalCheckEnabled() {
 		return false
 	}
 	result, err := a.PortalDet.Check()
@@ -705,7 +927,11 @@ func (a *App) checkPortalAfterConnect() bool {
 	}
 	switch result.Status {
 	case types.PortalStatusPortal:
-		a.errorf("Warning: captive portal detected — log in at: %s\n", result.PortalURL)
+		if result.PortalURL != "" {
+			a.errorf("Warning: captive portal detected — log in at: %s\n", result.PortalURL)
+		} else {
+			a.errorf("Warning: captive portal detected — open %s in a browser to log in\n", result.ProbeURL)
+		}
 		return true
 	case types.PortalStatusOffline:
 		a.errorf("Warning: no internet connectivity detected\n")
@@ -722,7 +948,7 @@ In `RunConnect`, replace the tail (after `a.printConnectionInfo(connectedIface)`
 	// Connect VPN if configured and not disabled
 	if !a.NoVPN {
 		if portalDetected {
-			a.errorf("Note: VPN will complete once the portal login is done.\n")
+			a.errorf("Note: the VPN may not come up until the portal login is complete.\n")
 		}
 		a.connectVPN(configName)
 	}
@@ -732,12 +958,16 @@ In `RunConnect`, replace the tail (after `a.printConnectionInfo(connectedIface)`
 In `RunStatus`, after the connection-info block (the `if connErr == nil && conn != nil { ... }` block), add:
 
 ```go
-	// Internet reachability / captive portal
-	if a.PortalDet != nil {
+	// Internet reachability / captive portal (skipped when portal.check: off)
+	if a.portalCheckEnabled() {
 		if result, err := a.PortalDet.Check(); err == nil {
 			switch result.Status {
 			case types.PortalStatusPortal:
-				a.printf("Internet:  captive portal (%s)\n", result.PortalURL)
+				url := result.PortalURL
+				if url == "" {
+					url = result.ProbeURL
+				}
+				a.printf("Internet:  captive portal (%s)\n", url)
 			case types.PortalStatusOffline:
 				a.printf("Internet:  unreachable\n")
 			default:
@@ -764,8 +994,10 @@ git commit -m "feat(cli): portal check after connect and Internet line in status
 ### Task 6: wiring + docs
 
 **Files:**
-- Modify: `cmd/net/main.go:270-287` (`createApp`)
+- Modify: `cmd/net/main.go:270-287` (`createApp` + new `createPortalDetector`)
 - Modify: `README.md` (command list + config reference; grep for existing `timeouts` docs)
+- Modify: `config.example` (portal + timeouts.portal entries)
+- Modify: `docs/plans/2026-07-17-captive-portal-design.md` (sync review-driven changes)
 
 **Step 1: Wire detector in `createApp`**
 
@@ -778,8 +1010,9 @@ func createApp() *App {
 	}
 }
 
-// createPortalDetector builds the portal detector from config when loaded,
-// falling back to defaults (Firefox probe URL, 3s) otherwise.
+// createPortalDetector builds the portal detector from config. Config is
+// loaded by PersistentPreRun (initializeManagers) before any command Run
+// calls createApp, so the nil-config fallback only covers load failures.
 func createPortalDetector() types.PortalDetector {
 	probeURL := ""
 	timeout := (&types.TimeoutConfig{}).GetPortalTimeout()
@@ -791,28 +1024,30 @@ func createPortalDetector() types.PortalDetector {
 }
 ```
 
-Add `"github.com/angelfreak/net/pkg/portal"` to main.go imports. Verify where `cfgManager` gets its config loaded (PersistentPreRun?) so `createPortalDetector` runs after load; if createApp can run before config load, the nil-config fallback covers it.
+Add `"github.com/angelfreak/net/pkg/portal"` to main.go imports.
 
 **Step 2: Build**
 
 Run: `go build ./... && go test ./...`
 Expected: clean build, all tests pass
 
-**Step 3: README** — add `net portal` to the commands section and this to the config example near `timeouts`:
+**Step 3: Docs** — add `net portal` to README's command section, and to BOTH the README config reference and `config.example` (users copy the example):
 
 ```yaml
 common:
   portal:
-    check: auto   # probe for captive portals after connect ("off" to disable)
+    check: auto   # probe for captive portals after connect and in status ("off" to disable)
     url: http://detectportal.firefox.com/success.txt
   timeouts:
-    portal: 3     # probe timeout in seconds
+    portal: 3     # captive-portal probe timeout in seconds
 ```
 
-**Step 4: Commit**
+**Step 4: Sync the design doc** — update `2026-07-17-captive-portal-design.md`: classification table (4xx/5xx ⇒ offline), PortalResult shape (PortalURL vs ProbeURL), `net status` honors `check: off`, root-exemption note, VPN hint wording. Add a "Revised after consensus review" note.
+
+**Step 5: Commit**
 
 ```bash
-git add cmd/net/main.go README.md
+git add cmd/net/main.go README.md config.example docs/plans/2026-07-17-captive-portal-design.md
 git commit -m "feat(cli): wire portal detector; document net portal"
 ```
 
@@ -821,7 +1056,30 @@ git commit -m "feat(cli): wire portal detector; document net portal"
 ### Task 7: full verification
 
 **Step 1:** `gofmt -l . | grep -v vendor` → no output; `go vet ./...` → clean
-**Step 2:** `go test ./...` → all packages PASS
+**Step 2:** `go test ./...` → all packages PASS (this is the required, deterministic verification: unit + httptest coverage of every classification row)
 **Step 3:** Build a real binary: `go build -o /tmp/net-portal-test ./cmd/net`
-**Step 4:** Real-life check on the live network (Amtrak_WiFi): run `/tmp/net-portal-test portal`; expect `Internet: ok` (already logged in) or `Captive portal detected!` + URL; verify exit code with `echo $?`. Also run `/tmp/net-portal-test status` and confirm the `Internet:` line. Neither needs root (pure HTTP probe + status reads).
+**Step 4 (manual QA — this session only, not CI):** the requesting user is literally sitting behind Amtrak_WiFi's portal; run `/tmp/net-portal-test portal` on the live network. Expect `Internet: ok` (already logged in) or `Captive portal detected!` + URL; verify exit code with `echo $?`; confirm no sudo prompt appears (root exemption). Also run `/tmp/net-portal-test status` and confirm the `Internet:` line.
 **Step 5:** Push branch, open PR per repo workflow (`gh pr create` with explicit `--repo`/`--base`/`--head` — origin redirects), then PR self-review per CLAUDE.md.
+
+---
+
+## Review Log
+
+### Round 1 (2026-07-17) — Codex: REVISE, Grok: REVISE, Claude self-review
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 1 | Grok (blocker) | `net portal` missing from root-exempt list → forced sudo | **Accepted.** Task 4 adds `"portal"` to `commandNeedsRootArgs` + `TestCommandNeedsRootArgs` cases. |
+| 2 | Codex (blocker) | `createPortalDetector` may run before config load | **Rejected with evidence:** config loads in `PersistentPreRun` (main.go:75-77) before any `Run` → `createApp()`. Lifecycle now documented in Task 6. |
+| 3 | Codex (blocker) | `os.Exit` in cobra `Run` untestable / may violate convention | **Rejected with evidence:** `Run` + `os.Exit` is the repo convention (status.go, connect.go, …). Exit mapping is a trivial switch; tested logic lives in `RunPortal`. |
+| 4 | Codex + Grok + self (major) | Any unexpected status (404/500/502) misclassified as Portal | **Accepted.** 4xx/5xx (except 511) now classify as Offline; tests added for 500, 404; `net portal` help text documents positive-evidence rule. |
+| 5 | Codex (major) | Probe-URL fallback printed as "Log in at:" is misleading | **Accepted.** `PortalResult` now has `PortalURL` (Location only) + `ProbeURL`; CLI says "Open <probe> in a browser to trigger the portal login page" when no Location. |
+| 6 | Codex (major) + self (minor) | `net status` network probe latency / no opt-out | **Accepted (partial).** `net status` honors `portal.check: off`; timeout bounded at 3s default. Always-on probing for status rejected as default per user's design decision. |
+| 7 | Codex (major) | "VPN will complete once portal login is done" possibly false for non-WireGuard | **Accepted.** Reworded to "the VPN may not come up until the portal login is complete"; behavior (still attempt VPN) unchanged per user decision. |
+| 8 | Grok (major) | Task 5 tests panic on real harness (nil config), tracking mock lacks Connect | **Accepted.** Tests rewritten compile-ready with proper `testConfigManager` setups; `trackingVPNManager` extended with `connectCalled`/`lastConnectName`. |
+| 9 | Grok (major) | Nested `common.portal` validation dropped vs design contract | **Accepted.** Added `validPortalFields`, nested validation, `check`-value validation, and rejection tests. |
+| 10 | Grok (minor) | No timeout test | **Accepted.** `TestCheck_Offline_Timeout` added with blocking handler. |
+| 11 | Grok (minor) | `config.example` not updated | **Accepted.** Task 6 updates `config.example`. |
+| 12 | Codex (minor) | Amtrak real-life step not reproducible | **Accepted (partial).** Marked manual QA (session-specific, explicitly requested by user); deterministic verification is the test suite. |
+| 13 | Self (major) | YAML `off` boolean ambiguity | **Resolved empirically:** yaml.v3 keeps unquoted `off` a string; config test locks it. `check`-value validation rejects other strings. |
+| 14 | Self (major) | Terminal escape injection via raw `Location` fallback | **Accepted.** Unparseable Locations return ""; test `TestCheck_Portal_MalformedLocationNotEchoed` added. |
