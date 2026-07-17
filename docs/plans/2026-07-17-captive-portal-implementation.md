@@ -6,7 +6,7 @@
 
 **Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; 3xx or 511 → portal (login URL from `Location`); 200 with unexpected body → portal (DNS-hijack style); transport errors **and all other HTTP statuses (4xx/5xx)** → offline, so a probe-endpoint outage is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
-**Accepted limitation (documented, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. On a multi-homed machine (wired + WiFi up), connecting to a captive WiFi while Ethernet has internet reports `Internet: ok` because the probe egresses via Ethernet. Binding the probe to the connected interface needs `SO_BINDTODEVICE` (CAP_NET_RAW — would break the root-exempt `net portal`) or fragile source-IP games; rejected for now (YAGNI, single-interface is the target scenario). Documented in README, design doc, and `net portal --help`.
+**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". Binding the probe to the connected interface needs `SO_BINDTODEVICE` (CAP_NET_RAW — would break the root-exempt `net portal`) or fragile source-IP games; out of scope. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its line host-wide (`Internet:  ok (default route)`); README, design doc, and `net portal --help` document the semantics.
 
 **Tech Stack:** Go stdlib `net/http` + `httptest` (no new dependencies), cobra, testify.
 
@@ -270,9 +270,28 @@ Add `"portal": true` to `validCommonFields`. In the validation pass where `commo
 
 1. Validate its subfields against `validPortalFields` (same `validateFields` helper, section name `common.portal`).
 2. Validate the `check` value **on the raw map, before unmarshal** (viper weak-typing coerces bools/ints to strings with no error): if present it must be a Go **string** whose trimmed, lowercased value is `""`, `"auto"`, or `"off"`; anything else (including YAML booleans/ints) fails with an error containing `common.portal.check must be "auto" or "off"`. The existing `ValidationError` type only formats "unknown field" messages — return this as a plain `fmt.Errorf` (or add a value-error variant to `ValidationError`, implementer's choice; the test asserts the message substring, not the type).
-3. Validate the `url` value at load when present: must parse, scheme `http`, non-empty host (mirrors the detector's runtime check; the CLI prints ProbeURL verbatim under the display-safety contract, so bad values are rejected before they can reach a terminal). Reject with a clear message; same error-type latitude as above.
+3. Validate the `url` value at load with these exact semantics (Grok r4: `url: ""` must not be rejected as "no host"):
+   - **absent key, YAML null (`url:`), or empty string (`url: ""`)** → default probe URL, no error;
+   - **non-empty string** → must pass the shared `portal.ValidateProbeURL` helper (parse OK, scheme `http`, non-empty host, no userinfo, no Cc/Cf runes in the serialized form — the CLI prints ProbeURL verbatim under the display-safety contract);
+   - **non-string** → clear error.
+
+Error plumbing (explicit, per review): extend `ValidationError` with an optional `Message string` field; `Error()` returns `Message` when set, else the existing unknown-field format. Value errors use `Message`.
+
+Additional tests:
+
+```go
+func TestPortalConfigEmptyURLAllowed(t *testing.T) {
+	for _, body := range []string{"url: \"\"", "url:", ""} { // empty, null, absent
+		configContent := "\ncommon:\n  portal:\n    " + body + "\n"
+		// ...LoadConfig...
+		assert.NoError(t, err, "portal url form %q must be accepted", body)
+	}
+}
+```
 
 This is deliberately stricter than the historically-unvalidated `timeouts` because a typo here silently re-enables probing or probes the wrong host.
+
+**Ordering note:** the URL rule uses `portal.ValidateProbeURL`, which lives in `pkg/portal`. Create `pkg/portal/validate.go` containing just that helper (plus its unit test) as part of this task — Task 3 then builds the Detector around it in the same package. Every commit stays compiling and green.
 
 **Step 4: Run to verify pass**
 
@@ -427,19 +446,54 @@ func TestCheck_Offline_NotFound(t *testing.T) {
 	assert.Equal(t, types.PortalStatusOffline, result.Status)
 }
 
+// brokenBodyTransport returns a 200 whose body errors mid-read — injected
+// via the Detector's test transport because httptest paths for mid-body
+// failures are not reliably deterministic.
+type brokenBodyTransport struct{}
+
+type brokenBody struct{ sent bool }
+
+func (b *brokenBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, "part"), nil
+	}
+	return 0, errors.New("connection reset mid-body")
+}
+func (b *brokenBody) Close() error { return nil }
+
+func (brokenBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &brokenBody{},
+		Header:     http.Header{},
+		Request:    req,
+	}, nil
+}
+
 func TestCheck_Offline_BodyReadFailure(t *testing.T) {
 	// 200 with a body that dies mid-read is a flaky link, not a portal.
+	d := New("http://probe.example.com/", time.Second, &testLogger{})
+	d.transport = brokenBodyTransport{}
+
+	result, err := d.Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOffline, result.Status)
+}
+
+func TestCheck_Portal_OversizedSuccessBody(t *testing.T) {
+	// "success" + KBs of whitespace + junk must never classify Online: an
+	// oversized body means something rewrote the response.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "1000") // promise more than we send
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("partial"))
-		// handler returns; connection closes short of Content-Length
+		w.Write([]byte("success"))
+		w.Write([]byte(strings.Repeat(" ", 5000)))
+		w.Write([]byte("<html>portal junk</html>"))
 	}))
 	defer srv.Close()
 
 	result, err := newTestDetector(srv.URL).Check()
 	assert.NoError(t, err)
-	assert.Equal(t, types.PortalStatusOffline, result.Status)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
 }
 
 func TestCheck_Offline_ConnectionRefused(t *testing.T) {
@@ -476,9 +530,21 @@ func TestCheck_HTTPSRejected(t *testing.T) {
 }
 
 func TestCheck_ProbeURLWithoutHostRejected(t *testing.T) {
-	for _, bad := range []string{"http:foo", "http:///path-only", "not a url"} {
+	for _, bad := range []string{"http:foo", "http:///path-only", "not a url", "http://user:pw@x.example.com/"} {
 		_, err := newTestDetector(bad).Check()
 		assert.Error(t, err, "probe URL %q must be rejected", bad)
+	}
+}
+
+func TestValidateProbeURL(t *testing.T) {
+	assert.NoError(t, ValidateProbeURL("http://x.example.com/p"))
+	for _, bad := range []string{
+		"https://x.example.com/",       // https undetectable by portals
+		"http:foo",                     // no host
+		"http://u:p@x.example.com/",    // userinfo spoofing
+		"http://evil‮.com/x",           // format rune in host
+	} {
+		assert.Error(t, ValidateProbeURL(bad), "%q must be rejected", bad)
 	}
 }
 
@@ -595,19 +661,39 @@ func New(probeURL string, timeout time.Duration, logger types.Logger) *Detector 
 	return &Detector{probeURL: probeURL, timeout: timeout, logger: logger}
 }
 
+// ValidateProbeURL reports whether raw is acceptable as a probe endpoint:
+// parseable, plain http (portals cannot intercept https), non-empty host, no
+// userinfo, and no control/format runes in the serialized form (the CLI
+// prints the probe URL verbatim). Shared by config load-time validation and
+// Check's runtime guard.
+func ValidateProbeURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid portal probe URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" {
+		return fmt.Errorf("portal probe URL must be plain http, got %q — portals cannot intercept %s", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("portal probe URL %q has no host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("portal probe URL %q must not contain userinfo", raw)
+	}
+	for _, r := range u.String() {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("portal probe URL contains control or format characters")
+		}
+	}
+	return nil
+}
+
 // Check probes the endpoint and classifies the response. Transport failures
 // and unexpected error statuses mean PortalStatusOffline (nil error); an
 // error is returned only for a misconfigured probe URL.
 func (d *Detector) Check() (types.PortalResult, error) {
-	u, err := url.Parse(d.probeURL)
-	if err != nil {
-		return types.PortalResult{}, fmt.Errorf("invalid portal probe URL %q: %w", d.probeURL, err)
-	}
-	if u.Scheme != "http" {
-		return types.PortalResult{}, fmt.Errorf("portal probe URL must be plain http, got %q — portals cannot intercept %s", d.probeURL, u.Scheme)
-	}
-	if u.Host == "" {
-		return types.PortalResult{}, fmt.Errorf("portal probe URL %q has no host", d.probeURL)
+	if err := ValidateProbeURL(d.probeURL); err != nil {
+		return types.PortalResult{}, err
 	}
 
 	transport := d.transport
@@ -635,18 +721,21 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	// Read one byte past the cap so an oversized body can never be trimmed
+	// into a fake "success" (e.g. "success" + KBs of whitespace + junk).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if err != nil {
 		// A truncated/broken body on an otherwise-OK response is a flaky
 		// link, not evidence of a portal.
 		d.logger.Debug("Portal probe body read failed", "error", err)
 		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
 	}
+	oversized := len(body) > maxBodyBytes
 	d.logger.Debug("Portal probe response", "status", resp.StatusCode)
 
 	switch {
 	case resp.StatusCode == http.StatusNoContent,
-		resp.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == "success":
+		resp.StatusCode == http.StatusOK && !oversized && strings.TrimSpace(string(body)) == "success":
 		return types.PortalResult{Status: types.PortalStatusOnline, ProbeURL: d.probeURL}, nil
 	case resp.StatusCode >= 300 && resp.StatusCode < 400,
 		resp.StatusCode == http.StatusNetworkAuthenticationRequired:
@@ -672,6 +761,9 @@ func (d *Detector) Check() (types.PortalResult, error) {
 // http/https URLs with a host, and rejected outright ("") if the serialized
 // URL contains any control or format characters. The Location value comes
 // from an untrusted network — it must never reach the terminal unvalidated.
+// Plain-http login URLs are accepted by design: captive-portal interception
+// necessarily starts over http, and schemeless redirects (//host/path)
+// inherit the probe's http scheme.
 func loginURL(base *url.URL, location string, logger types.Logger) string {
 	if location == "" {
 		return ""
@@ -887,16 +979,25 @@ plain HTTP; no CAP_NET_ADMIN needed):
 		case "help", "completion", "status", "show", "list", "portal":
 ```
 
-`cmd/net/main.go` — wire the detector in `createApp` and add the factory:
+`cmd/net/main.go` — wire the detector (and the route manager used by Task 5's
+multi-home signaling) in `createApp` and add the factory:
 
 ```go
 func createApp() *App {
 	return &App{
 		// ... existing fields ...
 		PortalDet:  createPortalDetector(),
+		RouteMgr:   netlink.NewRouteManager(),
 		// ...
 	}
 }
+```
+
+(`App` gains `RouteMgr types.RouteManager` next to `PortalDet`; add the
+`pkg/netlink` import. Nil `RouteMgr` must be tolerated by all users — tests
+mostly leave it nil.)
+
+```go
 
 // createPortalDetector builds the portal detector from config. Config is
 // loaded by PersistentPreRun (initializeManagers) before any command Run
@@ -929,6 +1030,7 @@ import (
 
 var portalCmd = &cobra.Command{
 	Use:   "portal",
+	Args:  cobra.NoArgs, // scripting command with exit-code semantics — reject stray args
 	Short: "Check for a captive portal on the current connection",
 	Long: `Probe a connectivity-check URL to determine whether the current network
 has working internet or a captive portal intercepting traffic.
@@ -978,8 +1080,8 @@ git commit -m "feat(cli): root-exempt net portal command with scripting exit cod
 ### Task 5: connect + status integration
 
 **Files:**
-- Modify: `cmd/net/app.go` (`RunConnect` tail ~line 281-288, `RunStatus`, `connectVPN` refactor, new helpers)
-- Test: `cmd/net/app_test.go`
+- Modify: `cmd/net/app.go` (`RunConnect` tail ~line 281-288, `RunStatus`, `connectVPN` refactor, new helpers; add `"time"` and `types.RouteManager` field usage — `RouteMgr` field itself was added in Task 4)
+- Test: `cmd/net/app_test.go` (also converts the seven `TestApp_connectVPN_*` tests, see Step 3 note)
 
 **Step 1: Write the failing tests** (complete and compile-ready; setups mirror `TestApp_RunConnect_DirectSSID` and `TestApp_RunConnect_WithVPNIntegration`)
 
@@ -1123,6 +1225,56 @@ func TestApp_RunConnect_OfflineAfterRetryWarns(t *testing.T) {
 	assert.Contains(t, stderr.String(), "no internet connectivity")
 }
 
+// stubRouteManager implements types.RouteManager with a fixed default route;
+// only GetDefaultRoute matters here, the rest are inert no-ops.
+type stubRouteManager struct{ def *types.Route }
+
+func (s *stubRouteManager) GetDefaultRoute() (*types.Route, error) {
+	if s.def == nil {
+		return nil, errors.New("no default route")
+	}
+	return s.def, nil
+}
+func (s *stubRouteManager) GetDefaultRouteForIface(string) (*types.Route, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *stubRouteManager) ReplaceDefault(string, string, int) error     { return nil }
+func (s *stubRouteManager) SetDefaultForIface(string, string, int) error { return nil }
+func (s *stubRouteManager) AddRoute(string, string, string) error        { return nil }
+func (s *stubRouteManager) ReplaceRoute(string, string, string) error    { return nil }
+func (s *stubRouteManager) DelRoute(string) error                        { return nil }
+func (s *stubRouteManager) FlushRoutes(string) error                     { return nil }
+func (s *stubRouteManager) ListRoutes() ([]types.Route, error)           { return nil, nil }
+
+func TestApp_RunConnect_MultiHomedNoteWhenDefaultRouteElsewhere(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &stubRouteManager{def: &types.Route{Gw: "10.0.0.1", Iface: "eth0"}}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Contains(t, stderr.String(), "default route (eth0)")
+	assert.Contains(t, stderr.String(), "wlan0")
+}
+
+func TestApp_RunConnect_NoMultiHomedNoteWhenRoutesMatch(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &stubRouteManager{def: &types.Route{Gw: "192.168.1.1", Iface: "wlan0"}}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.NotContains(t, stderr.String(), "default route (")
+}
+
 func TestApp_RunConnect_MisconfiguredProbeWarns(t *testing.T) {
 	// A Check() error means misconfiguration — must be visible on stderr,
 	// not silently swallowed (a silent skip looks like "no portal").
@@ -1199,7 +1351,7 @@ func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
 
 **Step 2: Run to verify failure**
 
-Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunConnect_NilDetector|TestApp_RunConnect_Offline|TestApp_RunStatus_ShowsInternet|TestApp_RunStatus_PortalCheckOff' -v`
+Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunConnect_NilDetector|TestApp_RunConnect_Offline|TestApp_RunConnect_MultiHomed|TestApp_RunConnect_NoMultiHomed|TestApp_RunConnect_Misconfigured|TestApp_RunConnect_RetryError|TestApp_RunStatus_' -v`
 Expected: FAIL (no warning printed / no Internet line); the NilDetector test may already pass — keep it as a regression guard
 
 **Step 3: Implement**
@@ -1217,9 +1369,20 @@ Refactor `connectVPN` so name resolution is reusable (behavior unchanged):
 
 ```go
 // resolveVPNName replaces connectVPN (which is deleted — RunConnect was its
-// only caller and now calls attemptVPNConnect itself so the portal hint and
-// the VPN attempt resolve the name exactly once). Carries over connectVPN's
-// doc comment about inheritance semantics (vpn: name / vpn: empty / no key).
+// only production caller and now calls attemptVPNConnect itself so the portal
+// hint and the VPN attempt resolve the name exactly once). Carries over
+// connectVPN's doc comment about inheritance semantics (vpn: name / vpn:
+// empty / no key).
+//
+// NOTE: seven existing tests (`TestApp_connectVPN_*`, app_test.go:1026-1136)
+// call connectVPN directly. Convert them, preserving coverage:
+//   - the five inheritance-semantics cases (NetworkSpecificVPN, CommonVPN,
+//     NetworkVPNOverridesCommon, NoConfig, NoVPNConfigured,
+//     VPNExplicitlyDisabled) assert `resolveVPNName(...)` returns the
+//     expected name ("" for the no-VPN cases) instead of asserting through
+//     the VPN manager mock;
+//   - ConnectionError calls `attemptVPNConnect("name")` directly and keeps
+//     its existing stderr assertion.
 func (a *App) resolveVPNName(networkName string) string {
 	config := a.ConfigMgr.GetConfig()
 	if config == nil {
@@ -1250,14 +1413,22 @@ func (a *App) portalCheckEnabled() bool {
 }
 
 // checkPortalAfterConnect probes for a captive portal right after a
-// connection comes up. An initial "offline" gets one retry after a short
-// settle delay — right after DHCP, routes/DNS can lag by a few hundred ms
-// and a premature warning trains users to ignore it. Never fatal — prints
-// warnings to stderr only. Reports whether a portal was detected so
-// RunConnect can add a VPN hint.
-func (a *App) checkPortalAfterConnect() bool {
+// connection comes up on connectedIface. An initial "offline" gets one retry
+// after a short settle delay — right after DHCP, routes/DNS can lag by a few
+// hundred ms and a premature warning trains users to ignore it. When the
+// default route egresses a different interface than the one just connected
+// (dual-homed: wired metric 100 beats WiFi 600), the probe result describes
+// the wrong path — say so instead of reporting a silent false "ok". Never
+// fatal — prints warnings to stderr only. Reports whether a portal was
+// detected so RunConnect can add a VPN hint.
+func (a *App) checkPortalAfterConnect(connectedIface string) bool {
 	if !a.portalCheckEnabled() {
 		return false
+	}
+	if a.RouteMgr != nil && connectedIface != "" {
+		if r, rerr := a.RouteMgr.GetDefaultRoute(); rerr == nil && r.Iface != "" && r.Iface != connectedIface {
+			a.errorf("Note: the portal probe uses the default route (%s), not the just-connected %s — a portal on %s may go undetected.\n", r.Iface, connectedIface, connectedIface)
+		}
 	}
 	result, err := a.PortalDet.Check()
 	if err != nil {
@@ -1300,7 +1471,7 @@ func (a *App) checkPortalAfterConnect() bool {
 In `RunConnect`, replace the tail (after `a.printConnectionInfo(connectedIface)`):
 
 ```go
-	portalDetected := a.checkPortalAfterConnect()
+	portalDetected := a.checkPortalAfterConnect(connectedIface)
 
 	// Connect VPN if configured and not disabled (resolve the name once so
 	// the hint and the attempt can never disagree)
@@ -1335,7 +1506,10 @@ In `RunStatus`, after the connection-info block (the `if connErr == nil && conn 
 		case result.Status == types.PortalStatusOffline:
 			a.printf("Internet:  unreachable\n")
 		default:
-			a.printf("Internet:  ok\n")
+			// Labeled host-wide: the probe follows the default route and is
+			// not scoped to the Interface: shown above (which may even be
+			// disconnected while another link provides internet).
+			a.printf("Internet:  ok (default route)\n")
 		}
 	}
 ```
@@ -1449,3 +1623,19 @@ git commit -m "docs: document net portal command and portal config"
 | 36 | Codex (minor) | Scripts can't distinguish offline from config error | **Accepted.** Exit code 3 for config/internal errors; help text updated. |
 | 37 | Codex (minor) | Validation semantics not documented | **Accepted.** README/config.example note allowed values and URL constraints. |
 | 38 | Self (major) | `TestLoginURL` bidi-in-PATH vector expects "" but `URL.String()` percent-encodes it (display-safe, accepted) | **Accepted.** Vector fixed to expect percent-encoded form; new host-bidi vector expects "" (hosts serialize raw, rune scan rejects). |
+
+### Round 4 (2026-07-17) — Codex: REVISE, Grok: REVISE, Claude self-review: 1 major (found & fixed pre-merge)
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 39 | Self + Grok (blocker) + Codex (major) | Deleting `connectVPN` breaks seven direct-call tests / behavior-preservation unproven | **Accepted (self-caught pre-merge).** The seven `TestApp_connectVPN_*` tests are the characterization suite; plan converts them (inheritance cases → `resolveVPNName` assertions, ConnectionError → `attemptVPNConnect` direct). |
+| 40 | Grok (major) | `url: ""` rejected as "no host" contradicts "empty means default"; `url:` null mishandled | **Accepted.** Explicit semantics: absent/null/"" → default (no error); non-empty string → validated; non-string → error. `TestPortalConfigEmptyURLAllowed` added. |
+| 41 | Grok (major) | Multi-home "YAGNI single-interface" rationale false — repo models dual-homing (metrics 100/600); silent false "ok" | **Accepted.** Reframed as known product gap with honest signaling: connect-time stderr note when default-route iface ≠ connected iface (via `types.RouteManager`, wired `netlink.NewRouteManager()`, nil-safe); tests with stub route manager. |
+| 42 | Grok (major) | `net status` probes while selected iface disconnected; `ok` next to `State: disconnected` unspecified | **Accepted (option B).** Line labeled host-wide: `Internet:  ok (default route)`; README documents it is not scoped to `Interface:`. |
+| 43 | Grok (minor) + Codex (major) | ProbeURL display-safety weaker than contract; no shared validator | **Accepted.** `portal.ValidateProbeURL` (parse, http, host, no userinfo, no Cc/Cf runes) shared by config load and `Check()`; created in Task 2 so commits stay green. |
+| 44 | Codex (blocker→minor as assessed) | Oversized body can trim to fake "success" | **Accepted.** Read `maxBodyBytes+1`; oversized is never Online (Portal on 200); whitespace-padding test added. (An adversarial portal can spoof `success` outright — no detector beats that — so this is robustness, not security.) |
+| 45 | Codex (major) | Short-Content-Length httptest for body failure may be nondeterministic | **Accepted.** Replaced with injected `RoundTripper` whose body errors mid-read. |
+| 46 | Codex (major) | `net portal` accepts stray args | **Accepted.** `Args: cobra.NoArgs`. |
+| 47 | Codex (minor) | Schemeless `//host` redirect yields http URL, tradeoff undocumented | **Accepted.** Documented on `loginURL`: portal interception necessarily starts over http. |
+| 48 | Codex (minor) | Per-task commits pollute history if final verification fails | **Rejected:** incremental commits that compile and pass tests are this repo's explicit convention (CLAUDE.md); PR review happens on the branch. |
+| 49 | Grok (secondary) | `fmt.Errorf` doesn't fit `ValidationErrors`; missing `time` import; `-run` filter gaps | **Accepted.** `ValidationError.Message` field specified; imports and filter updated. |
