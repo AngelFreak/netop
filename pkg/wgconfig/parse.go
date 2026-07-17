@@ -116,9 +116,9 @@ func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
 		}
 		cfg.ListenPort = &port
 	case "fwmark":
-		mark, err := strconv.Atoi(value)
-		if err != nil || mark < 0 {
-			return fmt.Errorf("invalid FwMark %q", value)
+		mark, err := parseFwMark(value)
+		if err != nil {
+			return err
 		}
 		cfg.FirewallMark = &mark
 	case "address", "dns", "mtu", "table", "preup", "postup", "predown", "postdown", "saveconfig":
@@ -127,6 +127,22 @@ func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
 		return fmt.Errorf("unknown [Interface] key %q", key)
 	}
 	return nil
+}
+
+// parseFwMark parses a WireGuard FwMark value, matching what `wg setconf`
+// accepts: the special disabled form "off" (0), a decimal value, or a
+// base-prefixed value such as "0xca6c". The result must fit in an unsigned
+// 32-bit integer.
+func parseFwMark(value string) (int, error) {
+	if strings.EqualFold(value, "off") {
+		return 0, nil
+	}
+	// base 0 lets strconv detect 0x/0o/0b prefixes; 32-bit unsigned range.
+	mark, err := strconv.ParseUint(value, 0, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid FwMark %q", value)
+	}
+	return int(mark), nil
 }
 
 // applyPeerKey handles keys under [Peer].

@@ -127,6 +127,35 @@ func TestParseConfig_Errors(t *testing.T) {
 	}
 }
 
+func TestParseConfig_FwMark(t *testing.T) {
+	t.Run("hex (wg tooling form)", func(t *testing.T) {
+		cfg, err := parseConfig("[Interface]\nPrivateKey = " + zeroKey + "\nFwMark = 0xca6c")
+		require.NoError(t, err)
+		require.NotNil(t, cfg.FirewallMark)
+		assert.Equal(t, 0xca6c, *cfg.FirewallMark)
+	})
+	t.Run("decimal", func(t *testing.T) {
+		cfg, err := parseConfig("[Interface]\nPrivateKey = " + zeroKey + "\nFwMark = 51820")
+		require.NoError(t, err)
+		require.NotNil(t, cfg.FirewallMark)
+		assert.Equal(t, 51820, *cfg.FirewallMark)
+	})
+	t.Run("off means zero", func(t *testing.T) {
+		cfg, err := parseConfig("[Interface]\nPrivateKey = " + zeroKey + "\nFwMark = off")
+		require.NoError(t, err)
+		require.NotNil(t, cfg.FirewallMark)
+		assert.Equal(t, 0, *cfg.FirewallMark)
+	})
+	t.Run("out of 32-bit range rejected", func(t *testing.T) {
+		_, err := parseConfig("[Interface]\nPrivateKey = " + zeroKey + "\nFwMark = 0x1FFFFFFFF")
+		assert.Error(t, err)
+	})
+	t.Run("garbage rejected", func(t *testing.T) {
+		_, err := parseConfig("[Interface]\nPrivateKey = " + zeroKey + "\nFwMark = nope")
+		assert.Error(t, err)
+	})
+}
+
 func TestParseConfig_EndpointFormats(t *testing.T) {
 	t.Run("IPv4", func(t *testing.T) {
 		cfg, err := parseConfig("[Peer]\nPublicKey = " + zeroKey + "\nEndpoint = 203.0.113.5:1194")
