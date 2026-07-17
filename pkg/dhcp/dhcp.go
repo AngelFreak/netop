@@ -27,6 +27,8 @@ type dhcpManagerImpl struct {
 	outInterface    string                // Interface for NAT routing (e.g., wlan0)
 	prevIPForward   string                // ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
 	linkMgr         types.LinkManager     // netlink-backed link access (interface up/down)
+	addrMgr         types.AddrManager     // netlink-backed interface address access
+	routeMgr        types.RouteManager    // netlink-backed routing table access
 	firewall        types.FirewallManager // go-iptables-backed NAT rules; nil until first use / injected in tests
 }
 
@@ -40,6 +42,8 @@ func NewDHCPManager(executor types.SystemExecutor, logger types.Logger) types.DH
 		leasesFile:      types.RuntimeDir + "/dnsmasq-dhcp.leases",
 		stateFile:       types.RuntimeDir + "/dhcp-state",
 		linkMgr:         netlink.NewLinkManager(),
+		addrMgr:         netlink.NewAddrManager(),
+		routeMgr:        netlink.NewRouteManager(),
 	}
 }
 
@@ -83,14 +87,14 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 	}
 
 	// Flush stale IP addresses (e.g., from a previous failed Stop)
-	d.executor.Execute("ip", "addr", "flush", "dev", config.Interface)
+	d.addrMgr.Flush(config.Interface)
 
 	// Set IP address on interface with configurable netmask
 	netmask := config.Netmask
 	if netmask == "" {
 		netmask = "24" // Default for backwards compatibility
 	}
-	if _, err := d.executor.Execute("ip", "addr", "add", config.Gateway+"/"+netmask, "dev", config.Interface); err != nil {
+	if err := d.addrMgr.Add(config.Interface, config.Gateway+"/"+netmask); err != nil {
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
 
@@ -153,7 +157,7 @@ func (d *dhcpManagerImpl) Stop() error {
 	// Clean up interface if we have config
 	if d.currentConfig != nil {
 		// Remove IP address
-		if _, err := d.executor.Execute("ip", "addr", "flush", "dev", d.currentConfig.Interface); err != nil {
+		if err := d.addrMgr.Flush(d.currentConfig.Interface); err != nil {
 			d.logger.Warn("Failed to flush IP addresses", "error", err.Error())
 		}
 
@@ -351,19 +355,12 @@ func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
 
 // detectOutInterface finds the default route interface (excluding the given interface)
 func (d *dhcpManagerImpl) detectOutInterface(exclude string) string {
-	output, err := d.executor.Execute("ip", "route", "show", "default")
+	route, err := d.routeMgr.GetDefaultRoute()
 	if err != nil {
 		return ""
 	}
-
-	fields := strings.Fields(output)
-	for i, field := range fields {
-		if field == "dev" && i+1 < len(fields) {
-			iface := fields[i+1]
-			if iface != exclude {
-				return iface
-			}
-		}
+	if route.Iface != "" && route.Iface != exclude {
+		return route.Iface
 	}
 	return ""
 }

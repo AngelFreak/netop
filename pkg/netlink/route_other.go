@@ -58,6 +58,16 @@ func (m *RouteManager) AddRoute(iface, destination, gw string) error {
 	return ErrUnsupported
 }
 
+// ReplaceRoute always returns ErrUnsupported on non-Linux platforms.
+func (m *RouteManager) ReplaceRoute(iface, destination, gw string) error {
+	return ErrUnsupported
+}
+
+// DelRoute always returns ErrUnsupported on non-Linux platforms.
+func (m *RouteManager) DelRoute(destination string) error {
+	return ErrUnsupported
+}
+
 // FlushRoutes always returns ErrUnsupported on non-Linux platforms.
 func (m *RouteManager) FlushRoutes(iface string) error {
 	return ErrUnsupported

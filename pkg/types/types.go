@@ -333,10 +333,17 @@ type RouteManager interface {
 	// routes on other interfaces intact. Use this for per-interface config that
 	// must coexist with other links (multi-homing). metric of 0 means unset.
 	SetDefaultForIface(iface, gw string, metric int) error
-	// AddRoute adds a route to destination (CIDR) via gw on iface. If gw is "",
-	// a device-scoped route is added. Returns an error if the route already
-	// exists.
+	// AddRoute adds a route to destination (CIDR or bare host IP) via gw on
+	// iface. If gw is "", a device-scoped route is added. Returns an error if
+	// the route already exists.
 	AddRoute(iface, destination, gw string) error
+	// ReplaceRoute installs a route to destination (CIDR or bare host IP) via gw
+	// on iface, replacing any existing route to the same destination. If gw is
+	// "", a device-scoped route is installed.
+	ReplaceRoute(iface, destination, gw string) error
+	// DelRoute removes the route to destination (CIDR or bare host IP). Missing
+	// routes are not treated as errors.
+	DelRoute(destination string) error
 	// FlushRoutes removes all IPv4 routes associated with iface.
 	FlushRoutes(iface string) error
 	// ListRoutes returns all IPv4 routes in the main table.

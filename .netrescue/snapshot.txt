@@ -1,0 +1,24 @@
+# Network snapshot Tue Jul 14 04:48:16 PM CEST 2026
+## default route
+default dev wg0 scope link 
+## all routes
+default dev wg0 scope link 
+100.91.0.0/16 dev wt0 proto kernel scope link src 100.91.253.21 
+149.50.217.161 via 192.168.3.2 dev wlp1s0 
+192.168.3.0/24 dev wlp1s0 proto kernel scope link src 192.168.3.251 
+## addresses
+1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+1: lo    inet6 ::1/128 scope host noprefixroute \       valid_lft forever preferred_lft forever
+3: wlp1s0    inet 192.168.3.251/24 brd 192.168.3.255 scope global wlp1s0\       valid_lft forever preferred_lft forever
+3: wlp1s0    inet6 fe80::aebc:32ff:fe5e:8d53/64 scope link \       valid_lft forever preferred_lft forever
+4: tailscale0    inet6 fe80::98a9:c57e:974:346d/64 scope link stable-privacy \       valid_lft forever preferred_lft forever
+6: wt0    inet 100.91.253.21/16 brd 100.91.255.255 scope global wt0\       valid_lft forever preferred_lft forever
+7: wg0    inet 10.2.0.2/32 scope global wg0\       valid_lft forever preferred_lft forever
+## resolv.conf attrs
+----i---------e------- /etc/resolv.conf
+## resolv.conf content
+nameserver 1.1.1.1
+## wg
+4: tailscale0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1280 qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500\    link/none 
+6: wt0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1280 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/none 
+7: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/none 

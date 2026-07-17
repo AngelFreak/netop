@@ -297,7 +297,6 @@ func TestConnect(t *testing.T) {
 					// WireGuard commands
 					"rm -f " + tmpDir + "/wg.conf":          "",
 					"wg setconf wg0 " + tmpDir + "/wg.conf": "",
-					"ip route replace default dev wg0":      "",
 				},
 			}
 			logger := &mockLogger{}
@@ -558,7 +557,6 @@ func TestConnectWireGuard(t *testing.T) {
 		commands: map[string]string{
 			"wg setconf wg0 " + tmpDir + "/wg.conf": "",
 			"rm -f " + tmpDir + "/wg.conf":          "",
-			"ip route replace default dev wg0":      "",
 		},
 	}
 	logger := &mockLogger{}
@@ -890,12 +888,13 @@ func TestConnectWireGuard_ErrorCases(t *testing.T) {
 			commands: map[string]string{
 				"wg setconf wg0 " + tmpDir + "/wg.conf": "",
 			},
-			errors: map[string]error{
-				"ip route replace default dev wg0": assert.AnError,
-			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, runtimeDir: tmpDir}
+		// The default-route replace now goes through the RouteManager, so inject
+		// the failure there to exercise the warning-only path.
+		routes := newFakeRoutes()
+		routes.ReplaceErr = assert.AnError
+		manager := &Manager{routeMgr: routes, addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, runtimeDir: tmpDir}
 
 		config := &types.VPNConfig{
 			Config:    "wireguard config",
@@ -1489,7 +1488,8 @@ func TestDisconnect_RemovesPersistedEndpointRoute(t *testing.T) {
 	}
 	logger := &mockLogger{}
 	manager := NewManagerWithDir(executor, logger, &mockConfigManager{}, tempDir)
-	manager.routeMgr = newFakeRoutes()
+	routes := newFakeRoutes()
+	manager.routeMgr = routes
 	manager.addrMgr = newFakeAddrs()
 	manager.linkMgr = newFakeLinks()
 
@@ -1506,7 +1506,7 @@ func TestDisconnect_RemovesPersistedEndpointRoute(t *testing.T) {
 
 	err = manager.Disconnect("")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "ip route del 203.0.113.5")
+	assert.Contains(t, routes.DeletedRoutes, "203.0.113.5")
 }
 
 func TestConnectWireGuard_ResolvesHostnameEndpoint(t *testing.T) {
@@ -1515,7 +1515,6 @@ func TestConnectWireGuard_ResolvesHostnameEndpoint(t *testing.T) {
 		commands: map[string]string{
 			"wg setconf wg0 " + tmpDir + "/wg.conf": "",
 			"rm -f " + tmpDir + "/wg.conf":          "",
-			"ip route replace default dev wg0":      "",
 		},
 	}
 	logger := &mockLogger{}
@@ -1588,7 +1587,8 @@ func TestConnect_RemovesOldEndpointRouteOnSwitch(t *testing.T) {
 		},
 	}
 	manager := NewManagerWithDir(executor, logger, configMgr, tempDir)
-	manager.routeMgr = newFakeRoutes()
+	routes := newFakeRoutes()
+	manager.routeMgr = routes
 	manager.addrMgr = newFakeAddrs()
 	manager.linkMgr = newFakeLinks()
 
@@ -1602,7 +1602,7 @@ func TestConnect_RemovesOldEndpointRouteOnSwitch(t *testing.T) {
 
 	err = manager.Connect("new-nb")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "ip route del 203.0.113.9")
+	assert.Contains(t, routes.DeletedRoutes, "203.0.113.9")
 }
 
 // When two same-type daemon VPNs are configured and none is net-tracked, live

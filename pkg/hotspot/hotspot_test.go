@@ -117,7 +117,7 @@ func (m *mockLogger) Warn(msg string, fields ...interface{})  {}
 func (m *mockLogger) Error(msg string, fields ...interface{}) {}
 
 // Test helpers
-func setupTestManager() (*hotspotManagerImpl, *mockExecutor, *fake.LinkManager, *fwfake.Manager) {
+func setupTestManager() (*hotspotManagerImpl, *mockExecutor, *fake.LinkManager, *fwfake.Manager, *fake.AddrManager, *fake.RouteManager) {
 	executor := newMockExecutor()
 	logger := &mockLogger{}
 	mgr := NewHotspotManager(executor, logger).(*hotspotManagerImpl)
@@ -126,6 +126,19 @@ func setupTestManager() (*hotspotManagerImpl, *mockExecutor, *fake.LinkManager, 
 	// tests don't touch real interfaces. Interface up/down is recorded on it.
 	links := &fake.LinkManager{}
 	mgr.linkMgr = links
+
+	// Replace the real netlink-backed address manager with an in-memory fake so
+	// setupInterface/cleanupInterface/Stop record Add/Flush calls instead of
+	// shelling out to real `ip addr`. Without this, the real netlink manager
+	// would try to resolve real interfaces.
+	addrs := &fake.AddrManager{}
+	mgr.addrMgr = addrs
+
+	// Replace the real netlink-backed route manager with an in-memory fake that
+	// advertises a default route on eth0, so detectOutInterface returns "eth0"
+	// for NAT setup. Empty Dst marks the route as default.
+	routes := &fake.RouteManager{Routes: []types.Route{{Gw: "192.168.1.1", Iface: "eth0"}}}
+	mgr.routeMgr = routes
 
 	// Inject a fake FirewallManager so setupNAT/cleanupNAT record EnableNAT/
 	// DisableNAT calls instead of shelling out to real iptables. Without this,
@@ -141,7 +154,7 @@ func setupTestManager() (*hotspotManagerImpl, *mockExecutor, *fake.LinkManager, 
 	mgr.dnsmasqConfFile = filepath.Join(tmpDir, "test_dnsmasq.conf")
 	mgr.stateFile = filepath.Join(tmpDir, "test_hotspot_state")
 
-	return mgr, executor, links, fw
+	return mgr, executor, links, fw, addrs, routes
 }
 
 func cleanup(mgr *hotspotManagerImpl) {
@@ -163,7 +176,7 @@ func TestNewHotspotManager(t *testing.T) {
 }
 
 func TestStart_Success(t *testing.T) {
-	mgr, executor, links, fw := setupTestManager()
+	mgr, executor, links, fw, addrs, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	// Redirect the ip_forward sysctl to a temp file so setupNAT reads/writes it
@@ -183,10 +196,10 @@ func TestStart_Success(t *testing.T) {
 		DNS:       []string{"8.8.8.8"},
 	}
 
-	// Mock successful commands
+	// Mock successful commands. The `ip addr add` and `ip route show default`
+	// shell-outs were migrated to the addr/route netlink fakes (asserted below),
+	// so only the remaining iw/hostapd/dnsmasq commands are mocked here.
 	executor.commands["iw wlan0 set type __ap"] = ""
-	executor.commands["ip addr add 192.168.50.1/24 dev wlan0"] = ""
-	executor.commands["ip route show default"] = "default via 192.168.1.1 dev eth0"
 
 	hostapdCmd := fmt.Sprintf("hostapd -B -P %s %s", mgr.hostapdPidFile, mgr.hostapdConfFile)
 	dnsmasqCmd := fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)
@@ -222,6 +235,10 @@ func TestStart_Success(t *testing.T) {
 	// manager for the detected outbound interface (eth0).
 	assert.Contains(t, fw.Enabled, fwfake.NATCall{Internal: "wlan0", Out: "eth0"})
 
+	// setupInterface must have assigned the gateway/netmask to the interface
+	// via the addr manager (replacing the `ip addr add` shell-out).
+	assert.Contains(t, addrs.Added, fake.AddrCall{Iface: "wlan0", CIDR: "192.168.50.1/24"})
+
 	// Verify the interface was cycled down then up via the link manager
 	assert.Contains(t, links.Downed, "wlan0")
 	assert.Contains(t, links.Upped, "wlan0")
@@ -232,7 +249,7 @@ func TestStart_Success(t *testing.T) {
 }
 
 func TestStart_InvalidConfig(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	tests := []struct {
@@ -309,7 +326,7 @@ func TestValidChannel(t *testing.T) {
 }
 
 func TestStart_AlreadyRunning(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -336,7 +353,7 @@ func TestStart_AlreadyRunning(t *testing.T) {
 }
 
 func TestStart_InterfaceDownFails(t *testing.T) {
-	mgr, _, links, _ := setupTestManager()
+	mgr, _, links, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -357,7 +374,7 @@ func TestStart_InterfaceDownFails(t *testing.T) {
 }
 
 func TestStart_HostapdFails(t *testing.T) {
-	mgr, executor, _, _ := setupTestManager()
+	mgr, executor, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -370,7 +387,6 @@ func TestStart_HostapdFails(t *testing.T) {
 	}
 
 	executor.commands["iw wlan0 set type __ap"] = ""
-	executor.commands["ip addr add 192.168.50.1/24 dev wlan0"] = ""
 	executor.errors[fmt.Sprintf("hostapd -B -P %s %s", mgr.hostapdPidFile, mgr.hostapdConfFile)] = fmt.Errorf("hostapd failed")
 
 	err := mgr.Start(config)
@@ -380,7 +396,7 @@ func TestStart_HostapdFails(t *testing.T) {
 }
 
 func TestStop_Success(t *testing.T) {
-	mgr, executor, links, _ := setupTestManager()
+	mgr, executor, links, _, addrs, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	// Keep the ip_forward sysctl write in cleanupNAT off the real /proc.
@@ -405,7 +421,6 @@ func TestStop_Success(t *testing.T) {
 
 	executor.commands["kill "+hostapdPid] = ""
 	executor.commands["kill "+dnsmasqPid] = ""
-	executor.commands["ip addr flush dev wlan0"] = ""
 	executor.commands["iw wlan0 set type managed"] = ""
 
 	err := mgr.Stop()
@@ -414,13 +429,16 @@ func TestStop_Success(t *testing.T) {
 	assert.Nil(t, mgr.currentConfig)
 	assert.NoFileExists(t, mgr.hostapdPidFile)
 	assert.NoFileExists(t, mgr.dnsmasqPidFile)
+	// Stop must flush the interface's IP addresses via the addr manager
+	// (replacing the `ip addr flush` shell-out).
+	assert.Contains(t, addrs.Flushed, "wlan0")
 	// Interface is brought down (for the managed-mode switch) then back up
 	assert.Contains(t, links.Downed, "wlan0")
 	assert.Contains(t, links.Upped, "wlan0")
 }
 
 func TestStop_NotRunning(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	err := mgr.Stop()
@@ -431,7 +449,7 @@ func TestStop_NotRunning(t *testing.T) {
 
 // Teardown must restore the pre-hotspot ip_forward value, not force it to 0.
 func TestStop_RestoresPriorIPForward(t *testing.T) {
-	mgr, executor, _, fw := setupTestManager()
+	mgr, executor, _, fw, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	// Simulate the host having forwarding enabled before us: pre-write "1" to
@@ -449,7 +467,6 @@ func TestStop_RestoresPriorIPForward(t *testing.T) {
 	defer cleanHostapd()
 	os.WriteFile(mgr.hostapdPidFile, []byte(hostapdPid), 0644)
 	executor.commands["kill "+hostapdPid] = ""
-	executor.commands["ip addr flush dev wlan0"] = ""
 	executor.commands["iw wlan0 set type managed"] = ""
 
 	err := mgr.Stop()
@@ -465,7 +482,7 @@ func TestStop_RestoresPriorIPForward(t *testing.T) {
 // If both daemons died on their own but state remains, Stop must still tear
 // down the NAT rules and ip_forward they left behind.
 func TestStop_CleansNATWhenDaemonsAlreadyDead(t *testing.T) {
-	mgr, executor, _, fw := setupTestManager()
+	mgr, executor, _, fw, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	// Recorded prior value in the state file is "0"; pre-write "1" to the temp
@@ -477,7 +494,6 @@ func TestStop_CleansNATWhenDaemonsAlreadyDead(t *testing.T) {
 
 	// State on disk, no running hostapd/dnsmasq (no pidfiles).
 	os.WriteFile(mgr.stateFile, []byte("wlan0|eth0|0"), 0600)
-	executor.commands["ip addr flush dev wlan0"] = ""
 	executor.commands["iw wlan0 set type managed"] = ""
 
 	err := mgr.Stop()
@@ -491,7 +507,7 @@ func TestStop_CleansNATWhenDaemonsAlreadyDead(t *testing.T) {
 }
 
 func TestStop_PartialFailure(t *testing.T) {
-	mgr, executor, _, _ := setupTestManager()
+	mgr, executor, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	// Keep the ip_forward sysctl write in cleanupNAT off the real /proc.
@@ -515,7 +531,6 @@ func TestStop_PartialFailure(t *testing.T) {
 	// dnsmasq kill succeeds but hostapd kill fails
 	executor.commands["kill "+dnsmasqPid] = ""
 	executor.errors["kill "+hostapdPid] = fmt.Errorf("no such process")
-	executor.commands["ip addr flush dev wlan0"] = ""
 	executor.commands["iw wlan0 set type managed"] = ""
 
 	err := mgr.Stop()
@@ -525,7 +540,7 @@ func TestStop_PartialFailure(t *testing.T) {
 }
 
 func TestGetStatus(t *testing.T) {
-	mgr, executor, _, _ := setupTestManager()
+	mgr, executor, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	// Test when not running
@@ -562,7 +577,7 @@ Station 11:22:33:44:55:66 (on wlan0)
 }
 
 func TestGetConnectedClients(t *testing.T) {
-	mgr, executor, _, _ := setupTestManager()
+	mgr, executor, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	mgr.currentConfig = &types.HotspotConfig{
@@ -582,7 +597,7 @@ Station 11:22:33:44:55:66 (on wlan0)
 }
 
 func TestGetConnectedClients_Error(t *testing.T) {
-	mgr, executor, _, _ := setupTestManager()
+	mgr, executor, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	mgr.currentConfig = &types.HotspotConfig{
@@ -596,7 +611,7 @@ func TestGetConnectedClients_Error(t *testing.T) {
 }
 
 func TestGenerateHostapdConfig_WithPassword(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -621,7 +636,7 @@ func TestGenerateHostapdConfig_WithPassword(t *testing.T) {
 }
 
 func TestGenerateHostapdConfig_NoPassword(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -645,7 +660,7 @@ func TestGenerateHostapdConfig_NoPassword(t *testing.T) {
 }
 
 func TestGenerateHostapdConfig_5GHz(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -667,7 +682,7 @@ func TestGenerateHostapdConfig_5GHz(t *testing.T) {
 }
 
 func TestGenerateDnsmasqConfig(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -693,7 +708,7 @@ func TestGenerateDnsmasqConfig(t *testing.T) {
 }
 
 func TestGenerateDnsmasqConfig_NoDNS(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	config := &types.HotspotConfig{
@@ -776,7 +791,7 @@ func TestEscapeHostapdString(t *testing.T) {
 }
 
 func TestGenerateHostapdConfig_EscapesSpecialCharacters(t *testing.T) {
-	mgr, _, _, _ := setupTestManager()
+	mgr, _, _, _, _, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	t.Run("escapes newlines in SSID to prevent injection", func(t *testing.T) {

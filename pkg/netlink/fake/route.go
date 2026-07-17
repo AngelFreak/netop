@@ -29,17 +29,23 @@ type RouteManager struct {
 	SetForIface []ReplaceCall
 	// Added records every AddRoute call in order.
 	Added []AddCall
+	// ReplacedRoutes records every ReplaceRoute call in order.
+	ReplacedRoutes []AddCall
+	// DeletedRoutes records the destination of every DelRoute call in order.
+	DeletedRoutes []string
 	// Flushed records the interface of every FlushRoutes call in order.
 	Flushed []string
 
 	// Force errors from specific methods when set.
-	GetErr         error
-	GetIfaceErr    error
-	ListErr        error
-	ReplaceErr     error
-	SetForIfaceErr error
-	AddErr         error
-	FlushErr       error
+	GetErr          error
+	GetIfaceErr     error
+	ListErr         error
+	ReplaceErr      error
+	SetForIfaceErr  error
+	AddErr          error
+	ReplaceRouteErr error
+	DelRouteErr     error
+	FlushErr        error
 }
 
 // ReplaceCall records the arguments of a single ReplaceDefault invocation.
@@ -131,6 +137,38 @@ func (m *RouteManager) AddRoute(iface, destination, gw string) error {
 	}
 	m.Added = append(m.Added, AddCall{Iface: iface, Destination: destination, Gw: gw})
 	m.Routes = append(m.Routes, types.Route{Dst: destination, Gw: gw, Iface: iface})
+	return nil
+}
+
+// ReplaceRoute records the call and upserts the route in the in-memory table.
+func (m *RouteManager) ReplaceRoute(iface, destination, gw string) error {
+	if m.ReplaceRouteErr != nil {
+		return m.ReplaceRouteErr
+	}
+	m.ReplacedRoutes = append(m.ReplacedRoutes, AddCall{Iface: iface, Destination: destination, Gw: gw})
+	for i := range m.Routes {
+		if m.Routes[i].Dst == destination {
+			m.Routes[i] = types.Route{Dst: destination, Gw: gw, Iface: iface}
+			return nil
+		}
+	}
+	m.Routes = append(m.Routes, types.Route{Dst: destination, Gw: gw, Iface: iface})
+	return nil
+}
+
+// DelRoute records the call and removes the matching route from the table.
+func (m *RouteManager) DelRoute(destination string) error {
+	if m.DelRouteErr != nil {
+		return m.DelRouteErr
+	}
+	m.DeletedRoutes = append(m.DeletedRoutes, destination)
+	kept := m.Routes[:0]
+	for _, r := range m.Routes {
+		if r.Dst != destination {
+			kept = append(kept, r)
+		}
+	}
+	m.Routes = kept
 	return nil
 }
 

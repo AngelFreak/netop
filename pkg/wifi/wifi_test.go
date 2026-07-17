@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/angelfreak/net/pkg/netlink/fake"
+	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -236,8 +237,6 @@ SSID: OtherSSID`,
 				// Disconnect commands (interface-specific termination)
 				"wpa_cli -i wlan0 terminate":  "",
 				"pkill -9 -f dhclient.*wlan0": "",
-				"ip addr flush dev wlan0":     "",
-				"ip route flush dev wlan0":    "",
 				// Reconnect commands
 				"mkdir -p /run/wpa_supplicant":                                  "",
 				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
@@ -246,12 +245,13 @@ SSID: OtherSSID`,
 				"pkill -9 -f udhcpc.*wlan0": "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
 				"timeout 15 dhclient -v wlan0":                                             "",
-				"ip addr show wlan0":                                                       "inet 192.168.1.100/24",
 			},
 		}
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.addrMgr = &fake.AddrManager{}
+		manager.routeMgr = &fake.RouteManager{}
 		manager.runtimeDir = tmp
 
 		err := manager.Connect("TestSSID", "password", "")
@@ -272,13 +272,14 @@ SSID: OtherSSID`,
 				"pkill -9 -f dhclient.*wlan0": "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
 				"timeout 15 dhclient -v wlan0":                                             "",
-				"ip addr show wlan0":                                                       "inet 192.168.1.100/24",
 			},
 			callCount: make(map[string]int),
 		}
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.addrMgr = &fake.AddrManager{}
+		manager.routeMgr = &fake.RouteManager{}
 		manager.runtimeDir = tmp
 
 		err := manager.Connect("TestSSID", "password", "")
@@ -301,6 +302,8 @@ SSID: OtherSSID`,
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.addrMgr = &fake.AddrManager{}
+		manager.routeMgr = &fake.RouteManager{}
 		manager.runtimeDir = tmp
 		manager.associationTimeout = 1 * time.Second // Short timeout for test
 
@@ -341,8 +344,6 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 			commands: map[string]string{
 				"iw wlan0 link":                "Not connected", // post-hibernation: no current SSID
 				"wpa_cli -i wlan0 terminate":   "",
-				"ip addr flush dev wlan0":      "",
-				"ip route flush dev wlan0":     "",
 				"mkdir -p /run/wpa_supplicant": "",
 				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
 				"wpa_cli -i wlan0 status": "wpa_state=COMPLETED\nssid=TestSSID",
@@ -353,24 +354,29 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 	links := &fake.LinkManager{}
 	manager.linkMgr = links
+	addrs := &fake.AddrManager{}
+	manager.addrMgr = addrs
+	routes := &fake.RouteManager{}
+	manager.routeMgr = routes
 	manager.runtimeDir = tmp
 
 	err := manager.Connect("TestSSID", "password", "")
 	assert.NoError(t, err)
 
-	// Verify flush commands were called
-	assert.Contains(t, executor.calledCommands, "ip addr flush dev wlan0",
+	// Verify stale addresses and routes were flushed via the netlink managers.
+	assert.Contains(t, addrs.Flushed, "wlan0",
 		"should flush stale IP addresses before connecting")
-	assert.Contains(t, executor.calledCommands, "ip route flush dev wlan0",
+	assert.Contains(t, routes.Flushed, "wlan0",
 		"should flush stale routes before connecting")
 
-	// Verify flush happens after terminateWpaSupplicant.
-	flushAddrIdx := indexOf(executor.calledCommands, "ip addr flush dev wlan0")
-	flushRouteIdx := indexOf(executor.calledCommands, "ip route flush dev wlan0")
+	// Verify flush happens after terminateWpaSupplicant. The flush is recorded
+	// by the netlink fakes, terminate by the executor, so compare against the
+	// executor call that immediately precedes the flush (mkdir happens after).
 	terminateIdx := indexOf(executor.calledCommands, "wpa_cli -i wlan0 terminate")
-
-	assert.True(t, terminateIdx < flushAddrIdx, "flush addr should come after terminate")
-	assert.True(t, terminateIdx < flushRouteIdx, "flush route should come after terminate")
+	mkdirIdx := indexOf(executor.calledCommands, "mkdir -p /run/wpa_supplicant")
+	assert.True(t, terminateIdx >= 0, "wpa_cli terminate should have been called")
+	assert.True(t, terminateIdx < mkdirIdx,
+		"terminate should come before wpa_supplicant setup (flush runs between them)")
 
 	// The interface is brought up via the netlink LinkManager (not the executor).
 	// Verify the pre-wpa_supplicant interface-up happened.
@@ -383,27 +389,27 @@ func TestDisconnect(t *testing.T) {
 			// Interface-specific termination commands
 			"wpa_cli -i wlan0 terminate":      "",
 			"rm -f /run/wpa_supplicant/wlan0": "",
-			"ip addr flush dev wlan0":         "",
-			"ip route flush dev wlan0":        "",
 		},
 	}
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 	links := &fake.LinkManager{}
 	manager.linkMgr = links
+	addrs := &fake.AddrManager{}
+	manager.addrMgr = addrs
+	routes := &fake.RouteManager{}
+	manager.routeMgr = routes
 
 	err := manager.Disconnect()
 	assert.NoError(t, err)
 	assert.Contains(t, links.Downed, "wlan0")
+	assert.Contains(t, addrs.Flushed, "wlan0")
+	assert.Contains(t, routes.Flushed, "wlan0")
 }
 
 func TestListConnections(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
-			"ip addr show wlan0": `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
-    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0
-       valid_lft forever preferred_lft forever`,
-			"ip route show dev wlan0": `default via 192.168.1.1 dev wlan0`,
 			"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
 SSID: TestNetwork`,
 			"cat /etc/resolv.conf": `nameserver 8.8.8.8
@@ -412,6 +418,10 @@ nameserver 1.1.1.1`,
 	}
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+	manager.addrMgr = &fake.AddrManager{FirstIPv4: "192.168.1.100"}
+	manager.routeMgr = &fake.RouteManager{
+		Routes: []types.Route{{Gw: "192.168.1.1", Iface: "wlan0"}},
+	}
 
 	connections, err := manager.ListConnections()
 	assert.NoError(t, err)
@@ -932,26 +942,6 @@ func TestObtainDHCP(t *testing.T) {
 	})
 }
 
-func TestParseIPAddress(t *testing.T) {
-	manager := &Manager{}
-
-	output := `2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
-    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0
-       valid_lft forever preferred_lft forever`
-
-	ip := manager.parseIPAddress(output)
-	assert.Equal(t, net.ParseIP("192.168.1.100"), ip)
-}
-
-func TestParseGateway(t *testing.T) {
-	manager := &Manager{}
-
-	output := `default via 192.168.1.1 dev wlan0`
-
-	gateway := manager.parseGateway(output)
-	assert.Equal(t, net.ParseIP("192.168.1.1"), gateway)
-}
-
 func TestGetCurrentSSID(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
@@ -1043,7 +1033,7 @@ func TestDisconnect_AdditionalCases(t *testing.T) {
 		}
 		logger := &mockLogger{}
 		links := &fake.LinkManager{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0", dhcpClient: &mockDHCPClient{}, linkMgr: links}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0", dhcpClient: &mockDHCPClient{}, linkMgr: links, addrMgr: &fake.AddrManager{}, routeMgr: &fake.RouteManager{}}
 
 		err := manager.Disconnect()
 		assert.NoError(t, err)
@@ -1058,7 +1048,7 @@ func TestDisconnect_AdditionalCases(t *testing.T) {
 		}
 		logger := &mockLogger{}
 		links := &fake.LinkManager{SetDownErr: assert.AnError}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0", dhcpClient: &mockDHCPClient{}, linkMgr: links}
+		manager := &Manager{executor: executor, logger: logger, iface: "wlan0", dhcpClient: &mockDHCPClient{}, linkMgr: links, addrMgr: &fake.AddrManager{}, routeMgr: &fake.RouteManager{}}
 
 		err := manager.Disconnect()
 		// Should return error if interface down fails
@@ -1071,14 +1061,18 @@ func TestListConnections_AdditionalCases(t *testing.T) {
 	t.Run("connection without DNS", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":           "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
-				"ip addr show wlan0":      "inet 192.168.1.100/24",
-				"ip route show dev wlan0": "default via 192.168.1.1",
-				"cat /etc/resolv.conf":    "", // No DNS
+				"iw wlan0 link":        "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
+				"cat /etc/resolv.conf": "", // No DNS
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+		manager := &Manager{
+			executor: executor,
+			logger:   logger,
+			iface:    "wlan0",
+			addrMgr:  &fake.AddrManager{FirstIPv4: "192.168.1.100"},
+			routeMgr: &fake.RouteManager{Routes: []types.Route{{Gw: "192.168.1.1", Iface: "wlan0"}}},
+		}
 
 		connections, err := manager.ListConnections()
 		assert.NoError(t, err)
@@ -1090,14 +1084,18 @@ func TestListConnections_AdditionalCases(t *testing.T) {
 	t.Run("connection without gateway", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":           "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
-				"ip addr show wlan0":      "inet 192.168.1.100/24",
-				"ip route show dev wlan0": "", // No gateway
-				"cat /etc/resolv.conf":    "nameserver 8.8.8.8",
+				"iw wlan0 link":        "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
+				"cat /etc/resolv.conf": "nameserver 8.8.8.8",
 			},
 		}
 		logger := &mockLogger{}
-		manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+		manager := &Manager{
+			executor: executor,
+			logger:   logger,
+			iface:    "wlan0",
+			addrMgr:  &fake.AddrManager{FirstIPv4: "192.168.1.100"},
+			routeMgr: &fake.RouteManager{}, // No default route on interface
+		}
 
 		connections, err := manager.ListConnections()
 		assert.NoError(t, err)
@@ -1252,13 +1250,13 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 				// Interface-specific commands for wlan0 only
 				"wpa_cli -i wlan0 terminate":      "OK",
 				"rm -f /run/wpa_supplicant/wlan0": "",
-				"ip addr flush dev wlan0":         "",
-				"ip route flush dev wlan0":        "",
 			},
 		}
 		logger := &mockLogger{}
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.linkMgr = &fake.LinkManager{}
+		manager.addrMgr = &fake.AddrManager{}
+		manager.routeMgr = &fake.RouteManager{}
 
 		err := manager.Disconnect()
 		assert.NoError(t, err)

@@ -28,6 +28,8 @@ type hotspotManagerImpl struct {
 	outInterface    string                // Interface for NAT routing (e.g., eth0)
 	prevIPForward   string                // /proc/.../ip_forward value before we enabled it, for restore ("0"/"1"/"" if unknown)
 	linkMgr         types.LinkManager     // netlink-backed link access (interface up/down)
+	addrMgr         types.AddrManager     // netlink-backed interface address access
+	routeMgr        types.RouteManager    // netlink-backed routing table access
 	firewall        types.FirewallManager // go-iptables-backed NAT rules; nil until first use / injected in tests
 }
 
@@ -42,6 +44,8 @@ func NewHotspotManager(executor types.SystemExecutor, logger types.Logger) types
 		dnsmasqConfFile: types.RuntimeDir + "/dnsmasq-hotspot.conf",
 		stateFile:       types.RuntimeDir + "/hotspot-state",
 		linkMgr:         netlink.NewLinkManager(),
+		addrMgr:         netlink.NewAddrManager(),
+		routeMgr:        netlink.NewRouteManager(),
 	}
 }
 
@@ -151,7 +155,7 @@ func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 	if netmask == "" {
 		netmask = "24"
 	}
-	if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "add", config.Gateway+"/"+netmask, "dev", config.Interface); err != nil {
+	if err := h.addrMgr.Add(config.Interface, config.Gateway+"/"+netmask); err != nil {
 		h.linkMgr.SetDown(config.Interface)
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
@@ -161,7 +165,7 @@ func (h *hotspotManagerImpl) setupInterface(config *types.HotspotConfig) error {
 
 // cleanupInterface cleans up interface after a failure
 func (h *hotspotManagerImpl) cleanupInterface(iface string) {
-	h.executor.ExecuteWithTimeout(2*time.Second, "ip", "addr", "flush", "dev", iface)
+	h.addrMgr.Flush(iface)
 	h.linkMgr.SetDown(iface)
 }
 
@@ -218,20 +222,12 @@ func (h *hotspotManagerImpl) setupNAT(hotspotIface string) error {
 
 // detectOutInterface finds the default route interface (excluding hotspot interface)
 func (h *hotspotManagerImpl) detectOutInterface(exclude string) string {
-	output, err := h.executor.ExecuteWithTimeout(2*time.Second, "ip", "route", "show", "default")
+	route, err := h.routeMgr.GetDefaultRoute()
 	if err != nil {
 		return ""
 	}
-
-	// Parse "default via X.X.X.X dev ethX" format
-	fields := strings.Fields(output)
-	for i, field := range fields {
-		if field == "dev" && i+1 < len(fields) {
-			iface := fields[i+1]
-			if iface != exclude {
-				return iface
-			}
-		}
+	if route.Iface != "" && route.Iface != exclude {
+		return route.Iface
 	}
 	return ""
 }
@@ -301,7 +297,7 @@ func (h *hotspotManagerImpl) Stop() error {
 	// Clean up interface if we have config
 	if h.currentConfig != nil {
 		// Remove IP address
-		if _, err := h.executor.ExecuteWithTimeout(5*time.Second, "ip", "addr", "flush", "dev", h.currentConfig.Interface); err != nil {
+		if err := h.addrMgr.Flush(h.currentConfig.Interface); err != nil {
 			h.logger.Warn("Failed to flush IP addresses", "error", err.Error())
 		}
 
