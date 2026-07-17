@@ -629,11 +629,42 @@ func (m *Manager) getPermanentMAC(iface string) (string, error) {
 	return "", fmt.Errorf("could not parse permanent MAC from: %s", output)
 }
 
-// writeFileDirect atomically writes content to path with 0644 permissions. It
-// stages to a temp file in the same directory and renames it into place, so the
-// destination (e.g. /etc/resolv.conf) never appears half-written. Native
-// replacement for shelling out to `tee`.
+// writeFileDirect writes content to path with 0644 permissions, preserving a
+// symlink at path by writing through to its target. Native replacement for
+// shelling out to `tee`, which also followed symlinks.
+//
+// /etc/resolv.conf is frequently a symlink (e.g. -> /run/systemd/resolve/
+// stub-resolv.conf on systemd-resolved) or a bind-mount (containers). A plain
+// temp-file+rename over path would replace the symlink with a regular file
+// (breaking resolved's management) or fail with EBUSY on a bind-mount. So we
+// resolve path to its real target and write there: atomically via temp+rename
+// when the target directory is writable (never half-written), otherwise
+// in-place through the existing file descriptor as a fallback.
 func (m *Manager) writeFileDirect(path, content string) error {
+	// Resolve symlinks so we write through to the real file, not over the link.
+	// EvalSymlinks fails if path itself doesn't exist yet; fall back to path.
+	target := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		target = resolved
+	}
+
+	if err := atomicWrite(target, content); err != nil {
+		// Atomic rename can fail when the target's directory isn't writable or
+		// the target is a bind-mount (EBUSY / cross-device). Fall back to
+		// truncating and writing the existing file in place, which follows the
+		// symlink/bind-mount the same way `tee` did.
+		if writeErr := os.WriteFile(target, []byte(content), 0644); writeErr != nil {
+			return fmt.Errorf("writing %q: atomic rename failed (%v); in-place write failed: %w", target, err, writeErr)
+		}
+	}
+	return nil
+}
+
+// atomicWrite writes content to path via a temp file in the same directory
+// followed by a rename, so the file never appears half-written. The temp file
+// must be in the same directory as path for the rename to stay on one
+// filesystem.
+func atomicWrite(path, content string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".net-resolv-*")
 	if err != nil {

@@ -886,6 +886,33 @@ func TestWriteFileDirect(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "new content", string(got))
 	})
+
+	// Regression: /etc/resolv.conf is frequently a symlink (systemd-resolved).
+	// writeFileDirect must write THROUGH the symlink to its target, not replace
+	// the symlink with a regular file (which the old `tee` behavior preserved).
+	t.Run("preserves symlink and writes through to target", func(t *testing.T) {
+		dir := t.TempDir()
+		realTarget := filepath.Join(dir, "real-resolv.conf")
+		assert.NoError(t, os.WriteFile(realTarget, []byte("original"), 0644))
+		link := filepath.Join(dir, "resolv.conf")
+		assert.NoError(t, os.Symlink(realTarget, link))
+
+		logger := &mockLogger{}
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: newMockExecutor(), logger: logger}
+
+		err := manager.writeFileDirect(link, "nameserver 1.1.1.1\n")
+		assert.NoError(t, err)
+
+		// The link must still be a symlink, not replaced by a regular file.
+		info, err := os.Lstat(link)
+		assert.NoError(t, err)
+		assert.NotZero(t, info.Mode()&os.ModeSymlink, "resolv.conf symlink should be preserved")
+
+		// The real target (not the link entry) must hold the new content.
+		got, err := os.ReadFile(realTarget)
+		assert.NoError(t, err)
+		assert.Equal(t, "nameserver 1.1.1.1\n", string(got))
+	})
 }
 
 func TestSetHostname(t *testing.T) {
