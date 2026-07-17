@@ -484,3 +484,22 @@ type FirewallManager interface {
 	// treated as errors.
 	DisableNAT(internalIface, outIface string) error
 }
+
+// WireGuardConfigurator applies and inspects WireGuard interface configuration
+// via the kernel's wireguard netlink API (github.com/.../wgctrl), replacing
+// shell-outs to the `wg` binary (`wg setconf` / `wg show`). The interface
+// itself is created/destroyed via LinkManager; this only configures keys,
+// peers, and endpoints on an already-created device. Implementations must
+// return a clear error (never panic) on non-Linux platforms or when the
+// wireguard module is unavailable.
+type WireGuardConfigurator interface {
+	// Configure parses a WireGuard INI configuration (the [Interface]/[Peer]
+	// form written by `wg-quick`/`wg setconf`) and applies it to iface,
+	// replacing the device's existing peers. Equivalent to `wg setconf`.
+	Configure(iface, config string) error
+	// HasPeers reports whether the interface currently has at least one
+	// configured peer. Equivalent to checking for a `peer:` line in
+	// `wg show <iface>`, used to distinguish a live tunnel from a stale
+	// interface with no configuration.
+	HasPeers(iface string) (bool, error)
+}
