@@ -524,7 +524,7 @@ func TestCheck_Portal_UnicodeWhitespacePaddedSuccess(t *testing.T) {
 	// Only ASCII whitespace may surround "success" — a legitimate endpoint
 	// never pads with U+00A0 etc., so treat it as a rewritten response.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("success "))
+		w.Write([]byte("success\u00a0")) // non-breaking space, explicit escape
 	}))
 	defer srv.Close()
 
