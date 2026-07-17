@@ -220,7 +220,7 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 	case "openvpn":
 		// Kill only our OpenVPN process using PID file
 		pidFile := filepath.Join(m.runtimeDir, "openvpn.pid")
-		if err := system.KillProcessByPID(m.executor, m.logger, pidFile); err != nil {
+		if err := system.KillProcessByPID(m.logger, pidFile); err != nil {
 			m.logger.Warn("Failed to kill tracked OpenVPN", "error", err)
 			return fmt.Errorf("failed to stop OpenVPN: %w", err)
 		}
@@ -835,14 +835,12 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 	for i := 0; i < 30; i++ {
 		// A stale tunnel interface from a previous run can satisfy the device
 		// check even though our daemon already died. Confirm the process we
-		// started is still alive before reporting success.
-		pid, pidErr := m.executor.ExecuteWithTimeout(1*time.Second, "cat", pidFile)
-		pid = strings.TrimSpace(pid)
-		if pidErr == nil && pid != "" {
-			if _, aliveErr := m.executor.ExecuteWithTimeout(1*time.Second, "kill", "-0", pid); aliveErr != nil {
-				system.KillProcessByPID(m.executor, m.logger, pidFile)
-				return fmt.Errorf("openvpn process exited before the tunnel came up")
-			}
+		// started is still alive before reporting success. A missing/empty
+		// pidfile (alive=false, err=nil) means we haven't observed the pid yet;
+		// only a valid-pid-but-dead result (err!=nil) indicates the daemon died.
+		if alive, aliveErr := system.ProcessAliveFromPIDFile(pidFile); aliveErr != nil && !alive {
+			system.KillProcessByPID(m.logger, pidFile)
+			return fmt.Errorf("openvpn process exited before the tunnel came up")
 		}
 		if exists, _ := m.linkMgr.Exists(device); exists {
 			m.logger.Info("OpenVPN tunnel established", "device", device)
@@ -851,7 +849,7 @@ func (m *Manager) connectOpenVPN(config *types.VPNConfig) error {
 		time.Sleep(time.Second)
 	}
 	// Clean up on failure
-	system.KillProcessByPID(m.executor, m.logger, pidFile)
+	system.KillProcessByPID(m.logger, pidFile)
 	return fmt.Errorf("openvpn failed to establish tunnel within 30s")
 }
 

@@ -19,6 +19,22 @@ import (
 
 // startFakeProcess starts a background process whose /proc/pid/comm matches
 // the given name. Returns the PID as a string and a cleanup function.
+// deadProcessPID spawns a short-lived process, reaps it, and returns its PID as
+// a string. The PID is guaranteed to belong to a process that has exited, so a
+// subsequent syscall.Kill against it fails with ESRCH — used to exercise the
+// "kill failed" path now that killing is native (syscall.Kill), not a mockable
+// executor command.
+func deadProcessPID(t *testing.T) string {
+	t.Helper()
+	cmd := exec.Command("sleep", "0")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start throwaway process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Wait() // reap it; pid is now dead
+	return strconv.Itoa(pid)
+}
+
 func startFakeProcess(name string) (string, func()) {
 	tmpDir, err := os.MkdirTemp("", "fakeproc-*")
 	if err != nil {
@@ -328,19 +344,18 @@ func TestStop_NotRunning(t *testing.T) {
 }
 
 func TestStop_KillFails(t *testing.T) {
-	mgr, executor := setupTestManager()
+	mgr, _ := setupTestManager()
 	defer cleanup(mgr)
 
 	mgr.currentConfig = &types.DHCPServerConfig{
 		Interface: "eth0",
 	}
 
-	// Create fake process with correct /proc/pid/comm name
-	dnsmasqPid, cleanDnsmasq := startFakeProcess("dnsmasq")
-	defer cleanDnsmasq()
-	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
-
-	executor.errors["kill "+dnsmasqPid] = fmt.Errorf("no such process")
+	// stopDnsmasq now signals the PID natively via syscall.Kill. To exercise
+	// the failure path, write a PID that is real-but-dead (spawned then reaped)
+	// so syscall.Kill returns ESRCH.
+	deadPid := deadProcessPID(t)
+	os.WriteFile(mgr.dnsmasqPidFile, []byte(deadPid), 0644)
 
 	err := mgr.Stop()
 

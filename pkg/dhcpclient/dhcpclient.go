@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/angelfreak/net/pkg/system"
@@ -197,8 +199,8 @@ func (m *Manager) Release(iface string) error {
 	pidFile := m.udhcpcPidFile(iface)
 	if data, err := os.ReadFile(pidFile); err == nil {
 		pid := strings.TrimSpace(string(data))
-		if pid != "" {
-			if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "kill", pid); err != nil {
+		if n, convErr := strconv.Atoi(pid); convErr == nil && n > 0 {
+			if err := syscall.Kill(n, syscall.SIGTERM); err != nil {
 				m.logger.Debug("Failed to SIGTERM udhcpc via pidfile", "pid", pid, "error", err)
 			}
 		}

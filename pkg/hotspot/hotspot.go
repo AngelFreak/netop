@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/angelfreak/net/pkg/firewall"
@@ -653,9 +654,13 @@ func (h *hotspotManagerImpl) loadState() {
 
 // killProcess kills a process with SIGTERM, falling back to SIGKILL if needed
 func (h *hotspotManagerImpl) killProcess(pid string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(pid))
+	if err != nil || n <= 0 {
+		return fmt.Errorf("invalid PID %q", pid)
+	}
+
 	// Try SIGTERM first
-	_, err := h.executor.ExecuteWithTimeout(2*time.Second, "kill", pid)
-	if err != nil {
+	if err := syscall.Kill(n, syscall.SIGTERM); err != nil {
 		return err
 	}
 
@@ -666,7 +671,7 @@ func (h *hotspotManagerImpl) killProcess(pid string) error {
 	processPath := filepath.Join("/proc", pid)
 	if _, err := os.Stat(processPath); err == nil {
 		// Process still running, use SIGKILL
-		h.executor.ExecuteWithTimeout(2*time.Second, "kill", "-9", pid)
+		_ = syscall.Kill(n, syscall.SIGKILL)
 	}
 
 	return nil
