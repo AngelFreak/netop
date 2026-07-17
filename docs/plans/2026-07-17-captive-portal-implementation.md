@@ -268,9 +268,10 @@ func (p *PortalConfig) CheckDisabled() bool {
 
 Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), when the common map contains a `portal` key that is itself a map:
 
-1. Validate its subfields against `validPortalFields` (same `validateFields` helper, section name `common.portal`).
-2. Validate the `check` value **on the raw map, before unmarshal** (viper weak-typing coerces bools/ints to strings with no error): if present it must be a Go **string** whose trimmed, lowercased value is `""`, `"auto"`, or `"off"`; anything else (including YAML booleans/ints) fails with an error containing `common.portal.check must be "auto" or "off"` — via the `ValidationError.Message` mechanism specified below (no other error path).
-3. Validate the `url` value at load with these exact semantics (Grok r4: `url: ""` must not be rejected as "no host"):
+1. Require `common.portal` to be **absent, null, or a map**. A scalar or list (`portal: off`, `portal: true`, `portal: [auto]`) appends `ValidationError{Section: "common.portal", Field: "portal", Message: "common.portal must be a mapping with optional \"check\" and \"url\" fields"}` — otherwise mapstructure produces a cryptic decode error or a silent zero struct. Test `TestPortalConfigScalarPortalRejected` covers all three shapes.
+2. Validate its subfields against `validPortalFields` (same `validateFields` helper, section name `common.portal`).
+3. Validate the `check` value **on the raw map, before unmarshal** (viper weak-typing coerces bools/ints to strings with no error): if present it must be a Go **string** whose trimmed, lowercased value is `""`, `"auto"`, or `"off"`; anything else (including YAML booleans/ints) fails with an error containing `common.portal.check must be "auto" or "off"` — via the `ValidationError.Message` mechanism specified below (no other error path).
+4. Validate the `url` value at load with these exact semantics (Grok r4: `url: ""` must not be rejected as "no host"):
    - **absent key, YAML null (`url:`), or empty string (`url: ""`)** → default probe URL, no error;
    - **non-empty string** → must pass the shared `types.ValidatePortalProbeURL` helper (raw Cc/Cf rune scan, parse OK, scheme `http`, non-empty host, no userinfo — the CLI prints ProbeURL verbatim under the display-safety contract);
    - **non-string** → clear error.
@@ -447,6 +448,32 @@ func TestCheck_Offline_ServerError(t *testing.T) {
 	assert.Equal(t, types.PortalStatusOffline, result.Status)
 }
 
+func TestCheck_Portal_403WithLocation(t *testing.T) {
+	// Enterprise/hotel portals sometimes intercept with 401/403 + Location.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://portal.example.com/login")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
+	assert.Equal(t, "http://portal.example.com/login", result.PortalURL)
+}
+
+func TestCheck_Offline_403WithoutLocation(t *testing.T) {
+	// A bare 403 (corporate block page) is NOT portal evidence.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOffline, result.Status)
+}
+
 func TestCheck_Offline_NotFound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
@@ -603,13 +630,12 @@ func TestLoginURL(t *testing.T) {
 		// so these return "" via the parse-error path:
 		{"raw control char rejected", "http://x.example.com/\x1b]0;pwn\x07", ""},
 		{"newline rejected", "http://x.example.com/a\nb", ""},
-		// U+202E in a PATH survives parsing but URL.String() percent-encodes
-		// it — the serialized output is display-safe, so it is ACCEPTED in
-		// encoded form (not rejected):
+		// URL.String() percent-encodes non-ASCII in BOTH path and host
+		// (verified on Go 1.26) — serialized output is display-safe ASCII,
+		// so these are ACCEPTED in encoded form. The Cc/Cf rune scan on the
+		// serialized string stays as defense-in-depth only:
 		{"bidi in path is percent-encoded", "http://x.example.com/‮gnp.exe", "http://x.example.com/%E2%80%AEgnp.exe"},
-		// ...but a non-ASCII HOST is serialized raw by URL.String(), so the
-		// Cc/Cf rune scan must reject bidi characters there:
-		{"bidi in host rejected", "http://evil‮.com/x", ""},
+		{"bidi in host is percent-encoded", "http://evil‮.com/x", "http://evil%E2%80%AE.com/x"},
 		{"percent-encoded controls stay encoded", "http://x.example.com/%1b%0d%0a", "http://x.example.com/%1b%0d%0a"},
 	}
 	for _, tt := range tests {
@@ -769,7 +795,15 @@ func (d *Detector) Check() (types.PortalResult, error) {
 			ProbeURL:  d.probeURL,
 		}, nil
 	case resp.StatusCode != http.StatusOK:
-		// 4xx/5xx (except 511): the probe endpoint itself is broken or
+		// Some enterprise/hotel portals answer 401/403 WITH a Location — a
+		// redirect header on an error status is interception evidence, so
+		// honor it. (Body sniffing is deliberately not done here: a
+		// corporate 403 block page would false-positive as a portal.)
+		if login := loginURL(resp.Request.URL, resp.Header.Get("Location"), d.logger); login != "" &&
+			(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return types.PortalResult{Status: types.PortalStatusPortal, PortalURL: login, ProbeURL: d.probeURL}, nil
+		}
+		// Other 4xx/5xx (except 511): the probe endpoint itself is broken or
 		// blocked. Don't cry "portal" over a CDN outage.
 		d.logger.Debug("Portal probe returned unexpected status, treating as offline", "status", resp.StatusCode)
 		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
@@ -1008,7 +1042,9 @@ func (a *App) RunPortal() (types.PortalStatus, error) {
 			a.printf("  Open %s in a browser to trigger the portal login page\n", result.ProbeURL)
 		}
 	case types.PortalStatusOffline:
-		a.println("Internet: unreachable (no response from probe)")
+		// Neutral copy: Offline covers both no-response and HTTP error
+		// statuses from the probe endpoint — don't claim "no response".
+		a.println("Internet: unreachable")
 	default:
 		a.println("Internet: ok")
 	}
@@ -1256,6 +1292,26 @@ func TestApp_RunConnect_OfflineRetriesOnce(t *testing.T) {
 	assert.NotContains(t, stderr.String(), "no internet connectivity")
 }
 
+func TestApp_RunConnect_OnlineAfterSettleRetry(t *testing.T) {
+	// Offline then Online: the settle-retry succeeded — no warning at all.
+	app, _, stderr := newTestApp()
+	app.PortalRetryDelay = time.Millisecond
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	det := &testPortalDetector{results: []types.PortalResult{
+		{Status: types.PortalStatusOffline},
+		{Status: types.PortalStatusOnline},
+	}}
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, det.calls)
+	assert.NotContains(t, stderr.String(), "Warning:")
+}
+
 func TestApp_RunConnect_OfflineAfterRetryWarns(t *testing.T) {
 	app, _, stderr := newTestApp()
 	app.PortalRetryDelay = time.Millisecond
@@ -1308,7 +1364,7 @@ func TestApp_RunConnect_MultiHomedNotePicksLowestMetric(t *testing.T) {
 
 	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
-	assert.Contains(t, stderr.String(), "default route (eth0)")
+	assert.Contains(t, stderr.String(), "default route (IPv4: eth0)")
 	assert.Contains(t, stderr.String(), "wlan0")
 }
 
@@ -1332,7 +1388,7 @@ func TestApp_RunConnect_MultiHomedNoteOnAnyOutcome(t *testing.T) {
 
 		err := app.RunConnect("TestSSID", "password123")
 		assert.NoError(t, err)
-		assert.Contains(t, stderr.String(), "default route (eth0)", "outcome %v", result.Status)
+		assert.Contains(t, stderr.String(), "default route (IPv4: eth0)", "outcome %v", result.Status)
 	}
 }
 
@@ -1626,8 +1682,10 @@ func (a *App) checkPortalAfterConnect(connectedIface string) bool {
 	// network), so the note prints regardless of the probe result.
 	// NB: RouteMgr.GetDefaultRoute() returns the FIRST default in the
 	// netlink dump, not the preferred one — use preferredDefaultIface.
+	// The comparison is IPv4-main-table only (ListRoutes' scope); the note
+	// says "IPv4 default route" so a dual-stack IPv6 egress isn't overclaimed.
 	if iface := a.preferredDefaultIface(); iface != "" && connectedIface != "" && iface != connectedIface {
-		a.errorf("Note: the portal probe uses the default route (%s), not the just-connected %s — the result may not describe %s.\n", iface, connectedIface, connectedIface)
+		a.errorf("Note: the portal probe follows the system default route (IPv4: %s), not the just-connected %s — the result may not describe %s.\n", iface, connectedIface, connectedIface)
 	}
 	result, err := a.PortalDet.Check()
 	if err != nil {
@@ -1667,8 +1725,9 @@ func (a *App) checkPortalAfterConnect(connectedIface string) bool {
 }
 
 // preferredDefaultIface returns the outgoing interface of the LOWEST-metric
-// IPv4 default route — the path the kernel (and therefore the portal probe)
-// actually prefers. Returns "" when unknown (nil RouteMgr, netlink error, or
+// IPv4 default route — the kernel's preferred IPv4 path. Heuristic for the
+// honesty note only: the probe may resolve AAAA and egress IPv6 on a
+// dual-stack host, which this cannot see (ListRoutes is IPv4 main table). Returns "" when unknown (nil RouteMgr, netlink error, or
 // no default route). GetDefaultRoute is NOT used: it returns the first
 // default in the netlink dump, which on a dual-homed machine may be the
 // higher-metric one.
@@ -1769,7 +1828,10 @@ common:
     check: auto   # "auto" (default) or "off"; anything else is rejected at load
     url: http://detectportal.firefox.com/success.txt
       # must be plain http with a host; a custom endpoint must answer
-      # HTTP 204 or a 200 body of exactly "success" when internet works
+      # HTTP 204 or a 200 body of exactly "success" when internet works.
+      # It should normally be an externally reachable public endpoint —
+      # a LAN-local probe answers even when the internet is down.
+      # (Self-hosted probes are allowed deliberately, for privacy.)
   timeouts:
     portal: 3     # captive-portal probe timeout in seconds
 ```
@@ -1787,7 +1849,7 @@ git commit -m "docs: document net portal command and portal config"
 
 ### Task 7: full verification
 
-**Step 1:** `test -z "$(gofmt -l . | grep -v vendor)"` → exit 0; `go vet ./...` → clean
+**Step 1:** `files=$(gofmt -l . | grep -v vendor || true); test -z "$files"` → exit 0 (`|| true` keeps grep's no-match exit from tripping pipefail runners); `go vet ./...` → clean
 **Step 2:** `go test ./...` → all packages PASS (this is the required, deterministic verification: unit + httptest coverage of every classification row)
 **Step 3:** Build a real binary: `go build -o /tmp/net-portal-test ./cmd/net`
 **Step 4 (opportunistic manual QA — optional, outside acceptance criteria; explicitly requested by the user for this session):** the requesting user is literally sitting behind Amtrak_WiFi's portal; run `/tmp/net-portal-test portal` on the live network. Expect `Internet: ok` (already logged in) or `Captive portal detected!` + URL; verify exit code with `echo $?`; confirm no sudo prompt appears (root exemption). Also run `/tmp/net-portal-test status` and confirm the `Internet:` line. Required verification is Steps 1–3 (deterministic).
@@ -1897,3 +1959,17 @@ git commit -m "docs: document net portal command and portal config"
 | 69 | Codex (major) | Unconditional settle-retry on deterministic failures | **Rejected (documented instead):** categorizing offline reasons adds detector API surface for marginal gain; refused/no-route probes fail in ms so the retry cost is ~500ms there, and the full ≈6.5s bound only hits blackholed networks — bound now stated exactly in README. Single retry was a deliberate r2 decision. |
 | 70 | Codex (major) | `resolveVPNName` panics on nil `ConfigMgr` | **Accepted.** Nil guard + `TestApp_resolveVPNName_NilConfigMgr`. (Old `connectVPN` had the same exposure, but the guard matches the plan's other nil-safe helpers.) |
 | 71 | Codex (minor) | PR push unconditional in verification | **Accepted.** Step 5 marked network/credentials-dependent; local green ≠ failure. |
+
+### Round 7 (2026-07-17) — Codex: REVISE, Grok: REVISE, Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 72 | Grok (blocker) | Host-bidi `TestLoginURL` vector fails: `URL.String()` percent-encodes non-ASCII HOSTS too (Go 1.26) — plan's "serialized raw" premise false | **Accepted, re-verified empirically.** Vector expects percent-encoded form; serialized output is always ASCII, Cc/Cf scan kept as defense-in-depth only. |
+| 73 | Grok + Codex (major) | Non-map `common.portal` (`portal: off` / `true` / `[auto]`) unspecified → cryptic decode or silent zero | **Accepted.** Raw pass requires absent/null/map; scalar/list appends explicit `ValidationError`; `TestPortalConfigScalarPortalRejected`. |
+| 74 | Grok (major) | 401/403 + `Location` portals classified Offline — real hotel/enterprise miss | **Accepted (Location-only rule).** 401/403 WITH sanitized Location → Portal; body-HTML sniffing rejected (corporate 403 block pages would false-positive — the r1 rule Codex established). Tests both ways. |
+| 75 | Grok (major) + Codex (major) | Multi-home note is IPv4-main-table heuristic; dual-stack probe may egress IPv6 — note overclaims | **Accepted (label + docs).** Note reads "(IPv4: eth0)"; godoc states the heuristic scope; README/design mention dual-stack caveat. Routing-lookup-per-destination rejected as complexity for an advisory note. |
+| 76 | Codex (major) | Reject localhost/private/loopback probe URLs | **Rejected (documented instead):** self-hosted LAN probes are deliberately legitimate for privacy-focused netop users; config.example documents that a LAN-local probe answers when the internet is down. |
+| 77 | Codex (major) | Connect-time latency 6.5s worst case; wants async/shorter timeout/conditional retry | **Rejected (re-litigation of r2 decision, documented in r6 #69):** cost only hits blackholed networks; async would break VPN-hint ordering; documented bound stands. |
+| 78 | Grok (minor) | "unreachable (no response from probe)" lies for HTTP 4xx/5xx | **Accepted.** Neutral "Internet: unreachable"; detail stays in debug logs. |
+| 79 | Grok (minor) | Offline→Online settle path untested | **Accepted.** `TestApp_RunConnect_OnlineAfterSettleRetry` added. |
+| 80 | Codex (minor) | `test -z "$(…| grep …)"` trips pipefail runners | **Accepted.** `files=$(… || true); test -z "$files"`. |
