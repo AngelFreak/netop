@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/angelfreak/net/pkg/netlink"
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 )
 
@@ -162,12 +163,12 @@ func (h *hotspotManagerImpl) waitForHostapd() error {
 func (h *hotspotManagerImpl) setupNAT(hotspotIface string) error {
 	// Record the current forwarding state so teardown can restore it instead
 	// of unconditionally disabling forwarding the host may have had enabled.
-	if out, err := h.executor.ExecuteWithTimeout(2*time.Second, "cat", "/proc/sys/net/ipv4/ip_forward"); err == nil {
-		h.prevIPForward = strings.TrimSpace(out)
+	if prev, err := system.ReadIPForward(); err == nil {
+		h.prevIPForward = prev
 	}
 
 	// Enable IP forwarding
-	if _, err := h.executor.ExecuteWithTimeout(2*time.Second, "sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"); err != nil {
+	if err := system.WriteIPForward("1"); err != nil {
 		return fmt.Errorf("failed to enable IP forwarding: %w", err)
 	}
 
@@ -245,7 +246,7 @@ func (h *hotspotManagerImpl) cleanupNAT(hotspotIface string) {
 	if restore != "0" && restore != "1" {
 		restore = "0"
 	}
-	if _, err := h.executor.ExecuteWithTimeout(2*time.Second, "sh", "-c", "echo "+restore+" > /proc/sys/net/ipv4/ip_forward"); err != nil {
+	if err := system.WriteIPForward(restore); err != nil {
 		h.logger.Warn("Failed to restore IP forwarding", "error", err.Error())
 	}
 }

@@ -1,7 +1,10 @@
 package system
 
 import (
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -60,11 +63,41 @@ func KillProcessGraceful(executor types.SystemExecutor, logger types.Logger, pat
 }
 
 // WriteSecureFile writes content to a file with 0600 permissions atomically.
-// Uses the install command to atomically create file with correct permissions,
-// avoiding TOCTOU race where file exists briefly with wrong permissions.
-func WriteSecureFile(executor types.SystemExecutor, path, content string) error {
-	_, err := executor.ExecuteWithInput("install", content, "-m", "0600", "/dev/stdin", path)
-	return err
+// It writes to a temporary file in the same directory, chmods it to 0600, then
+// renames it over the destination — so the file never appears with wrong
+// permissions (TOCTOU avoidance), matching the semantics of `install -m 0600`.
+// Native replacement for shelling out to `install`.
+func WriteSecureFile(path, content string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".net-secure-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file in %q: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup if we don't successfully rename into place.
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
+	// Set 0600 before writing content so the secret never exists world-readable.
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("renaming temp file to %q: %w", path, err)
+	}
+	tmpName = "" // renamed successfully; skip cleanup
+	return nil
 }
 
 // ParseIPFromOutput extracts the first inet IP address from `ip addr show` output.

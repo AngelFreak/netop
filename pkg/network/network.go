@@ -30,6 +30,11 @@ type Manager struct {
 	addrMgr          types.AddrManager  // netlink-backed interface address access
 	linkMgr          types.LinkManager  // netlink-backed link access (up/down, MAC)
 	dnsOwnershipPath string             // overridable for tests; defaults to types.RuntimeDir/dns-owned
+	resolvConfPath   string             // overridable for tests; defaults to /etc/resolv.conf
+	// setImmutable sets/clears the immutable flag on a file. Defaults to
+	// system.SetImmutable (native FS_IOC_SETFLAGS ioctl); overridable in tests
+	// so lock/unlock intent can be observed without CAP_LINUX_IMMUTABLE.
+	setImmutable func(path string, immutable bool) error
 }
 
 // NewManager creates a new network manager
@@ -42,7 +47,34 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		addrMgr:          netlink.NewAddrManager(),
 		linkMgr:          netlink.NewLinkManager(),
 		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
+		resolvConfPath:   "/etc/resolv.conf",
+		setImmutable:     system.SetImmutable,
 	}
+}
+
+// resolvConf returns the resolv.conf path (overridable in tests).
+func (m *Manager) resolvConf() string {
+	if m.resolvConfPath != "" {
+		return m.resolvConfPath
+	}
+	return "/etc/resolv.conf"
+}
+
+// immutable applies the immutable flag via the injected setter (defaults to
+// system.SetImmutable), tolerating a nil setter for zero-value Managers built
+// in tests.
+func (m *Manager) immutable(path string, immutable bool) error {
+	if m.setImmutable == nil {
+		return system.SetImmutable(path, immutable)
+	}
+	return m.setImmutable(path, immutable)
+}
+
+// lockResolvConf sets the immutable flag on resolv.conf natively (replacing
+// `chattr +i`), preventing external tools (dhclient, netbird) from overwriting
+// DNS that netop configured.
+func (m *Manager) lockResolvConf() error {
+	return m.immutable(m.resolvConf(), true)
 }
 
 // killProcess kills processes matching a pattern with SIGKILL (fast, no graceful shutdown)
@@ -82,8 +114,7 @@ func (m *Manager) isDNSOwned() bool {
 func (m *Manager) SetDNS(servers []string) error {
 	if len(servers) == 0 || (len(servers) == 1 && servers[0] == "dhcp") {
 		// Remove immutable flag to allow DHCP to update DNS
-		_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-		if err != nil {
+		if err := m.unlockResolvConf(); err != nil {
 			m.logger.Debug("Failed to remove immutable flag (may not be set)", "error", err)
 		}
 		m.clearDNSOwnership()
@@ -113,14 +144,13 @@ func (m *Manager) SetDNS(servers []string) error {
 		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
-	err := m.writeFileDirect("/etc/resolv.conf", resolvConf.String())
+	err := m.writeFileDirect(m.resolvConf(), resolvConf.String())
 	if err != nil {
 		return fmt.Errorf("failed to write resolv.conf: %w", err)
 	}
 
 	// Lock to prevent other tools (dhclient, netbird) from overwriting
-	_, err = m.executor.Execute("chattr", "+i", "/etc/resolv.conf")
-	if err != nil {
+	if err := m.lockResolvConf(); err != nil {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
 	m.markDNSOwned()
@@ -172,18 +202,17 @@ func (m *Manager) clearDNS() (bool, error) {
 // LockDNS sets the immutable flag on /etc/resolv.conf to prevent external
 // tools (like netbird) from overwriting DNS configuration.
 func (m *Manager) LockDNS() {
-	if _, err := m.executor.Execute("chattr", "+i", "/etc/resolv.conf"); err != nil {
+	if err := m.lockResolvConf(); err != nil {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
 	m.markDNSOwned()
 }
 
-// unlockResolvConf removes the immutable flag from /etc/resolv.conf.
-// VPN clients like netbird set this flag and may leave it after disconnecting,
-// which prevents DHCP or net from updating DNS.
+// unlockResolvConf removes the immutable flag from /etc/resolv.conf natively
+// (replacing `chattr -i`). VPN clients like netbird set this flag and may leave
+// it after disconnecting, which prevents DHCP or net from updating DNS.
 func (m *Manager) unlockResolvConf() error {
-	_, err := m.executor.Execute("chattr", "-i", "/etc/resolv.conf")
-	return err
+	return m.immutable(m.resolvConf(), false)
 }
 
 // resolvConfHasNameserver reports whether /etc/resolv.conf currently contains

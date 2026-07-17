@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/angelfreak/net/pkg/netlink/fake"
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -158,6 +159,13 @@ func TestStart_Success(t *testing.T) {
 	mgr, executor, links := setupTestManager()
 	defer cleanup(mgr)
 
+	// Redirect the ip_forward sysctl to a temp file so setupNAT reads/writes it
+	// without touching the real /proc.
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	os.WriteFile(ipfPath, []byte("0"), 0644)
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
 	config := &types.HotspotConfig{
 		Interface: "wlan0",
 		SSID:      "TestAP",
@@ -172,7 +180,6 @@ func TestStart_Success(t *testing.T) {
 	executor.commands["iw wlan0 set type __ap"] = ""
 	executor.commands["ip addr add 192.168.50.1/24 dev wlan0"] = ""
 	executor.commands["ip route show default"] = "default via 192.168.1.1 dev eth0"
-	executor.commands["sh -c echo 1 > /proc/sys/net/ipv4/ip_forward"] = ""
 	executor.commands["iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"] = ""
 	executor.commands["iptables -A FORWARD -i wlan0 -j ACCEPT"] = ""
 	executor.commands["iptables -A FORWARD -o wlan0 -m state --state RELATED,ESTABLISHED -j ACCEPT"] = ""
@@ -201,6 +208,11 @@ func TestStart_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, mgr.currentConfig)
 	assert.Equal(t, "TestAP", mgr.currentConfig.SSID)
+
+	// setupNAT must have enabled IP forwarding by writing "1" to the sysctl.
+	if data, rerr := os.ReadFile(ipfPath); assert.NoError(t, rerr) {
+		assert.Equal(t, "1", string(data))
+	}
 
 	// Verify the interface was cycled down then up via the link manager
 	assert.Contains(t, links.Downed, "wlan0")
@@ -363,6 +375,12 @@ func TestStop_Success(t *testing.T) {
 	mgr, executor, links := setupTestManager()
 	defer cleanup(mgr)
 
+	// Keep the ip_forward sysctl write in cleanupNAT off the real /proc.
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	os.WriteFile(ipfPath, []byte("0"), 0644)
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
 	mgr.currentConfig = &types.HotspotConfig{
 		Interface: "wlan0",
 		SSID:      "TestAP",
@@ -408,6 +426,13 @@ func TestStop_RestoresPriorIPForward(t *testing.T) {
 	mgr, executor, _ := setupTestManager()
 	defer cleanup(mgr)
 
+	// Simulate the host having forwarding enabled before us: pre-write "1" to
+	// the temp sysctl. Teardown must restore this value, not force it to 0.
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	os.WriteFile(ipfPath, []byte("1"), 0644)
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
 	mgr.currentConfig = &types.HotspotConfig{Interface: "wlan0"}
 	mgr.outInterface = "eth0"
 	mgr.prevIPForward = "1" // host had forwarding enabled before us
@@ -421,7 +446,9 @@ func TestStop_RestoresPriorIPForward(t *testing.T) {
 
 	err := mgr.Stop()
 	assert.NoError(t, err)
-	assert.Contains(t, executor.called, "sh -c echo 1 > /proc/sys/net/ipv4/ip_forward",
+	data, rerr := os.ReadFile(ipfPath)
+	assert.NoError(t, rerr)
+	assert.Equal(t, "1", string(data),
 		"must restore prior ip_forward=1 rather than forcing 0")
 }
 
@@ -430,6 +457,13 @@ func TestStop_RestoresPriorIPForward(t *testing.T) {
 func TestStop_CleansNATWhenDaemonsAlreadyDead(t *testing.T) {
 	mgr, executor, _ := setupTestManager()
 	defer cleanup(mgr)
+
+	// Recorded prior value in the state file is "0"; pre-write "1" to the temp
+	// sysctl so we can prove teardown restores it back down to "0".
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	os.WriteFile(ipfPath, []byte("1"), 0644)
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
 
 	// State on disk, no running hostapd/dnsmasq (no pidfiles).
 	os.WriteFile(mgr.stateFile, []byte("wlan0|eth0|0"), 0600)
@@ -440,12 +474,21 @@ func TestStop_CleansNATWhenDaemonsAlreadyDead(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, executor.called, "iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE",
 		"NAT masquerade rule must be removed even when the daemons already died")
-	assert.Contains(t, executor.called, "sh -c echo 0 > /proc/sys/net/ipv4/ip_forward")
+	data, rerr := os.ReadFile(ipfPath)
+	assert.NoError(t, rerr)
+	assert.Equal(t, "0", string(data),
+		"ip_forward must be restored to the recorded prior value (0)")
 }
 
 func TestStop_PartialFailure(t *testing.T) {
 	mgr, executor, _ := setupTestManager()
 	defer cleanup(mgr)
+
+	// Keep the ip_forward sysctl write in cleanupNAT off the real /proc.
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	os.WriteFile(ipfPath, []byte("0"), 0644)
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
 
 	mgr.currentConfig = &types.HotspotConfig{
 		Interface: "wlan0",

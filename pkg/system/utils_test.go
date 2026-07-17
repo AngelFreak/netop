@@ -3,6 +3,8 @@ package system
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -202,28 +204,47 @@ func TestKillProcessByPID(t *testing.T) {
 // Tests for WriteSecureFile
 
 func TestWriteSecureFile(t *testing.T) {
-	t.Run("calls install with correct arguments", func(t *testing.T) {
-		executor := newTestExecutor()
+	t.Run("writes content with 0600 permissions", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "test.conf")
 
-		err := WriteSecureFile(executor, "/tmp/test.conf", "test content")
-
+		err := WriteSecureFile(path, "test content")
 		assert.NoError(t, err)
-		assert.Len(t, executor.executedCommands, 1)
-		cmd := executor.executedCommands[0]
-		assert.Equal(t, "install", cmd.cmd)
-		assert.Contains(t, cmd.args, "-m")
-		assert.Contains(t, cmd.args, "0600")
-		assert.Contains(t, cmd.args, "/dev/stdin")
-		assert.Contains(t, cmd.args, "/tmp/test.conf")
-		assert.Equal(t, "test content", cmd.input)
+
+		data, err := os.ReadFile(path)
+		assert.NoError(t, err)
+		assert.Equal(t, "test content", string(data))
+
+		info, err := os.Stat(path)
+		assert.NoError(t, err)
+		assert.Equal(t, os.FileMode(0600), info.Mode().Perm(), "file must be created with 0600 permissions")
 	})
 
-	t.Run("returns error on failure", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.mockResponses["install"] = mockResponse{err: assert.AnError}
+	t.Run("atomically overwrites an existing file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "test.conf")
+		assert.NoError(t, os.WriteFile(path, []byte("old"), 0644))
 
-		err := WriteSecureFile(executor, "/tmp/test.conf", "content")
+		err := WriteSecureFile(path, "new content")
+		assert.NoError(t, err)
 
+		data, _ := os.ReadFile(path)
+		assert.Equal(t, "new content", string(data))
+		info, _ := os.Stat(path)
+		assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+	})
+
+	t.Run("leaves no temp files behind", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.conf")
+
+		assert.NoError(t, WriteSecureFile(path, "content"))
+
+		entries, _ := os.ReadDir(dir)
+		assert.Len(t, entries, 1, "only the destination file should remain, no temp files")
+		assert.Equal(t, "test.conf", entries[0].Name())
+	})
+
+	t.Run("returns error when directory does not exist", func(t *testing.T) {
+		err := WriteSecureFile(filepath.Join(t.TempDir(), "nope", "test.conf"), "content")
 		assert.Error(t, err)
 	})
 }

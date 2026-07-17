@@ -206,7 +206,7 @@ func main() {
 		if sysExecutor != nil && logger != nil {
 			logger.Debug("Signal received, cleaning up")
 			// Unlock resolv.conf so DNS isn't permanently broken
-			sysExecutor.ExecuteWithTimeout(2*time.Second, "chattr", "-i", "/etc/resolv.conf")
+			_ = system.SetImmutable("/etc/resolv.conf", false)
 			// Kill any wpa_supplicant/dhclient we may have started
 			if iface != "" {
 				sysExecutor.ExecuteWithTimeout(1*time.Second, "wpa_cli", "-i", iface, "terminate")

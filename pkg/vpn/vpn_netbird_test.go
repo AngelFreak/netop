@@ -27,10 +27,11 @@ func TestConnectNetBird_MissingBinary(t *testing.T) {
 }
 
 func TestConnectNetBird_Success(t *testing.T) {
+	tmpDir := t.TempDir()
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			"ip route show default": "default via 192.168.1.1 dev eth0",
-			"netbird up --setup-key-file /run/net/netbird-setupkey --management-url https://api.netbird.io --disable-dns": "",
+			"netbird up --setup-key-file " + tmpDir + "/netbird-setupkey --management-url https://api.netbird.io --disable-dns": "",
 			"netbird status --json": `{"daemonStatus":"Connected"}`,
 		},
 	}
@@ -44,12 +45,12 @@ func TestConnectNetBird_Success(t *testing.T) {
 			},
 		},
 	}
-	manager := NewManager(executor, logger, configMgr)
+	manager := NewManagerWithDir(executor, logger, configMgr, tmpDir)
 
 	err := manager.Connect("nb")
 	assert.NoError(t, err)
 	// The setup key must be passed via --setup-key-file, never as an argv token.
-	executor.assertCommandExecuted(t, "netbird up --setup-key-file /run/net/netbird-setupkey --management-url https://api.netbird.io --disable-dns")
+	executor.assertCommandExecuted(t, "netbird up --setup-key-file "+tmpDir+"/netbird-setupkey --management-url https://api.netbird.io --disable-dns")
 	for _, cmd := range executor.executedCommands {
 		assert.NotContains(t, cmd, "--setup-key XXXXXXXX", "setup key must never appear in a command argument")
 	}

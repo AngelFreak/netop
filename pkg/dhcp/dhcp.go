@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/angelfreak/net/pkg/netlink"
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 )
 
@@ -299,12 +300,12 @@ func (d *dhcpManagerImpl) generateDnsmasqConfig(config *types.DHCPServerConfig) 
 func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
 	// Record the current forwarding state so teardown can restore it instead
 	// of unconditionally disabling forwarding the host may have had enabled.
-	if out, err := d.executor.Execute("cat", "/proc/sys/net/ipv4/ip_forward"); err == nil {
-		d.prevIPForward = strings.TrimSpace(out)
+	if prev, err := system.ReadIPForward(); err == nil {
+		d.prevIPForward = prev
 	}
 
 	// Enable IP forwarding
-	if _, err := d.executor.Execute("sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"); err != nil {
+	if err := system.WriteIPForward("1"); err != nil {
 		return fmt.Errorf("failed to enable IP forwarding: %w", err)
 	}
 
@@ -377,7 +378,7 @@ func (d *dhcpManagerImpl) cleanupNAT(dhcpIface string) {
 	if restore != "0" && restore != "1" {
 		restore = "0"
 	}
-	if _, err := d.executor.Execute("sh", "-c", "echo "+restore+" > /proc/sys/net/ipv4/ip_forward"); err != nil {
+	if err := system.WriteIPForward(restore); err != nil {
 		d.logger.Warn("Failed to restore IP forwarding", "error", err.Error())
 	}
 }
