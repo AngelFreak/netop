@@ -269,7 +269,7 @@ func (p *PortalConfig) CheckDisabled() bool {
 Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), when the common map contains a `portal` key that is itself a map:
 
 1. Validate its subfields against `validPortalFields` (same `validateFields` helper, section name `common.portal`).
-2. Validate the `check` value **on the raw map, before unmarshal** (viper weak-typing coerces bools/ints to strings with no error): if present it must be a Go **string** whose trimmed, lowercased value is `""`, `"auto"`, or `"off"`; anything else (including YAML booleans/ints) fails with an error containing `common.portal.check must be "auto" or "off"`. The existing `ValidationError` type only formats "unknown field" messages — return this as a plain `fmt.Errorf` (or add a value-error variant to `ValidationError`, implementer's choice; the test asserts the message substring, not the type).
+2. Validate the `check` value **on the raw map, before unmarshal** (viper weak-typing coerces bools/ints to strings with no error): if present it must be a Go **string** whose trimmed, lowercased value is `""`, `"auto"`, or `"off"`; anything else (including YAML booleans/ints) fails with an error containing `common.portal.check must be "auto" or "off"` — via the `ValidationError.Message` mechanism specified below (no other error path).
 3. Validate the `url` value at load with these exact semantics (Grok r4: `url: ""` must not be rejected as "no host"):
    - **absent key, YAML null (`url:`), or empty string (`url: ""`)** → default probe URL, no error;
    - **non-empty string** → must pass the shared `types.ValidatePortalProbeURL` helper (raw Cc/Cf rune scan, parse OK, scheme `http`, non-empty host, no userinfo — the CLI prints ProbeURL verbatim under the display-safety contract);
@@ -493,6 +493,19 @@ func TestCheck_Offline_BodyReadFailure(t *testing.T) {
 	assert.Equal(t, types.PortalStatusOffline, result.Status)
 }
 
+func TestCheck_Portal_UnicodeWhitespacePaddedSuccess(t *testing.T) {
+	// Only ASCII whitespace may surround "success" — a legitimate endpoint
+	// never pads with U+00A0 etc., so treat it as a rewritten response.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("success "))
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
+}
+
 func TestCheck_Portal_OversizedSuccessBody(t *testing.T) {
 	// "success" + KBs of whitespace + junk must never classify Online: an
 	// oversized body means something rewrote the response.
@@ -551,8 +564,9 @@ func TestCheck_ProbeURLWithoutHostRejected(t *testing.T) {
 (The validator's own table test `TestValidatePortalProbeURL` lives in
 `pkg/types/validation_test.go` — created in Task 2: accepts
 `http://x.example.com/p`; rejects https, `http:foo` (no host),
-`http://u:p@x.example.com/` (userinfo), `http://evil‮.com/x` (format rune,
-scanned on the RAW string), and `"http://x.example.com/\x1b"` (raw control).)
+`http://u:p@x.example.com/` (userinfo), `http://evil‮.com/x` and
+`http://exämple.com/` (non-ASCII — printable-ASCII-only rule), and
+`"http://x.example.com/\x1b"` (raw control).)
 
 func TestNew_DefaultURL(t *testing.T) {
 	d := New("", time.Second, &testLogger{})
@@ -674,15 +688,15 @@ the Detector calls it):
 
 ```go
 // ValidatePortalProbeURL reports whether raw is acceptable as a captive-portal
-// probe endpoint: no control/format runes in the RAW string (the CLI prints
-// the configured URL verbatim — scanning only the percent-encoding
-// serialization would miss raw bytes), parseable, plain http (portals cannot
-// intercept https), non-empty host, no userinfo. Shared by config load-time
-// validation and the detector's runtime guard.
+// probe endpoint: printable ASCII only in the RAW string (the CLI prints the
+// configured URL verbatim — this rules out control bytes, bidi/format runes,
+// and IDN-confusable hostnames in one check), parseable, plain http (portals
+// cannot intercept https), non-empty host, no userinfo. Shared by config
+// load-time validation and the detector's runtime guard.
 func ValidatePortalProbeURL(raw string) error {
 	for _, r := range raw {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return fmt.Errorf("portal probe URL contains control or format characters")
+		if r < 0x20 || r > 0x7e {
+			return fmt.Errorf("portal probe URL must be printable ASCII")
 		}
 	}
 	u, err := url.Parse(raw)
@@ -770,7 +784,9 @@ func (d *Detector) Check() (types.PortalResult, error) {
 		d.logger.Debug("Portal probe body read failed", "error", err)
 		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
 	}
-	if len(body) <= maxBodyBytes && strings.TrimSpace(string(body)) == "success" {
+	// ASCII-whitespace trim only: Unicode-whitespace padding around "success"
+	// is not something a legitimate probe endpoint produces.
+	if len(body) <= maxBodyBytes && strings.Trim(string(body), " \t\r\n") == "success" {
 		return types.PortalResult{Status: types.PortalStatusOnline, ProbeURL: d.probeURL}, nil
 	}
 	// 200 with an unexpected body: something rewrote the response
@@ -1256,15 +1272,14 @@ func TestApp_RunConnect_OfflineAfterRetryWarns(t *testing.T) {
 	assert.Contains(t, stderr.String(), "no internet connectivity")
 }
 
-// stubRouteManager implements types.RouteManager with a fixed default route;
-// only GetDefaultRoute matters here, the rest are inert no-ops.
-type stubRouteManager struct{ def *types.Route }
+// stubRouteManager implements types.RouteManager with a fixed route table;
+// only ListRoutes matters here (preferredDefaultIface uses it), the rest are
+// inert no-ops.
+type stubRouteManager struct{ routes []types.Route }
 
+func (s *stubRouteManager) ListRoutes() ([]types.Route, error) { return s.routes, nil }
 func (s *stubRouteManager) GetDefaultRoute() (*types.Route, error) {
-	if s.def == nil {
-		return nil, errors.New("no default route")
-	}
-	return s.def, nil
+	return nil, errors.New("not implemented")
 }
 func (s *stubRouteManager) GetDefaultRouteForIface(string) (*types.Route, error) {
 	return nil, errors.New("not implemented")
@@ -1273,23 +1288,52 @@ func (s *stubRouteManager) ReplaceDefault(string, string, int) error     { retur
 func (s *stubRouteManager) SetDefaultForIface(string, string, int) error { return nil }
 func (s *stubRouteManager) AddRoute(string, string, string) error        { return nil }
 func (s *stubRouteManager) ReplaceRoute(string, string, string) error    { return nil }
-func (s *stubRouteManager) DelRoute(string) error                        { return nil }
-func (s *stubRouteManager) FlushRoutes(string) error                     { return nil }
-func (s *stubRouteManager) ListRoutes() ([]types.Route, error)           { return nil, nil }
+func (s *stubRouteManager) DelRoute(string) error    { return nil }
+func (s *stubRouteManager) FlushRoutes(string) error { return nil }
 
-func TestApp_RunConnect_MultiHomedNoteWhenDefaultRouteElsewhere(t *testing.T) {
+func TestApp_RunConnect_MultiHomedNotePicksLowestMetric(t *testing.T) {
+	// TWO defaults, dump order deliberately wlan0-first: the note must
+	// compare against the lowest-metric (preferred) default, eth0@100 —
+	// not whatever the netlink dump lists first.
 	app, _, stderr := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
 	app.WiFiMgr = &testWiFiManager{
 		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
 	}
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
-	app.RouteMgr = &stubRouteManager{def: &types.Route{Gw: "10.0.0.1", Iface: "eth0"}}
+	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
 
 	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
 	assert.Contains(t, stderr.String(), "default route (eth0)")
 	assert.Contains(t, stderr.String(), "wlan0")
+}
+
+func TestApp_RunConnect_MultiHomedNoteOnAnyOutcome(t *testing.T) {
+	// A portal/offline verdict via the wrong link misleads just like a false
+	// "ok" — the note must print regardless of the probe outcome.
+	for _, result := range []types.PortalResult{
+		{Status: types.PortalStatusPortal, PortalURL: "http://x", ProbeURL: "http://p"},
+		{Status: types.PortalStatusOffline},
+	} {
+		app, _, stderr := newTestApp()
+		app.PortalRetryDelay = time.Millisecond
+		app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+		app.WiFiMgr = &testWiFiManager{
+			connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+		}
+		app.PortalDet = &testPortalDetector{results: []types.PortalResult{result}}
+		app.RouteMgr = &stubRouteManager{routes: []types.Route{
+			{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+		}}
+
+		err := app.RunConnect("TestSSID", "password123")
+		assert.NoError(t, err)
+		assert.Contains(t, stderr.String(), "default route (eth0)", "outcome %v", result.Status)
+	}
 }
 
 func TestApp_RunConnect_NoMultiHomedNoteWhenRoutesMatch(t *testing.T) {
@@ -1299,7 +1343,9 @@ func TestApp_RunConnect_NoMultiHomedNoteWhenRoutesMatch(t *testing.T) {
 		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
 	}
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
-	app.RouteMgr = &stubRouteManager{def: &types.Route{Gw: "192.168.1.1", Iface: "wlan0"}}
+	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},
+	}}
 
 	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
@@ -1497,6 +1543,23 @@ func TestApp_resolveVPNName_VPNExplicitlyDisabled(t *testing.T) {
 	assert.Equal(t, "", app.resolveVPNName("home"))
 }
 
+func TestApp_resolveVPNName_UnconfiguredNameFallsBackToCommon(t *testing.T) {
+	// The plain-SSID path: RunConnect passes the SSID as configName when the
+	// name isn't a configured network — common.vpn must still apply
+	// (the second success path of the old connectVPN).
+	app, _, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{Common: types.CommonConfig{VPN: "default-vpn"}},
+	}
+	assert.Equal(t, "default-vpn", app.resolveVPNName("any"))
+}
+
+func TestApp_resolveVPNName_NilConfigMgr(t *testing.T) {
+	app, _, _ := newTestApp()
+	app.ConfigMgr = nil
+	assert.Equal(t, "", app.resolveVPNName("any"))
+}
+
 func TestApp_attemptVPNConnect_ConnectionError(t *testing.T) {
 	app, stdout, stderr := newTestApp()
 	app.VPNMgr = &testVPNManager{connectErr: errors.New("connection refused")}
@@ -1512,6 +1575,9 @@ Continuing `cmd/net/app.go` implementation:
 
 ```go
 func (a *App) resolveVPNName(networkName string) string {
+	if a.ConfigMgr == nil {
+		return ""
+	}
 	config := a.ConfigMgr.GetConfig()
 	if config == nil {
 		return ""
@@ -1553,6 +1619,16 @@ func (a *App) checkPortalAfterConnect(connectedIface string) bool {
 	if !a.portalCheckEnabled() {
 		return false
 	}
+	// Honest multi-home signaling: the probe follows the kernel's preferred
+	// default route (lowest metric — wired 100 beats WiFi 600), which may
+	// not be the just-connected interface. Any outcome via the wrong link
+	// misleads (false ok, false offline, or a portal URL for the wrong
+	// network), so the note prints regardless of the probe result.
+	// NB: RouteMgr.GetDefaultRoute() returns the FIRST default in the
+	// netlink dump, not the preferred one — use preferredDefaultIface.
+	if iface := a.preferredDefaultIface(); iface != "" && connectedIface != "" && iface != connectedIface {
+		a.errorf("Note: the portal probe uses the default route (%s), not the just-connected %s — the result may not describe %s.\n", iface, connectedIface, connectedIface)
+	}
 	result, err := a.PortalDet.Check()
 	if err != nil {
 		// Check errors mean misconfiguration (e.g. https probe URL) — the
@@ -1586,17 +1662,35 @@ func (a *App) checkPortalAfterConnect(connectedIface string) bool {
 		return true
 	case types.PortalStatusOffline:
 		a.errorf("Warning: no internet connectivity detected\n")
-	default:
-		// "Online" via a different egress than the just-connected interface
-		// is the multi-homed false-ok case (wired metric 100 beats WiFi 600)
-		// — the one outcome where staying silent would be a lie.
-		if a.RouteMgr != nil && connectedIface != "" {
-			if r, rerr := a.RouteMgr.GetDefaultRoute(); rerr == nil && r != nil && r.Iface != "" && r.Iface != connectedIface {
-				a.errorf("Note: internet was verified via the default route (%s), not the just-connected %s — a portal on %s may go undetected.\n", r.Iface, connectedIface, connectedIface)
-			}
-		}
 	}
 	return false
+}
+
+// preferredDefaultIface returns the outgoing interface of the LOWEST-metric
+// IPv4 default route — the path the kernel (and therefore the portal probe)
+// actually prefers. Returns "" when unknown (nil RouteMgr, netlink error, or
+// no default route). GetDefaultRoute is NOT used: it returns the first
+// default in the netlink dump, which on a dual-homed machine may be the
+// higher-metric one.
+func (a *App) preferredDefaultIface() string {
+	if a.RouteMgr == nil {
+		return ""
+	}
+	routes, err := a.RouteMgr.ListRoutes()
+	if err != nil {
+		return ""
+	}
+	best := ""
+	bestMetric := -1
+	for _, r := range routes {
+		if !r.IsDefault() || r.Iface == "" {
+			continue
+		}
+		if bestMetric == -1 || r.Metric < bestMetric {
+			best, bestMetric = r.Iface, r.Metric
+		}
+	}
+	return best
 }
 ```
 
@@ -1667,7 +1761,7 @@ git commit -m "feat(cli): portal check after connect and Internet line in status
 - Modify: `config.example` (portal + timeouts.portal entries)
 - Modify: `docs/plans/2026-07-17-captive-portal-design.md` (sync review-driven changes)
 
-**Step 1: README** — add `net portal` to the commands section (exit codes 0/2/1/3, the default-route limitation, and the connect-time latency bound: worst case ≈ settle 500ms + 2× portal timeout when the network is truly offline), and add to BOTH the README config reference and `config.example` (users copy the example):
+**Step 1: README** — add `net portal` to the commands section (exit codes 0/2/1/3, the default-route limitation, and the connect-time latency bound: worst case ≈ settle 500ms + 2× portal timeout when the network is truly offline — the retry is deliberately unconditional; refused/no-route probes fail in milliseconds so the full cost only hits blackholed networks). Note that `timeouts.*` subfields remain historically unvalidated (a `timeouts.portl` typo silently falls back to the 3s default) — tightening that is out of scope for this feature (pre-existing behavior; changing it could break configs that load today). Add to BOTH the README config reference and `config.example` (users copy the example):
 
 ```yaml
 common:
@@ -1697,7 +1791,7 @@ git commit -m "docs: document net portal command and portal config"
 **Step 2:** `go test ./...` → all packages PASS (this is the required, deterministic verification: unit + httptest coverage of every classification row)
 **Step 3:** Build a real binary: `go build -o /tmp/net-portal-test ./cmd/net`
 **Step 4 (opportunistic manual QA — optional, outside acceptance criteria; explicitly requested by the user for this session):** the requesting user is literally sitting behind Amtrak_WiFi's portal; run `/tmp/net-portal-test portal` on the live network. Expect `Internet: ok` (already logged in) or `Captive portal detected!` + URL; verify exit code with `echo $?`; confirm no sudo prompt appears (root exemption). Also run `/tmp/net-portal-test status` and confirm the `Internet:` line. Required verification is Steps 1–3 (deterministic).
-**Step 5:** Push branch, open PR per repo workflow (`gh pr create` with explicit `--repo`/`--base`/`--head` — origin redirects), then PR self-review per CLAUDE.md.
+**Step 5 (requires network + GitHub credentials; skip gracefully if unavailable):** Push branch, open PR per repo workflow (`gh pr create` with explicit `--repo`/`--base`/`--head` — origin redirects), then PR self-review per CLAUDE.md. A completed implementation with Steps 1–3 green is NOT a failure if publishing is impossible.
 
 ---
 
@@ -1788,3 +1882,18 @@ git commit -m "docs: document net portal command and portal config"
 | 59 | Grok (minor) | Task 3 test imports missing `errors`/`strings` | **Accepted.** Import block fixed. |
 | 60 | Grok (minor) | Multi-home branch can nil-deref a `(nil, nil)` route | **Accepted.** `r != nil` guard added. |
 | 61 | Self (minor) | Status host-wide label "(default route)" untested | **Accepted (pre-merged).** `TestApp_RunStatus_OnlineLabeledHostWide` added. |
+
+### Round 6 (2026-07-17) — Codex: REVISE, Grok: REVISE, Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 62 | Grok (major) | `GetDefaultRoute()` returns FIRST default in netlink dump, not lowest-metric — honesty note can compare the wrong iface on the exact motivating topology | **Accepted.** New `preferredDefaultIface()` helper: `ListRoutes()` → lowest-metric default. Two-defaults test with dump order reversed. |
+| 63 | Grok (major) | Multi-home note only on Online — false portal/offline via wrong link also mislead | **Accepted (supersedes r5 #54).** Note prints on ANY outcome, before the probe, with outcome-neutral wording ("the result may not describe wlan0") — which also resolves Codex's r5 wording complaint. Any-outcome test added. |
+| 64 | Grok (major) | Test conversion dropped the unknown-name → `common.vpn` fallback path (the plain-SSID/Amtrak path!) | **Accepted.** `TestApp_resolveVPNName_UnconfiguredNameFallsBackToCommon` added. |
+| 65 | Grok (minor) | Stale "implementer's choice" sentence contradicts exact plumbing spec | **Accepted.** Bullet now points solely at `ValidationError.Message`. |
+| 66 | Grok (minor) | `timeouts.portal` typos silently ignored while `common.portal` is strict | **Accepted (document-only).** Pre-existing `timeouts.*` behavior documented in README; tightening it could break configs that load today — out of scope. |
+| 67 | Codex (blocker as filed) | Non-ASCII/IDN-confusable hostnames pass probe-URL validation | **Accepted.** Printable-ASCII-only rule for the raw configured URL (subsumes Cc/Cf); non-ASCII test vector. `loginURL` untouched — international portal hosts are legitimate network data there. |
+| 68 | Codex (major) | Unicode TrimSpace widens the "success" match | **Accepted.** ASCII-only trim; U+00A0-padded test classifies Portal. |
+| 69 | Codex (major) | Unconditional settle-retry on deterministic failures | **Rejected (documented instead):** categorizing offline reasons adds detector API surface for marginal gain; refused/no-route probes fail in ms so the retry cost is ~500ms there, and the full ≈6.5s bound only hits blackholed networks — bound now stated exactly in README. Single retry was a deliberate r2 decision. |
+| 70 | Codex (major) | `resolveVPNName` panics on nil `ConfigMgr` | **Accepted.** Nil guard + `TestApp_resolveVPNName_NilConfigMgr`. (Old `connectVPN` had the same exposure, but the guard matches the plan's other nil-safe helpers.) |
+| 71 | Codex (minor) | PR push unconditional in verification | **Accepted.** Step 5 marked network/credentials-dependent; local green ≠ failure. |
