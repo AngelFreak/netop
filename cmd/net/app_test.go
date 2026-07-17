@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -725,14 +726,6 @@ func TestApp_RunShow_SpecificNetwork(t *testing.T) {
 
 func TestApp_RunStatus(t *testing.T) {
 	app, stdout, _ := newTestApp()
-	app.Executor = &testExecutor{
-		executeFunc: func(name string, args ...string) (string, error) {
-			if name == "hostname" {
-				return "testhost\n", nil
-			}
-			return "", nil
-		},
-	}
 	app.WiFiMgr = &testWiFiManager{
 		connections: []types.Connection{
 			{Interface: "wlan0", SSID: "TestNet", State: "connected", IP: net.ParseIP("192.168.1.100")},
@@ -751,7 +744,11 @@ func TestApp_RunStatus(t *testing.T) {
 	err := app.RunStatus()
 	assert.NoError(t, err)
 	assert.Contains(t, stdout.String(), "Network Status")
-	assert.Contains(t, stdout.String(), "testhost")
+	// Hostname now comes from os.Hostname() (the real system hostname), not a
+	// mocked executor command. Assert the status prints the actual hostname.
+	if h, hErr := os.Hostname(); hErr == nil && h != "" {
+		assert.Contains(t, stdout.String(), h)
+	}
 	assert.Contains(t, stdout.String(), "TestNet")
 }
 

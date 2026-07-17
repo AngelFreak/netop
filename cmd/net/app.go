@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -806,7 +807,7 @@ func (a *App) RunStatus() error {
 	}
 
 	// Get hostname
-	hostname, err := a.Executor.Execute("hostname")
+	hostname, err := os.Hostname()
 	if err != nil {
 		a.Logger.Debug("Failed to get hostname", "error", err)
 	} else {

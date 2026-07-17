@@ -221,14 +221,14 @@ func (m *Manager) Release(iface string) error {
 		m.runDir() + "/dhclient." + iface + ".leases",
 	}
 	for _, f := range leaseFiles {
-		if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "rm", "-f", f); err != nil {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, fmt.Sprintf("failed to remove %s: %v", f, err))
 		}
 	}
 
 	// Clean up interface-specific dhclient config
 	confFile := m.runDir() + "/dhclient." + iface + ".conf"
-	if _, err := m.executor.ExecuteWithTimeout(CleanupTimeout, "rm", "-f", confFile); err != nil {
+	if err := os.Remove(confFile); err != nil && !os.IsNotExist(err) {
 		m.logger.Debug("Failed to remove dhclient config", "file", confFile, "error", err)
 	}
 

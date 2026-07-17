@@ -596,8 +596,7 @@ func (m *Manager) GenerateWireGuardKey() (private, public string, err error) {
 
 // removeFile removes a file, logging any error but not failing
 func (m *Manager) removeFile(path string) {
-	_, err := m.executor.ExecuteWithTimeout(1*time.Second, "rm", "-f", path)
-	if err != nil {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		m.logger.Debug("Failed to remove temp file", "path", path, "error", err)
 	}
 }
