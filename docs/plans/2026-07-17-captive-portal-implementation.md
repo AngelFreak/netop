@@ -929,6 +929,9 @@ func TestLoginURL(t *testing.T) {
 		{"path-relative rejected (probe-host mislabeling)", "/login", ""},
 		{"bare-name relative rejected", "login", ""},
 		{"query-only relative rejected", "?next=x", ""},
+		{"degenerate double-slash rejected", "//", ""},
+		{"degenerate triple-slash rejected", "///", ""},
+		{"triple-slash host smuggle rejected", "///evil.com/login", ""},
 		{"empty", "", ""},
 		{"unparseable", "http://bad host/", ""},
 		{"javascript scheme rejected", "javascript:alert(1)", ""},
@@ -1218,6 +1221,13 @@ func loginURL(base *url.URL, location string, logger types.Logger) string {
 		// the probe hostname still points at the real probe server. The
 		// ProbeURL fallback re-triggers interception either way.
 		logger.Debug("Portal sent relative Location, using probe URL fallback")
+		return ""
+	}
+	if strings.HasPrefix(location, "//") && ref.Host == "" {
+		// Degenerate scheme-relative forms ("//", "///evil/…") parse with
+		// an empty host and would resolve to the probe host — same
+		// mislabeling as path-relative references.
+		logger.Debug("Portal sent degenerate scheme-relative Location, using probe URL fallback")
 		return ""
 	}
 	resolved := base.ResolveReference(ref)
@@ -1910,7 +1920,8 @@ func TestApp_RunConnect_MultiHomedNotePicksLowestMetric(t *testing.T) {
 
 	err := app.RunConnect("TestSSID", "password123")
 	assert.NoError(t, err)
-	assert.Contains(t, stderr.String(), "default route (IPv4: eth0)")
+	assert.Contains(t, stderr.String(), "default route (eth0)")
+	assert.Contains(t, stderr.String(), "Disable/unplug eth0")
 	assert.Contains(t, stderr.String(), "wlan0")
 }
 
@@ -1934,7 +1945,7 @@ func TestApp_RunConnect_MultiHomedNoteOnAnyOutcome(t *testing.T) {
 
 		err := app.RunConnect("TestSSID", "password123")
 		assert.NoError(t, err)
-		assert.Contains(t, stderr.String(), "default route (IPv4: eth0)", "outcome %v", result.Status)
+		assert.Contains(t, stderr.String(), "default route (eth0)", "outcome %v", result.Status)
 	}
 }
 
@@ -2456,7 +2467,7 @@ func (a *App) checkPortalAfterConnect(connectedIface string, vpnConfigured bool)
 	// The comparison is IPv4-main-table only (ListRoutes' scope); the note
 	// says "IPv4 default route" so a dual-stack IPv6 egress isn't overclaimed.
 	if iface := a.preferredDefaultIface(); iface != "" && connectedIface != "" && iface != connectedIface {
-		a.errorf("Note: the portal probe follows the system default route (IPv4: %s), not the just-connected %s — the result may not describe %s.\n", iface, connectedIface, connectedIface)
+		a.errorf("Note: the portal probe follows the preferred IPv4 default route (%s), not the just-connected %s — portal detection for %s is unreliable while %s stays preferred. Disable/unplug %s or open a browser while on %s.\n", iface, connectedIface, connectedIface, iface, iface, connectedIface)
 	}
 	result, err := a.PortalDet.Check()
 	if err != nil {
@@ -2626,15 +2637,15 @@ common:
 
 **Step 2: Sync the design doc** — the design is stale relative to ALL review rounds; the sync must be EXHAUSTIVE, replacing these sections wholesale (grep the design afterwards to confirm each string landed):
 
-1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; **301/302/303/307/308**/511→portal; **401/403 + present `Location` header→portal — PortalURL only when the Location sanitizes, else ProbeURL fallback**; 200 unexpected body→portal (Location used for PortalURL when sanitizable); everything else — **including 304 and non-redirect 3xx** — →offline; oversized body never online; body read only on 200, with a pre-captured Location beating the broken-body offline heuristic).
+1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; **301/302/303/307/308**/511→portal; **401/403 + present `Location` header→portal — PortalURL only when the Location sanitizes, else ProbeURL fallback**; 200 unexpected body→portal (Location used for PortalURL when sanitizable); everything else — **including 304 and non-redirect 3xx** — →offline; oversized body never online; body read only on 200, with a pre-captured Location beating the broken-body offline heuristic). Location sanitization rules: **path-relative and degenerate scheme-relative (`//`, `///…`) references → empty PortalURL** (ProbeURL fallback); absolute http(s) and `//host/…` forms only when the parsed host is non-empty.
 2. `PortalResult` shape → **`PortalStatusUnknown` as fail-closed zero value**, `PortalURL` (Location only) + `ProbeURL` + display-safety contract; probe URL validation (visible ASCII, http, host, no userinfo).
-3. CLI section → exit codes **0/2/1/3** (3 = config/internal error; Unknown maps to 1, never 0), neutral `Internet: unreachable` copy, `Args: cobra.NoArgs`, root exemption; **`net portal` always probes, ignoring `check: off`**.
+3. CLI section → exit codes **0/2/1/3** (3 = config/internal error; Unknown maps to 1, never 0), neutral `Internet: unreachable` copy, `Args: cobra.NoArgs`, root exemption; **`net portal` always probes, ignoring `check: off`**; **every `net portal` outcome carries `(default IPv4 route: <iface>)` when known** (mirrors status). Connect-time multi-home note includes the actionable remediation (disable/unplug the preferred link or use a browser on the captive network).
 4. `net status` → honors `check: off` (line omitted); skips probing entirely on config load failure; EVERY outcome names the preferred IPv4 default route when known: **`Internet:  ok (default IPv4 route: eth0)`**, **`Internet:  captive portal (URL) (default IPv4 route: eth0)`**, **`Internet:  unreachable (default IPv4 route: eth0)`** (unlabeled fallbacks when unknown); Unknown statuses print `unreachable`, never `ok`; the line prints even when the selected interface is disconnected.
 5. Connect flow → settle-retry (500ms + one retry, offline-warn only after retry), VPN hint only when a VPN resolves, **offline warning demoted to debug when a VPN is configured**, `resolveVPNName` replacing `connectVPN`.
 6. Multi-home → known product gap, IPv4-labeled honesty note via lowest-metric default (`preferredDefaultIface`, not `GetDefaultRoute`), dual-stack caveat, heuristic-not-guarantee wording.
 7. Config → `common.portal` map-only rule, `check` AND `url` raw-map value validation incl. non-string rejection (weak-typing trap), `url` empty/null/absent ⇒ default.
 
-Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `Location header`, `default IPv4 route: `, `captive portal (`, `unreachable (default IPv4 route`, `check: off`, `exit`, `Unknown`.
+Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `Location header`, `path-relative`, `Captive portal detected`, `default IPv4 route: `, `captive portal (`, `unreachable (default IPv4 route`, `check: off`, `exit`, `Unknown`.
 
 Add a "Revised after consensus review (see plan Review Log for round count)" note at the top.
 
@@ -2920,3 +2931,11 @@ git commit -m "docs: document net portal command and portal config"
 | 165 | Grok (major) | #164's "moves to Task 4" was note-only — body still lived in Task 5; `fakenetlink` import unstated in Task 4 | **Accepted.** Full helper body pasted in Task 4; Task 5 keeps a do-not-redefine pointer; import comment at the first Task 4 fixture. |
 | 166 | Grok (major) | Path-relative `Location` resolved against the probe host and mislabeled "Log in at:" (wrong under transparent interception) | **Accepted.** `loginURL` rejects path-relative/query-only references → ProbeURL fallback (works for both interception styles); `RedirectRelative` test and `TestLoginURL` vectors flipped; doc comment updated. |
 | 167 | Grok (major) | `createApp` ellipsis fence unsafe for literal/agent execution (dropped fields nil-panic) | **Accepted.** Full 16-field body pasted with verify-against-current caveat. |
+
+### Round 20 (2026-07-18) — **Codex: APPROVE (3rd consecutive)**, Grok: REVISE (3), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 168 | Grok (major) | `//`, `///`, `///evil/…` bypass the #166 relative rule and mislabel the probe host as a login URL (empirically tabled) | **Accepted.** Scheme-relative refs must carry a non-empty parsed host; three rejection vectors added. |
+| 169 | Grok (major) | Task 6 sync lagged the r18/r19 contracts (relative-Location rule, portal-command route labels); grep-back couldn't catch either | **Accepted.** Items 1/3 extended; `path-relative` + `Captive portal detected` grep tokens; stale `(IPv4: …)` test assertions fixed to the current copy. |
+| 170 | Grok (major) | Multi-home note accurate but non-actionable — a note the user can't act on trains them to ignore it | **Accepted.** Note names the remediation (disable/unplug the preferred link, or browser on the captive SSID); copy locked by substring assertions. |
