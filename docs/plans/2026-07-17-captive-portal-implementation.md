@@ -394,7 +394,21 @@ For reference, the rules this fragment encodes:
    - **non-empty string** → must pass the shared `types.ValidatePortalProbeURL` helper (visible-ASCII-only scan `0x21..0x7e` — no spaces, controls, or non-ASCII — then parse OK, scheme `http`, non-empty host, no userinfo — the CLI prints ProbeURL verbatim under the display-safety contract);
    - **non-string** (YAML bool/int/list) → `ValidationError` with `Message: "common.portal.url must be a string"` — same raw-map mechanism as `check`.
 
-Error plumbing (exact, no implementer's choice): extend `ValidationError` with an optional `Message string` field; `Error()` returns `Message` when set, else the existing unknown-field format. Inside the `common` branch of the raw-validation pass, append value errors like:
+Error plumbing (exact, no implementer's choice): extend `ValidationError` with an optional `Message string` field and replace `Error()` with exactly this precedence (a partial edit that adds the field but keeps the old `Error()` would surface value errors as "unknown field" and fail the message-substring tests only later):
+
+```go
+func (e ValidationError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Suggestion != "" {
+		return fmt.Sprintf("unknown field '%s' in %s (did you mean '%s'?)", e.Field, e.Section, e.Suggestion)
+	}
+	return fmt.Sprintf("unknown field '%s' in %s", e.Field, e.Section)
+}
+```
+
+(Verify the two non-Message branches against the CURRENT `ValidationError.Error()` in `pkg/config/config.go` and keep its exact wording — the fragment above mirrors it as of `93a90c9`.) Inside the `common` branch of the raw-validation pass, append value errors like:
 
 ```go
 errors = append(errors, ValidationError{
@@ -683,6 +697,36 @@ func TestCheck_Portal_AuthStatusWithLocation(t *testing.T) {
 		assert.Equal(t, types.PortalStatusPortal, result.Status, "status %d", status)
 		assert.Equal(t, "http://portal.example.com/login", result.PortalURL, "status %d", status)
 	}
+}
+
+func TestCheck_Portal_200WithLocation(t *testing.T) {
+	// Some rewrite-style portals send 200 + portal HTML + a Location.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://portal.example.com/login")
+		w.Write([]byte("<html>login here</html>"))
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
+	assert.Equal(t, "http://portal.example.com/login", result.PortalURL)
+}
+
+func TestCheck_Portal_403WithUnsanitizableLocation(t *testing.T) {
+	// Location PRESENCE is the interception evidence; a URL that fails
+	// sanitization (userinfo) still means portal — with ProbeURL fallback.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://user:pass@evil.example.com/login")
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	result, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
+	assert.Empty(t, result.PortalURL)
+	assert.Equal(t, srv.URL, result.ProbeURL)
 }
 
 func TestCheck_Offline_403WithoutLocation(t *testing.T) {
@@ -1050,13 +1094,19 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	case resp.StatusCode != http.StatusOK:
 		// Some enterprise/hotel portals answer 401/403 WITH a Location — a
 		// redirect header on an error status is interception evidence, so
-		// honor it. (Body sniffing is deliberately not done here: a
-		// corporate 403 block page would false-positive as a portal.
-		// Non-redirect 3xx like 304 land here too and classify offline —
-		// a caching intermediary is not interception evidence.)
-		if login := loginURL(resp.Request.URL, resp.Header.Get("Location"), d.logger); login != "" &&
+		// honor its PRESENCE even when the URL itself fails sanitization
+		// (PortalURL stays empty and the caller falls back to ProbeURL,
+		// same as the 3xx path). Bare 401/403 without Location remain
+		// offline: a corporate block page is not a portal, and body
+		// sniffing is deliberately not done. Non-redirect 3xx like 304
+		// land here too and classify offline.
+		if loc := resp.Header.Get("Location"); loc != "" &&
 			(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-			return types.PortalResult{Status: types.PortalStatusPortal, PortalURL: login, ProbeURL: d.probeURL}, nil
+			return types.PortalResult{
+				Status:    types.PortalStatusPortal,
+				PortalURL: loginURL(resp.Request.URL, loc, d.logger),
+				ProbeURL:  d.probeURL,
+			}, nil
 		}
 		// Other 4xx/5xx (except 511): the probe endpoint itself is broken or
 		// blocked. Don't cry "portal" over a CDN outage.
@@ -1079,8 +1129,14 @@ func (d *Detector) Check() (types.PortalResult, error) {
 		return types.PortalResult{Status: types.PortalStatusOnline, ProbeURL: d.probeURL}, nil
 	}
 	// 200 with an unexpected body: something rewrote the response
-	// (DNS-hijack style portals do this). No login URL known.
-	return types.PortalResult{Status: types.PortalStatusPortal, ProbeURL: d.probeURL}, nil
+	// (DNS-hijack style portals do this). Some such portals still send a
+	// Location header — use it when it sanitizes; Location never decides
+	// Online (body/204 stay authoritative).
+	return types.PortalResult{
+		Status:    types.PortalStatusPortal,
+		PortalURL: loginURL(resp.Request.URL, resp.Header.Get("Location"), d.logger),
+		ProbeURL:  d.probeURL,
+	}, nil
 }
 
 // isRedirectStatus reports whether status is a redirect that carries
@@ -1706,24 +1762,10 @@ func TestApp_RunConnect_OfflineAfterRetryWarns(t *testing.T) {
 	assert.Contains(t, stderr.String(), "no internet connectivity")
 }
 
-// stubRouteManager implements types.RouteManager with a fixed route table;
-// only ListRoutes matters here (preferredDefaultIface uses it), the rest are
-// inert no-ops.
-type stubRouteManager struct{ routes []types.Route }
-
-func (s *stubRouteManager) ListRoutes() ([]types.Route, error) { return s.routes, nil }
-func (s *stubRouteManager) GetDefaultRoute() (*types.Route, error) {
-	return nil, errors.New("not implemented")
-}
-func (s *stubRouteManager) GetDefaultRouteForIface(string) (*types.Route, error) {
-	return nil, errors.New("not implemented")
-}
-func (s *stubRouteManager) ReplaceDefault(string, string, int) error     { return nil }
-func (s *stubRouteManager) SetDefaultForIface(string, string, int) error { return nil }
-func (s *stubRouteManager) AddRoute(string, string, string) error        { return nil }
-func (s *stubRouteManager) ReplaceRoute(string, string, string) error    { return nil }
-func (s *stubRouteManager) DelRoute(string) error    { return nil }
-func (s *stubRouteManager) FlushRoutes(string) error { return nil }
+// Route fixtures use the EXISTING pkg/netlink/fake.RouteManager (fake.Routes
+// → ListRoutes, compile-time interface assert) — do NOT hand-roll a stub;
+// duplicating the interface here drifts when RouteManager grows methods.
+// Import: fakenetlink "github.com/angelfreak/net/pkg/netlink/fake"
 
 func TestApp_RunConnect_MultiHomedNotePicksLowestMetric(t *testing.T) {
 	// TWO defaults, dump order deliberately wlan0-first: the note must
@@ -1735,7 +1777,7 @@ func TestApp_RunConnect_MultiHomedNotePicksLowestMetric(t *testing.T) {
 		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
 	}
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
-	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},
 		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
 	}}
@@ -1760,7 +1802,7 @@ func TestApp_RunConnect_MultiHomedNoteOnAnyOutcome(t *testing.T) {
 			connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
 		}
 		app.PortalDet = &testPortalDetector{results: []types.PortalResult{result}}
-		app.RouteMgr = &stubRouteManager{routes: []types.Route{
+		app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 			{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
 		}}
 
@@ -1777,7 +1819,7 @@ func TestApp_RunConnect_NoMultiHomedNoteWhenRoutesMatch(t *testing.T) {
 		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
 	}
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
-	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},
 	}}
 
@@ -1866,7 +1908,7 @@ func TestApp_RunStatus_PortalNamesDefaultRouteIface(t *testing.T) {
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
 		Status: types.PortalStatusPortal, PortalURL: "http://portal.example.com/login", ProbeURL: "http://p",
 	}}}
-	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
 	}}
 
@@ -1879,7 +1921,7 @@ func TestApp_RunStatus_UnreachableNamesDefaultRouteIface(t *testing.T) {
 	app, stdout, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
-	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
 	}}
 
@@ -1892,7 +1934,7 @@ func TestApp_RunStatus_OnlineNamesDefaultRouteIface(t *testing.T) {
 	app, stdout, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
-	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
 	}}
 
@@ -2752,3 +2794,12 @@ git commit -m "docs: document net portal command and portal config"
 | 151 | Grok (minor) | `probe error` status line unlabeled, breaking the every-outcome rule | **Accepted.** Labeled when the route is known; ProbeErrorLine test pinned to the unlabeled form. |
 | 152 | Grok (minor) | `createPortalDetector` config wiring untested — hard-coded defaults would stay green | **Accepted.** `TestCreatePortalDetector_UsesConfigURLAndTimeout` probes a live httptest server through the configured URL. |
 | 153 | Grok (minor) | `statusCmd.Short` stays stale after status grows the Internet line | **Accepted.** Task 6 Step 0 updates the Short text. |
+
+### Round 17 (2026-07-18) — **Codex: APPROVE ("NO OBJECTIONS", tree-verified)**, Grok: REVISE (4 new findings), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 154 | Grok (major) | 200-with-Location portals never get their login URL extracted (real-world rewrite-portal shape) | **Accepted.** 200 unexpected-body path now runs `loginURL` on Location (Location never decides Online); `TestCheck_Portal_200WithLocation`. |
+| 155 | Grok (minor) | 401/403 with a present-but-unsanitizable Location classified Offline, while the same Location on 302 yields Portal | **Accepted.** Location PRESENCE is the evidence; URL quality only affects PortalURL vs ProbeURL fallback; `TestCheck_Portal_403WithUnsanitizableLocation`; bare 401/403 stay Offline. |
+| 156 | Grok (minor) | Hand-rolled `stubRouteManager` duplicates the existing `pkg/netlink/fake.RouteManager` | **Accepted, fake verified in tree.** All fixtures use `fakenetlink.RouteManager{Routes: …}`. |
+| 157 | Grok (minor) | `ValidationError.Error()` precedence was prose-only | **Accepted.** Full method pasted with a verify-against-current-wording caveat. |
