@@ -318,6 +318,26 @@ func TestTimeoutConfigGetCarrierTimeout(t *testing.T) {
 	}
 }
 
+func TestTimeoutConfigGetPortalTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   TimeoutConfig
+		expected time.Duration
+	}{
+		{"default when zero", TimeoutConfig{Portal: 0}, 3 * time.Second},
+		{"default when negative", TimeoutConfig{Portal: -1}, 3 * time.Second},
+		{"custom 10 seconds", TimeoutConfig{Portal: 10}, 10 * time.Second},
+		{"custom 1 second", TimeoutConfig{Portal: 1}, 1 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.config.GetPortalTimeout()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
 func TestTimeoutConfigAllDefaults(t *testing.T) {
 	// Test that a zero-value TimeoutConfig returns all defaults
 	config := TimeoutConfig{}
@@ -326,6 +346,7 @@ func TestTimeoutConfigAllDefaults(t *testing.T) {
 	assert.Equal(t, 30*time.Second, config.GetAssociationTimeout())
 	assert.Equal(t, 30*time.Second, config.GetCommandTimeout())
 	assert.Equal(t, 5*time.Second, config.GetCarrierTimeout())
+	assert.Equal(t, 3*time.Second, config.GetPortalTimeout())
 }
 
 func TestTimeoutConfigAllCustom(t *testing.T) {
@@ -335,10 +356,12 @@ func TestTimeoutConfigAllCustom(t *testing.T) {
 		Association: 60,
 		Command:     120,
 		Carrier:     15,
+		Portal:      7,
 	}
 
 	assert.Equal(t, 45*time.Second, config.GetDHCPTimeout())
 	assert.Equal(t, 60*time.Second, config.GetAssociationTimeout())
 	assert.Equal(t, 120*time.Second, config.GetCommandTimeout())
 	assert.Equal(t, 15*time.Second, config.GetCarrierTimeout())
+	assert.Equal(t, 7*time.Second, config.GetPortalTimeout())
 }
