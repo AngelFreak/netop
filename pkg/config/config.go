@@ -566,8 +566,8 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 				return nil, err
 			}
 			// Cache the resolved config under the ALIAS name too, so later
-			// lookups by alias (notably connectVPN, which indexes Networks by
-			// the name the user connected with) find the target's VPN/settings.
+			// lookups by alias (notably resolveVPNName, which indexes Networks
+			// by the name the user connected with) find the target's VPN/settings.
 			m.config.Networks[name] = *resolved
 			return resolved, nil
 		}
