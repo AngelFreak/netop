@@ -190,6 +190,7 @@ type testNetworkManager struct {
 	dhcpErr        error
 	connectErr     error
 	connectionInfo *types.Connection
+	connectionErr  error
 }
 
 func (n *testNetworkManager) SetMAC(iface, mac string) error {
@@ -248,6 +249,9 @@ func (n *testNetworkManager) SetIP(iface, addr, gateway string, metric int) erro
 }
 
 func (n *testNetworkManager) GetConnectionInfo(iface string) (*types.Connection, error) {
+	if n.connectionErr != nil {
+		return nil, n.connectionErr
+	}
 	if n.connectionInfo != nil {
 		return n.connectionInfo, nil
 	}
@@ -1024,10 +1028,11 @@ func TestApp_RunDHCPServer_StartShowsConfig(t *testing.T) {
 	assert.Contains(t, output, "Lease:     6h")
 }
 
-// Tests for connectVPN and attemptVPNConnect
+// Tests for resolveVPNName and attemptVPNConnect (converted from the former
+// TestApp_connectVPN_* suite when connectVPN was inlined into RunConnect)
 
-func TestApp_connectVPN_NetworkSpecificVPN(t *testing.T) {
-	app, stdout, _ := newTestApp()
+func TestApp_resolveVPNName_NetworkSpecificVPN(t *testing.T) {
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{
 		config: &types.Config{
 			Networks: map[string]types.NetworkConfig{
@@ -1035,61 +1040,43 @@ func TestApp_connectVPN_NetworkSpecificVPN(t *testing.T) {
 			},
 		},
 	}
-
-	app.connectVPN("work")
-	assert.Contains(t, stdout.String(), "Connecting to VPN 'work-vpn'...")
-	assert.Contains(t, stdout.String(), "VPN connected!")
+	assert.Equal(t, "work-vpn", app.resolveVPNName("work"))
 }
 
-func TestApp_connectVPN_CommonVPN(t *testing.T) {
-	app, stdout, _ := newTestApp()
+func TestApp_resolveVPNName_CommonVPN(t *testing.T) {
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{
 		config: &types.Config{
-			Common: types.CommonConfig{
-				VPN: "default-vpn",
-			},
+			Common: types.CommonConfig{VPN: "default-vpn"},
 			Networks: map[string]types.NetworkConfig{
 				"home": {SSID: "HomeWiFi"}, // No VPN configured
 			},
 		},
 	}
-
-	app.connectVPN("home")
-	assert.Contains(t, stdout.String(), "Connecting to VPN 'default-vpn'...")
-	assert.Contains(t, stdout.String(), "VPN connected!")
+	assert.Equal(t, "default-vpn", app.resolveVPNName("home"))
 }
 
-func TestApp_connectVPN_NetworkVPNOverridesCommon(t *testing.T) {
-	app, stdout, _ := newTestApp()
+func TestApp_resolveVPNName_NetworkVPNOverridesCommon(t *testing.T) {
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{
 		config: &types.Config{
-			Common: types.CommonConfig{
-				VPN: "default-vpn",
-			},
+			Common: types.CommonConfig{VPN: "default-vpn"},
 			Networks: map[string]types.NetworkConfig{
 				"work": {SSID: "WorkWiFi", VPN: "work-vpn"},
 			},
 		},
 	}
-
-	app.connectVPN("work")
-	// Should use network-specific VPN, not common
-	assert.Contains(t, stdout.String(), "Connecting to VPN 'work-vpn'...")
-	assert.Contains(t, stdout.String(), "VPN connected!")
-	assert.NotContains(t, stdout.String(), "default-vpn")
+	assert.Equal(t, "work-vpn", app.resolveVPNName("work"))
 }
 
-func TestApp_connectVPN_NoConfig(t *testing.T) {
-	app, stdout, _ := newTestApp()
+func TestApp_resolveVPNName_NoConfig(t *testing.T) {
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: nil}
-
-	app.connectVPN("any")
-	// Should not output anything when config is nil
-	assert.Empty(t, stdout.String())
+	assert.Equal(t, "", app.resolveVPNName("any"))
 }
 
-func TestApp_connectVPN_NoVPNConfigured(t *testing.T) {
-	app, stdout, _ := newTestApp()
+func TestApp_resolveVPNName_NoVPNConfigured(t *testing.T) {
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{
 		config: &types.Config{
 			Networks: map[string]types.NetworkConfig{
@@ -1097,19 +1084,14 @@ func TestApp_connectVPN_NoVPNConfigured(t *testing.T) {
 			},
 		},
 	}
-
-	app.connectVPN("home")
-	// Should not output anything when no VPN configured
-	assert.Empty(t, stdout.String())
+	assert.Equal(t, "", app.resolveVPNName("home"))
 }
 
-func TestApp_connectVPN_VPNExplicitlyDisabled(t *testing.T) {
-	app, stdout, _ := newTestApp()
+func TestApp_resolveVPNName_VPNExplicitlyDisabled(t *testing.T) {
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{
 		config: &types.Config{
-			Common: types.CommonConfig{
-				VPN: "default-vpn", // Common VPN is set
-			},
+			Common: types.CommonConfig{VPN: "default-vpn"}, // Common VPN is set
 			Networks: map[string]types.NetworkConfig{
 				"home": {SSID: "HomeWiFi"}, // VPN field empty, but explicitly disabled
 			},
@@ -1118,25 +1100,86 @@ func TestApp_connectVPN_VPNExplicitlyDisabled(t *testing.T) {
 			"home": true, // Simulate vpn: (empty) in YAML
 		},
 	}
-
-	app.connectVPN("home")
-	// Should NOT connect to common VPN because vpn: was explicitly set to empty
-	assert.Empty(t, stdout.String())
+	// Must NOT inherit common VPN because vpn: was explicitly set to empty
+	assert.Equal(t, "", app.resolveVPNName("home"))
 }
 
-func TestApp_connectVPN_ConnectionError(t *testing.T) {
-	app, stdout, stderr := newTestApp()
+func TestApp_resolveVPNName_UnconfiguredNameFallsBackToCommon(t *testing.T) {
+	// The plain-SSID path: RunConnect passes the SSID as configName when the
+	// name isn't a configured network — common.vpn must still apply
+	// (the second success path of the old connectVPN).
+	app, _, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{
-		config: &types.Config{
-			Common: types.CommonConfig{VPN: "broken-vpn"},
-		},
+		config: &types.Config{Common: types.CommonConfig{VPN: "default-vpn"}},
 	}
+	assert.Equal(t, "default-vpn", app.resolveVPNName("any"))
+}
+
+func TestApp_resolveVPNName_NilConfigMgr(t *testing.T) {
+	app, _, _ := newTestApp()
+	app.ConfigMgr = nil
+	assert.Equal(t, "", app.resolveVPNName("any"))
+}
+
+func TestApp_attemptVPNConnect_ConnectionError(t *testing.T) {
+	app, stdout, stderr := newTestApp()
 	app.VPNMgr = &testVPNManager{connectErr: errors.New("connection refused")}
 
-	app.connectVPN("any")
+	app.attemptVPNConnect("broken-vpn")
 	// VPN connection failure should show warning to user but not fail WiFi connection
 	assert.NotContains(t, stdout.String(), "VPN connected")
 	assert.Contains(t, stderr.String(), "VPN connection failed")
+}
+
+// End-to-end characterizations through RunConnect: unit tests on
+// resolveVPNName can stay green while the RunConnect wiring is broken
+// (hint without connect, wrong configName), so the two inheritance edges
+// that motivated the refactor are asserted through the full command.
+
+func TestApp_RunConnect_NetworkVPNOverridesCommonEndToEnd(t *testing.T) {
+	app, _, _ := newTestApp()
+	tracker := &trackingVPNManager{}
+	app.VPNMgr = tracker
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Common: types.CommonConfig{VPN: "default-vpn"},
+			Networks: map[string]types.NetworkConfig{
+				"work": {SSID: "WorkWiFi", VPN: "work-vpn"},
+			},
+		},
+		networkConfig: &types.NetworkConfig{SSID: "WorkWiFi", VPN: "work-vpn"},
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("work", "")
+	assert.NoError(t, err)
+	assert.True(t, tracker.connectCalled)
+	assert.Equal(t, "work-vpn", tracker.lastConnectName)
+}
+
+func TestApp_RunConnect_VPNExplicitlyDisabledEndToEnd(t *testing.T) {
+	app, _, _ := newTestApp()
+	tracker := &trackingVPNManager{}
+	app.VPNMgr = tracker
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Common: types.CommonConfig{VPN: "default-vpn"},
+			Networks: map[string]types.NetworkConfig{
+				"home": {SSID: "HomeWiFi"},
+			},
+		},
+		networkConfig:         &types.NetworkConfig{SSID: "HomeWiFi"},
+		vpnExplicitlyDisabled: map[string]bool{"home": true},
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("home", "")
+	assert.NoError(t, err)
+	assert.False(t, tracker.connectCalled, "vpn: (explicitly empty) must not inherit common.vpn")
 }
 
 func TestApp_RunConnect_WithVPNIntegration(t *testing.T) {
@@ -1237,14 +1280,22 @@ func TestApp_RunShow_MergesWithCommon(t *testing.T) {
 	assert.Contains(t, stdout.String(), "8.8.8.8")
 }
 
-// trackingVPNManager tracks whether Disconnect was called
+// trackingVPNManager tracks Disconnect and Connect calls
 type trackingVPNManager struct {
 	testVPNManager
 	disconnectCalled bool
+	connectCalled    bool
+	lastConnectName  string
 }
 
 func (v *trackingVPNManager) Disconnect(name string) error {
 	v.disconnectCalled = true
+	return nil
+}
+
+func (v *trackingVPNManager) Connect(name string) error {
+	v.connectCalled = true
+	v.lastConnectName = name
 	return nil
 }
 
@@ -1444,4 +1495,422 @@ func TestApp_RunPortal_DetectorError(t *testing.T) {
 	_, err := app.RunPortal()
 	assert.Error(t, err)
 	assert.Contains(t, stderr.String(), "probe URL must be plain http")
+}
+
+// --- Task 5: connect + status integration tests ---
+
+func TestApp_RunConnect_PortalWarning(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status:    types.PortalStatusPortal,
+		PortalURL: "http://portal.example.com/login",
+		ProbeURL:  "http://probe.example.com/",
+	}}}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Contains(t, stderr.String(), "captive portal detected")
+	assert.Contains(t, stderr.String(), "http://portal.example.com/login")
+	// No VPN configured → no VPN hint
+	assert.NotContains(t, stderr.String(), "VPN")
+}
+
+func TestApp_RunConnect_PortalCheckOff(t *testing.T) {
+	app, _, stderr := newTestApp()
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusPortal, PortalURL: "http://x", ProbeURL: "http://p"}}}
+	app.PortalDet = det
+	app.ConfigMgr = &testConfigManager{
+		config:     &types.Config{Common: types.CommonConfig{Portal: types.PortalConfig{Check: "off"}}},
+		networkErr: errors.New("not found"),
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, det.calls, "portal check must be skipped when check: off")
+	assert.NotContains(t, stderr.String(), "captive portal")
+}
+
+func TestApp_RunConnect_NilDetectorNoCrash(t *testing.T) {
+	app, stdout, _ := newTestApp() // PortalDet nil — must not panic
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Connected!")
+}
+
+func TestApp_RunConnect_PortalStillConnectsVPN(t *testing.T) {
+	app, _, stderr := newTestApp()
+	tracker := &trackingVPNManager{}
+	app.VPNMgr = tracker
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Networks: map[string]types.NetworkConfig{"home": {SSID: "Home", VPN: "myvpn"}},
+			VPN:      map[string]types.VPNConfig{"myvpn": {Type: "wireguard"}},
+		},
+		networkConfig: &types.NetworkConfig{SSID: "Home", VPN: "myvpn"},
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status: types.PortalStatusPortal, PortalURL: "http://x", ProbeURL: "http://p",
+	}}}
+
+	err := app.RunConnect("home", "")
+	assert.NoError(t, err)
+	assert.True(t, tracker.connectCalled, "VPN attempt must still happen after portal warning")
+	assert.Equal(t, "myvpn", tracker.lastConnectName)
+	assert.Contains(t, stderr.String(), "may not come up until")
+}
+
+func TestApp_RunConnect_OfflineRetriesOnce(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.PortalRetryDelay = time.Millisecond
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	// First probe races DHCP/DNS settling and reports Offline; retry sees the portal.
+	det := &testPortalDetector{results: []types.PortalResult{
+		{Status: types.PortalStatusOffline},
+		{Status: types.PortalStatusPortal, PortalURL: "http://portal.example.com/login", ProbeURL: "http://p"},
+	}}
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, det.calls)
+	assert.Contains(t, stderr.String(), "captive portal detected")
+	assert.NotContains(t, stderr.String(), "no internet connectivity")
+}
+
+func TestApp_RunConnect_OnlineAfterSettleRetry(t *testing.T) {
+	// Offline then Online: the settle-retry succeeded — no warning at all.
+	app, _, stderr := newTestApp()
+	app.PortalRetryDelay = time.Millisecond
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	det := &testPortalDetector{results: []types.PortalResult{
+		{Status: types.PortalStatusOffline},
+		{Status: types.PortalStatusOnline},
+	}}
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, det.calls)
+	assert.NotContains(t, stderr.String(), "Warning:")
+}
+
+func TestApp_RunConnect_OfflineAfterRetryWarns(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.PortalRetryDelay = time.Millisecond
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, det.calls)
+	assert.Contains(t, stderr.String(), "no internet connectivity")
+}
+
+func TestApp_RunConnect_MultiHomedNotePicksLowestMetric(t *testing.T) {
+	// TWO defaults, dump order deliberately wlan0-first: the note must
+	// compare against the lowest-metric (preferred) default, eth0@100 —
+	// not whatever the netlink dump lists first.
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Contains(t, stderr.String(), "default route (eth0)")
+	assert.Contains(t, stderr.String(), "Disable/unplug eth0")
+	assert.Contains(t, stderr.String(), "wlan0")
+}
+
+func TestApp_RunConnect_MultiHomedNoteOnAnyOutcome(t *testing.T) {
+	// A portal/offline verdict via the wrong link misleads just like a false
+	// "ok" — the note must print regardless of the probe outcome.
+	for _, result := range []types.PortalResult{
+		{Status: types.PortalStatusPortal, PortalURL: "http://x", ProbeURL: "http://p"},
+		{Status: types.PortalStatusOffline},
+	} {
+		app, _, stderr := newTestApp()
+		app.PortalRetryDelay = time.Millisecond
+		app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+		app.WiFiMgr = &testWiFiManager{
+			connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+		}
+		app.PortalDet = &testPortalDetector{results: []types.PortalResult{result}}
+		app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+			{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+		}}
+
+		err := app.RunConnect("TestSSID", "password123")
+		assert.NoError(t, err)
+		assert.Contains(t, stderr.String(), "default route (eth0)", "outcome %v", result.Status)
+	}
+}
+
+func TestApp_RunConnect_NoMultiHomedNoteWhenRoutesMatch(t *testing.T) {
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},
+	}}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.NotContains(t, stderr.String(), "default route (")
+}
+
+func TestApp_RunConnect_MisconfiguredProbeWarns(t *testing.T) {
+	// A Check() error means misconfiguration — must be visible on stderr,
+	// not silently swallowed (a silent skip looks like "no portal").
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{err: errors.New("probe URL must be plain http")}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err) // still non-fatal
+	assert.Contains(t, stderr.String(), "portal probe misconfigured")
+}
+
+func TestApp_RunConnect_RetryErrorNoOfflineWarning(t *testing.T) {
+	// First probe offline, retry errors out: don't warn "offline" off a
+	// half-completed check.
+	app, _, stderr := newTestApp()
+	app.PortalRetryDelay = time.Millisecond
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	det := &testPortalDetector{
+		results: []types.PortalResult{{Status: types.PortalStatusOffline}},
+		errs:    []error{nil, errors.New("transient")},
+	}
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, det.calls)
+	assert.NotContains(t, stderr.String(), "no internet connectivity")
+}
+
+func TestApp_RunStatus_ProbeErrorLine(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.RouteMgr = nil                                          // pinned: expected string is the route-unlabeled form
+	app.PortalDet = &testPortalDetector{err: errors.New("probe URL must be plain http")}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  probe error")
+}
+
+func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.RouteMgr = nil                                          // pinned: expected string is the route-unlabeled form
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status:    types.PortalStatusPortal,
+		PortalURL: "http://portal.example.com/login",
+		ProbeURL:  "http://probe.example.com/",
+	}}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  captive portal (http://portal.example.com/login)")
+	assert.Equal(t, 1, app.PortalDet.(*testPortalDetector).calls, "status probes exactly once (no retry)")
+}
+
+func TestApp_RunStatus_OnlineLabeledHostWide(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.RouteMgr = nil                                          // pinned: expected string is the route-unlabeled form
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  ok (default route)")
+}
+
+func TestApp_RunStatus_PortalNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status: types.PortalStatusPortal, PortalURL: "http://portal.example.com/login", ProbeURL: "http://p",
+	}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  captive portal (http://portal.example.com/login) (default IPv4 route: eth0)")
+}
+
+func TestApp_RunStatus_UnreachableNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  unreachable (default IPv4 route: eth0)")
+}
+
+func TestApp_RunStatus_OnlineNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  ok (default IPv4 route: eth0)")
+}
+
+func TestApp_RunStatus_UnknownStatusNeverOk(t *testing.T) {
+	// Zero-value PortalResult (PortalStatusUnknown) must never print "ok".
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.PortalDet = &testPortalDetector{}                       // empty results → zero-value result
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  unreachable")
+	assert.NotContains(t, stdout.String(), "Internet:  ok")
+}
+
+func TestApp_RunConnect_VPNConfiguredSuppressesOfflineWarning(t *testing.T) {
+	// VPN-required networks legitimately look offline pre-VPN: no scary
+	// warning, but the VPN attempt must still proceed.
+	app, _, stderr := newTestApp()
+	app.PortalRetryDelay = time.Millisecond
+	tracker := &trackingVPNManager{}
+	app.VPNMgr = tracker
+	app.ConfigMgr = &testConfigManager{
+		config:     &types.Config{Common: types.CommonConfig{VPN: "default-vpn"}},
+		networkErr: errors.New("not found"),
+	}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.NotContains(t, stderr.String(), "no internet connectivity")
+	assert.True(t, tracker.connectCalled)
+}
+
+func TestApp_RunStatus_InternetLineWhenDisconnected(t *testing.T) {
+	// The Internet line is host-wide (#42): it must print even when the
+	// selected interface has no connection info (another link may carry
+	// the internet). Guards the insertion point staying OUTSIDE the
+	// connected-branch if/else.
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.NetworkMgr = &testNetworkManager{connectionErr: errors.New("no connection on iface")}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	// Prove the disconnected branch actually ran (guards a no-op
+	// connectionErr harness) AND the host-wide line still printed.
+	assert.NotContains(t, stdout.String(), "State:     connected")
+	assert.Contains(t, stdout.String(), "Internet:  ok (default route")
+}
+
+func TestApp_RunStatus_ConfigLoadFailureSkipsProbe(t *testing.T) {
+	// Load failure means the user's portal policy (check: off, custom URL)
+	// is unknown — auto-probing substituted defaults could report "ok"
+	// against their intent. Skip; the loader already surfaced the error.
+	app, stdout, _ := newTestApp() // testConfigManager{} → GetConfig() == nil
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.PortalDet = det
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, det.calls)
+	assert.NotContains(t, stdout.String(), "Internet:")
+}
+
+func TestApp_RunConnect_UnknownStatusWarns(t *testing.T) {
+	// Zero-value PortalResult (Unknown) must fail closed on connect too —
+	// a silent no-op reads as a clean connect with working internet.
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	det := &testPortalDetector{} // empty results → zero-value result
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, det.calls) // Unknown is not Offline: no settle-retry
+	assert.Contains(t, stderr.String(), "could not be determined")
+}
+
+func TestApp_RunStatus_OfflineLine(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  unreachable")
+}
+
+func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.PortalDet = det
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{Common: types.CommonConfig{Portal: types.PortalConfig{Check: "off"}}},
+	}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, det.calls)
+	assert.NotContains(t, stdout.String(), "Internet:")
 }
