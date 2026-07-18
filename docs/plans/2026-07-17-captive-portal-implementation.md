@@ -6,7 +6,7 @@
 
 **Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; redirect statuses **301/302/303/307/308** or 511 → portal (login URL from `Location`); 401/403 **with a sanitized `Location`** → portal (enterprise/hotel interception); 200 with unexpected body → portal (DNS-hijack style); transport errors **and every other status — including 304 and other non-redirect 3xx** → offline, so a probe-endpoint outage or caching intermediary is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
-**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". A connect-time bound probe IS technically feasible — `net connect` runs as root (sudo re-exec), which has the caps for `SO_BINDTODEVICE` — but correct binding also requires binding DNS resolution (custom `net.Resolver` with a `Dialer.Control` hook; Go's default resolver ignores the transport dialer), and it would make `net connect` classify differently from the root-exempt `net portal`/`net status` on the same network. That complexity/consistency trade-off is REJECTED as a product decision for this feature, not an impossibility; a follow-up issue for an opt-in bound connect-time probe is reasonable future work. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its online line host-wide, naming the route interface when known — `Internet:  ok (default route: eth0)`, plain `(default route)` otherwise; README, design doc, and `net portal --help` document the semantics.
+**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". A connect-time bound probe IS technically feasible — `net connect` runs as root (sudo re-exec), which has the caps for `SO_BINDTODEVICE` — but correct binding also requires binding DNS resolution (custom `net.Resolver` with a `Dialer.Control` hook; Go's default resolver ignores the transport dialer), and it would make `net connect` classify differently from the root-exempt `net portal`/`net status` on the same network. That complexity/consistency trade-off is REJECTED as a product decision for this feature, not an impossibility; a follow-up issue for an opt-in bound connect-time probe is reasonable future work. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels EVERY Internet outcome with the preferred IPv4 default route when known — `Internet:  ok (default IPv4 route: eth0)`, `Internet:  captive portal (URL) (default IPv4 route: eth0)`, `Internet:  unreachable (default IPv4 route: eth0)` — falling back to `(default route)` / unlabeled forms when unknown; README, design doc, and `net portal --help` document the semantics.
 
 **Tech Stack:** Go stdlib `net/http` + `httptest` (no new dependencies), cobra, testify.
 
@@ -272,6 +272,7 @@ func TestValidatePortalProbeURL(t *testing.T) {
 		"format rune":         "http://evil‮.com/x",
 		"raw control byte":    "http://x.example.com/\x1b",
 		"raw space":           "http://x.example.com/a b",
+		"fragment":            "http://x.example.com/p#frag",
 		"unparseable":         "not a url",
 	} {
 		assert.Error(t, ValidatePortalProbeURL(bad), "%s: %q must be rejected", name, bad)
@@ -292,7 +293,7 @@ func TestPortalConfigCheckDisabled(t *testing.T) {
 
 **Step 2: Run to verify failure**
 
-Run: `go test ./pkg/config/ -run TestPortalConfig -v && go test ./pkg/types/ -run TestPortalConfigCheckDisabled -v`
+Run: `go test ./pkg/config/ -run TestPortalConfig -v && go test ./pkg/types/ -run 'TestPortalConfigCheckDisabled|TestValidatePortalProbeURL' -v`
 Expected: FAIL — `cfg.Common.Portal` undefined / `portal` rejected as unknown common field
 
 **Step 3: Implement**
@@ -422,7 +423,7 @@ This is deliberately stricter than the historically-unvalidated `timeouts` becau
 
 **Placement note:** the URL rule uses `types.ValidatePortalProbeURL`. **Add it to the EXISTING** `pkg/types/validation.go` next to the other validators (`ValidateMAC`, `ValidateSSID`, …) — the file already exists; do not create a new one. `pkg/types` is the dependency-free bottom layer both `pkg/config` and `pkg/portal` already import, so config never depends on the runtime detector package. Its test goes in the existing `pkg/types/validation_test.go`; Task 3's Detector calls the same helper.
 
-The definitive implementation (this task):
+The definitive implementation (this task; `pkg/types/validation.go` will need `net/url` — and NOT `unicode`, the scan is a plain byte-range check — added to its imports):
 
 ```go
 // ValidatePortalProbeURL reports whether raw is acceptable as a captive-portal
@@ -451,6 +452,9 @@ func ValidatePortalProbeURL(raw string) error {
 	}
 	if u.User != nil {
 		return fmt.Errorf("portal probe URL %q must not contain userinfo", raw)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("portal probe URL %q must not contain a fragment — fragments are never sent over HTTP", raw)
 	}
 	return nil
 }
@@ -817,7 +821,9 @@ func TestLoginURL(t *testing.T) {
 		// serialized string stays as defense-in-depth only:
 		{"bidi in path is percent-encoded", "http://x.example.com/‮gnp.exe", "http://x.example.com/%E2%80%AEgnp.exe"},
 		{"bidi in host is percent-encoded", "http://evil‮.com/x", "http://evil%E2%80%AE.com/x"},
-		{"percent-encoded controls stay encoded", "http://x.example.com/%1b%0d%0a", "http://x.example.com/%1b%0d%0a"},
+		{"percent-encoded controls rejected", "http://x.example.com/%1b%0d%0a", ""},
+		{"percent-encoded DEL rejected", "http://x.example.com/%7F", ""},
+		{"benign percent-encoding allowed", "http://x.example.com/%20a?x=%2Fb", "http://x.example.com/%20a?x=%2Fb"},
 		{"raw space in query rejected", "http://x.example.com/login?next=a b", ""},
 		{"oversized URL rejected", "http://x.example.com/" + strings.Repeat("a", 3000), ""},
 	}
@@ -856,8 +862,11 @@ Expected: FAIL — package doesn't compile (no portal.go)
 // The probe uses the process's normal routing (default route). It is NOT
 // bound to a specific interface: on a multi-homed machine the result
 // reflects the preferred route, which may not be the interface that was
-// just connected. Binding would require SO_BINDTODEVICE (CAP_NET_RAW) and
-// break the root-exempt `net portal` command.
+// just connected. Binding (SO_BINDTODEVICE) is feasible where netop runs
+// as root (net connect), but correct binding also needs a bound DNS
+// resolver and would make root and root-exempt commands classify the same
+// network differently — rejected as a product decision; an opt-in bound
+// connect-time probe is possible future work.
 package portal
 
 import (
@@ -1020,6 +1029,29 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	return types.PortalResult{Status: types.PortalStatusPortal, ProbeURL: d.probeURL}, nil
 }
 
+// hasEncodedControl reports whether the URL string contains a
+// percent-encoded C0 control or DEL (%00-%1F, %7F), case-insensitively.
+func hasEncodedControl(s string) bool {
+	ls := strings.ToLower(s)
+	for i := 0; i+2 < len(ls); i++ {
+		if ls[i] != '%' {
+			continue
+		}
+		h := ls[i+1 : i+3]
+		if h == "7f" || (h[0] == '0') || (h[0] == '1') {
+			// %0x / %1x / %7f — verify both are hex digits first
+			if isHexDigit(h[0]) && isHexDigit(h[1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+}
+
 // isRedirectStatus reports whether status is a redirect that carries
 // interception semantics. Deliberately NOT all of 3xx: 304 Not Modified is a
 // caching intermediary, and 300/305/306 carry no portal meaning — treating
@@ -1065,6 +1097,12 @@ func loginURL(base *url.URL, location string, logger types.Logger) string {
 		return ""
 	}
 	s := resolved.String()
+	if hasEncodedControl(s) {
+		// Downstream tooling (browsers, log processors) may decode %00-%1f/
+		// %7f later — encoded controls have no place in a login URL.
+		logger.Debug("Portal Location contains percent-encoded control bytes, ignoring")
+		return ""
+	}
 	if len(s) > maxLoginURLBytes {
 		logger.Debug("Portal Location exceeds length cap, ignoring", "len", len(s))
 		return ""
@@ -1730,6 +1768,7 @@ func TestApp_RunStatus_ProbeErrorLine(t *testing.T) {
 func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
 	app, stdout, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.RouteMgr = nil // pinned: expected string is the route-unlabeled form
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
 		Status:    types.PortalStatusPortal,
 		PortalURL: "http://portal.example.com/login",
@@ -1762,7 +1801,7 @@ func TestApp_RunStatus_OnlineNamesDefaultRouteIface(t *testing.T) {
 
 	err := app.RunStatus()
 	assert.NoError(t, err)
-	assert.Contains(t, stdout.String(), "Internet:  ok (default route: eth0)")
+	assert.Contains(t, stdout.String(), "Internet:  ok (default IPv4 route: eth0)")
 }
 
 func TestApp_RunStatus_UnknownStatusNeverOk(t *testing.T) {
@@ -2255,9 +2294,10 @@ In `RunStatus`, insert AFTER the ENTIRE connection-info if/else (i.e. outside bo
 			}
 			// Status has no connect-time route note, so every line names
 			// the probed route when known — a portal/unreachable verdict
-			// via the wrong link misleads just like a false ok.
+			// via the wrong link misleads just like a false ok. "IPv4"
+			// keeps the claim at the heuristic's actual confidence.
 			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  captive portal via %s (%s)\n", iface, url)
+				a.printf("Internet:  captive portal (%s) (default IPv4 route: %s)\n", url, iface)
 			} else {
 				a.printf("Internet:  captive portal (%s)\n", url)
 			}
@@ -2266,14 +2306,14 @@ In `RunStatus`, insert AFTER the ENTIRE connection-info if/else (i.e. outside bo
 			// not scoped to the Interface: shown above (which may even be
 			// disconnected while another link provides internet).
 			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  ok (default route: %s)\n", iface)
+				a.printf("Internet:  ok (default IPv4 route: %s)\n", iface)
 			} else {
 				a.printf("Internet:  ok (default route)\n")
 			}
 		default:
 			// Offline, Unknown, and any future status — never fail open.
 			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  unreachable (default route: %s)\n", iface)
+				a.printf("Internet:  unreachable (default IPv4 route: %s)\n", iface)
 			} else {
 				a.printf("Internet:  unreachable\n")
 			}
@@ -2323,12 +2363,12 @@ common:
 1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; **301/302/303/307/308**/511→portal; 401/403+sanitized Location→portal; 200 unexpected body→portal; everything else — **including 304 and non-redirect 3xx** — →offline; oversized body never online; body read only on 200).
 2. `PortalResult` shape → **`PortalStatusUnknown` as fail-closed zero value**, `PortalURL` (Location only) + `ProbeURL` + display-safety contract; probe URL validation (visible ASCII, http, host, no userinfo).
 3. CLI section → exit codes **0/2/1/3** (3 = config/internal error; Unknown maps to 1, never 0), neutral `Internet: unreachable` copy, `Args: cobra.NoArgs`, root exemption; **`net portal` always probes, ignoring `check: off`**.
-4. `net status` → honors `check: off`, host-wide label naming the route interface when known: **`Internet:  ok (default route: eth0)`**, plain `(default route)` otherwise; unknown statuses print `unreachable`, never `ok`.
+4. `net status` → honors `check: off` (line omitted); skips probing entirely on config load failure; EVERY outcome names the preferred IPv4 default route when known: **`Internet:  ok (default IPv4 route: eth0)`**, **`Internet:  captive portal (URL) (default IPv4 route: eth0)`**, **`Internet:  unreachable (default IPv4 route: eth0)`** (unlabeled fallbacks when unknown); Unknown statuses print `unreachable`, never `ok`; the line prints even when the selected interface is disconnected.
 5. Connect flow → settle-retry (500ms + one retry, offline-warn only after retry), VPN hint only when a VPN resolves, **offline warning demoted to debug when a VPN is configured**, `resolveVPNName` replacing `connectVPN`.
 6. Multi-home → known product gap, IPv4-labeled honesty note via lowest-metric default (`preferredDefaultIface`, not `GetDefaultRoute`), dual-stack caveat, heuristic-not-guarantee wording.
 7. Config → `common.portal` map-only rule, `check` AND `url` raw-map value validation incl. non-string rejection (weak-typing trap), `url` empty/null/absent ⇒ default.
 
-Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `default route: `, `check: off`, `exit`, `Unknown`.
+Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `default IPv4 route: `, `captive portal (`, `unreachable (default IPv4 route`, `check: off`, `exit`, `Unknown`.
 
 Add a "Revised after consensus review (see plan Review Log for round count)" note at the top.
 
@@ -2343,7 +2383,7 @@ git commit -m "docs: document net portal command and portal config"
 
 ### Task 7: full verification
 
-**Step 1:** `files=$(git ls-files '*.go' | xargs -r gofmt -l); test -z "$files"` → exit 0 (tracked Go files only; `-r` skips the gofmt call entirely if the list is ever empty); `go vet ./...` → clean
+**Step 1:** `files=$(git ls-files -z '*.go' | xargs -0 -r gofmt -l); test -z "$files"` → exit 0 (tracked Go files only, NUL-safe for exotic filenames, `-r` skips gofmt on an empty list); `go vet ./...` → clean
 **Step 2:** `go test ./...` → all packages PASS (this is the required, deterministic verification: unit + httptest coverage of every classification row)
 **Step 3:** Build a real binary: `go build -o /tmp/net-portal-test ./cmd/net`
 **Step 4 (opportunistic manual QA — optional, outside acceptance criteria; explicitly requested by the user for this session):** the requesting user is literally sitting behind Amtrak_WiFi's portal; run `/tmp/net-portal-test portal` on the live network. Expect `Internet: ok` (already logged in) or `Captive portal detected!` + URL; verify exit code with `echo $?`; confirm no sudo prompt appears (root exemption). Also run `/tmp/net-portal-test status` and confirm the `Internet:` line. Required verification is Steps 1–3 (deterministic).
@@ -2549,3 +2589,16 @@ git commit -m "docs: document net portal command and portal config"
 | 130 | Grok (major) | Host-wide Internet line untested when the selected iface is disconnected; insertion prose ambiguous | **Accepted.** Placement wording now says OUTSIDE the entire if/else; `TestApp_RunStatus_InternetLineWhenDisconnected` + `testNetworkManager.connectionErr` extension. |
 | 131 | Grok (major, disputing #21 with new evidence) | `net connect` runs as root — `SO_BINDTODEVICE` is available on the motivating path; rejection rationale overclaimed | **Accepted (rationale rewritten, signaling kept).** Bind is feasible but requires bound DNS (custom Resolver) and would make root and root-exempt commands classify differently; rejected as an explicit product decision with follow-up-issue note — Grok's fix option 2. |
 | 132 | Grok (minor) | Red-phase filter missed `UnknownStatusWarns` (filter drift, same class as #108/#121) | **Accepted.** Filter rewritten as a grouped pattern including `Unknown`. |
+
+### Round 14 (2026-07-18) — Codex: REVISE, Grok: REVISE (1 major + 2 minors, "program behavior fully specified"), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 133 | Codex (major) | Portal-line test doesn't pin `RouteMgr`; assertion unstable if fixtures gain routes | **Accepted.** Explicit `app.RouteMgr = nil` with comment. |
+| 134 | Codex (major) | "via eth0" wording overstates a metric-only IPv4 heuristic | **Accepted.** Uniform `(default IPv4 route: eth0)` suffix on all labeled lines; matches the connect-note's IPv4 qualifier. |
+| 135 | Codex (major) | Percent-encoded C0/DEL accepted in login URLs; downstream tooling may decode | **Accepted.** `hasEncodedControl` rejects %00-%1F/%7F case-insensitively; stays-encoded vector flipped to rejection; benign-encoding vector added. |
+| 136 | Codex (minor) | Probe URLs with fragments print differently than probed | **Accepted.** Fragment rejection + vector. |
+| 137 | Codex (minor) | gofmt gate not NUL-safe | **Accepted.** `git ls-files -z \| xargs -0 -r`. |
+| 138 | Grok (major) | Architecture/Task 6 froze pre-#128 status labeling (same class as #84/#105) | **Accepted.** Header, Task 6 item 4, and grep-back strings now carry all three labeled forms (in the new #134 wording). |
+| 139 | Grok (minor) | Package godoc still stated the pre-#131 "would break root-exempt portal" rationale | **Accepted.** Godoc rewritten to the honest rationale (feasible-but-rejected, bound-DNS + consistency). |
+| 140 | Grok (minor) | Task 2 red phase never runs `TestValidatePortalProbeURL`; `net/url` import unstated | **Accepted.** Red filter extended; import note added (no `unicode` needed — byte-range scan). |
