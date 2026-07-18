@@ -4,7 +4,7 @@
 
 **Goal:** Detect captive portals (e.g. Amtrak_WiFi) after connect, on demand via `net portal`, and in `net status` — printing the portal's login URL when the portal supplies one via redirect, otherwise the probe URL to open in a browser (which the portal will intercept).
 
-**Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; redirect statuses **301/302/303/307/308** or 511 → portal (login URL from `Location`); 401/403 **with a sanitized `Location`** → portal (enterprise/hotel interception); 200 with unexpected body → portal (DNS-hijack style); transport errors **and every other status — including 304 and other non-redirect 3xx** → offline, so a probe-endpoint outage or caching intermediary is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
+**Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; redirect statuses **301/302/303/307/308** or 511 → portal (login URL from `Location`); 401/403 **with a `Location` header** → portal (enterprise/hotel interception; a sanitized Location populates PortalURL, otherwise ProbeURL fallback); 200 with unexpected body → portal (DNS-hijack style); transport errors **and every other status — including 304 and other non-redirect 3xx** → offline, so a probe-endpoint outage or caching intermediary is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
 **Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". A connect-time bound probe IS technically feasible — `net connect` runs as root (sudo re-exec), which has the caps for `SO_BINDTODEVICE` — but correct binding also requires binding DNS resolution (custom `net.Resolver` with a `Dialer.Control` hook; Go's default resolver ignores the transport dialer), and it would make `net connect` classify differently from the root-exempt `net portal`/`net status` on the same network. That complexity/consistency trade-off is REJECTED as a product decision for this feature, not an impossibility; a follow-up issue for an opt-in bound connect-time probe is reasonable future work. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels EVERY Internet outcome with the preferred IPv4 default route when known — `Internet:  ok (default IPv4 route: eth0)`, `Internet:  captive portal (URL) (default IPv4 route: eth0)`, `Internet:  unreachable (default IPv4 route: eth0)` — falling back to `(default route)` / unlabeled forms when unknown; README, design doc, and `net portal --help` document the semantics.
 
@@ -699,6 +699,18 @@ func TestCheck_Portal_AuthStatusWithLocation(t *testing.T) {
 	}
 }
 
+func TestCheck_Portal_200LocationWithBrokenBody(t *testing.T) {
+	// Location captured before the body read: interception evidence beats
+	// the flaky-link heuristic when both apply.
+	d := New("http://probe.example.com/", time.Second, &testLogger{})
+	d.transport = brokenBodyWithLocationTransport{}
+
+	result, err := d.Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, result.Status)
+	assert.Equal(t, "http://portal.example.com/login", result.PortalURL)
+}
+
 func TestCheck_Portal_200WithLocation(t *testing.T) {
 	// Some rewrite-style portals send 200 + portal HTML + a Location.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -713,20 +725,22 @@ func TestCheck_Portal_200WithLocation(t *testing.T) {
 	assert.Equal(t, "http://portal.example.com/login", result.PortalURL)
 }
 
-func TestCheck_Portal_403WithUnsanitizableLocation(t *testing.T) {
+func TestCheck_Portal_AuthStatusWithUnsanitizableLocation(t *testing.T) {
 	// Location PRESENCE is the interception evidence; a URL that fails
 	// sanitization (userinfo) still means portal — with ProbeURL fallback.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "http://user:pass@evil.example.com/login")
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", "http://user:pass@evil.example.com/login")
+			w.WriteHeader(status)
+		}))
 
-	result, err := newTestDetector(srv.URL).Check()
-	assert.NoError(t, err)
-	assert.Equal(t, types.PortalStatusPortal, result.Status)
-	assert.Empty(t, result.PortalURL)
-	assert.Equal(t, srv.URL, result.ProbeURL)
+		result, err := newTestDetector(srv.URL).Check()
+		srv.Close()
+		assert.NoError(t, err, "status %d", status)
+		assert.Equal(t, types.PortalStatusPortal, result.Status, "status %d", status)
+		assert.Empty(t, result.PortalURL, "status %d", status)
+		assert.Equal(t, srv.URL, result.ProbeURL, "status %d", status)
+	}
 }
 
 func TestCheck_Offline_403WithoutLocation(t *testing.T) {
@@ -785,6 +799,17 @@ func (brokenBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		StatusCode: http.StatusOK,
 		Body:       &brokenBody{},
 		Header:     http.Header{},
+		Request:    req,
+	}, nil
+}
+
+type brokenBodyWithLocationTransport struct{}
+
+func (brokenBodyWithLocationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &brokenBody{},
+		Header:     http.Header{"Location": []string{"http://portal.example.com/login"}},
 		Request:    req,
 	}, nil
 }
@@ -993,8 +1018,9 @@ type Detector struct {
 	probeURL string
 	timeout  time.Duration
 	logger   types.Logger
-	// transport overrides the HTTP transport in tests; nil uses a
-	// proxy-free default so we probe the local network path.
+	// transport is set by New to a proxy-free DefaultTransport clone (we
+	// probe the local network path, and reuse avoids stranding idle
+	// connections across checks); tests may overwrite it after New.
 	transport http.RoundTripper
 }
 
@@ -1020,7 +1046,11 @@ func New(probeURL string, timeout time.Duration, logger types.Logger) *Detector 
 		// must never disable the bound on a blackholed network.
 		timeout = (&types.TimeoutConfig{}).GetPortalTimeout()
 	}
-	return &Detector{probeURL: probeURL, timeout: timeout, logger: logger}
+	// Build the proxy-free transport ONCE: a fresh clone per Check would
+	// strand idle connections/goroutines across the connect-time retry.
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return &Detector{probeURL: probeURL, timeout: timeout, logger: logger, transport: t}
 }
 ```
 
@@ -1038,18 +1068,9 @@ func (d *Detector) Check() (types.PortalResult, error) {
 		return types.PortalResult{}, err
 	}
 
-	transport := d.transport
-	if transport == nil {
-		// Clone the default transport to keep Go's tuned defaults (dialer
-		// timeouts, connection pooling), then disable proxies: the point is
-		// to test the local network path directly.
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.Proxy = nil
-		transport = t
-	}
 	client := &http.Client{
 		Timeout:   d.timeout,
-		Transport: transport,
+		Transport: d.transport, // set once in New (proxy-free clone) or injected by tests
 		// Don't follow redirects — the portal's Location header IS the answer.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -1114,12 +1135,24 @@ func (d *Detector) Check() (types.PortalResult, error) {
 		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
 	}
 
-	// 200: read one byte past the cap so an oversized body can never be
+	// 200: capture Location FIRST — rewrite portals may send it, and it
+	// remains valid evidence even if the body then stalls or breaks.
+	loc := resp.Header.Get("Location")
+	// Read one byte past the cap so an oversized body can never be
 	// trimmed into a fake "success" (e.g. "success" + KBs of whitespace).
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if err != nil {
-		// A truncated/broken body on an otherwise-OK response is a flaky
-		// link, not evidence of a portal.
+		if loc != "" {
+			// Broken body but a Location present: interception evidence
+			// wins over the flaky-link heuristic.
+			return types.PortalResult{
+				Status:    types.PortalStatusPortal,
+				PortalURL: loginURL(resp.Request.URL, loc, d.logger),
+				ProbeURL:  d.probeURL,
+			}, nil
+		}
+		// A truncated/broken body on an otherwise-OK response with no
+		// Location is a flaky link, not evidence of a portal.
 		d.logger.Debug("Portal probe body read failed", "error", err)
 		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
 	}
@@ -1134,7 +1167,7 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	// Online (body/204 stay authoritative).
 	return types.PortalResult{
 		Status:    types.PortalStatusPortal,
-		PortalURL: loginURL(resp.Request.URL, resp.Header.Get("Location"), d.logger),
+		PortalURL: loginURL(resp.Request.URL, loc, d.logger),
 		ProbeURL:  d.probeURL,
 	}, nil
 }
@@ -1291,8 +1324,22 @@ func TestApp_RunPortal_ConfigLoadFailure(t *testing.T) {
 	assert.Contains(t, stderr.String(), "configuration failed to load")
 }
 
+func TestApp_RunPortal_OnlineNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := portalTestApp()
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOnline, status)
+	assert.Contains(t, stdout.String(), "Internet: ok (default IPv4 route: eth0)")
+}
+
 func TestApp_RunPortal_Online(t *testing.T) {
 	app, stdout, _ := portalTestApp()
+	app.RouteMgr = nil // pinned: expected string is the route-unlabeled form
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
 
 	status, err := app.RunPortal()
@@ -1397,7 +1444,9 @@ Expected: compile error (`app.PortalDet`, `app.RunPortal` undefined); after stub
 	RouteMgr   types.RouteManager   // Route inspection for multi-home signaling (nil-safe)
 ```
 
-RunPortal method (near RunStatus):
+RunPortal method (near RunStatus; it calls `preferredDefaultIface`, which is
+pasted in Task 5 — add that helper in THIS task so the commit compiles, Task 5
+then only references it):
 
 ```go
 // RunPortal probes for internet connectivity and captive portals, printing
@@ -1421,21 +1470,27 @@ func (a *App) RunPortal() (types.PortalStatus, error) {
 		a.errorf("Error: %v\n", err)
 		return types.PortalStatusOffline, err
 	}
+	// Like status (#128), every outcome names the probed route when known —
+	// this command has no connect-time multi-home note either.
+	routeSuffix := ""
+	if iface := a.preferredDefaultIface(); iface != "" {
+		routeSuffix = fmt.Sprintf(" (default IPv4 route: %s)", iface)
+	}
 	switch result.Status {
 	case types.PortalStatusPortal:
-		a.println("Captive portal detected!")
+		a.printf("Captive portal detected!%s\n", routeSuffix)
 		if result.PortalURL != "" {
 			a.printf("  Log in at: %s\n", result.PortalURL)
 		} else {
 			a.printf("  Open %s in a browser to trigger the portal login page\n", result.ProbeURL)
 		}
 	case types.PortalStatusOnline:
-		a.println("Internet: ok")
+		a.printf("Internet: ok%s\n", routeSuffix)
 	default:
 		// Offline, Unknown, and any future status: never fail open into
 		// "ok". Neutral copy — Offline covers both no-response and HTTP
 		// error statuses from the probe endpoint.
-		a.println("Internet: unreachable")
+		a.printf("Internet: unreachable%s\n", routeSuffix)
 	}
 	return result.Status, nil
 }
@@ -1512,9 +1567,10 @@ or a rewritten response body). Probe failures and server errors are reported
 as "unreachable" — if the probe endpoint itself is down, that is not a portal.
 
 The probe follows normal process routing; on a multi-homed machine it
-reflects the preferred interface, not necessarily the one just connected
-(the multi-home note is an IPv4-main-table metric heuristic, not a guarantee
-of probe egress). HTTP proxy environment variables are intentionally ignored
+reflects the preferred interface, not necessarily the one you care about.
+Output names the preferred IPv4 default route when known — an IPv4-main-table
+metric heuristic, not a guarantee of probe egress. HTTP proxy environment
+variables are intentionally ignored
 — a proxy would answer on the portal's behalf and mask it.
 
 This command always probes, even with common.portal.check: off (which only
@@ -2529,7 +2585,7 @@ common:
 
 **Step 2: Sync the design doc** — the design is stale relative to ALL review rounds; the sync must be EXHAUSTIVE, replacing these sections wholesale (grep the design afterwards to confirm each string landed):
 
-1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; **301/302/303/307/308**/511→portal; 401/403+sanitized Location→portal; 200 unexpected body→portal; everything else — **including 304 and non-redirect 3xx** — →offline; oversized body never online; body read only on 200).
+1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; **301/302/303/307/308**/511→portal; **401/403 + present `Location` header→portal — PortalURL only when the Location sanitizes, else ProbeURL fallback**; 200 unexpected body→portal (Location used for PortalURL when sanitizable); everything else — **including 304 and non-redirect 3xx** — →offline; oversized body never online; body read only on 200, with a pre-captured Location beating the broken-body offline heuristic).
 2. `PortalResult` shape → **`PortalStatusUnknown` as fail-closed zero value**, `PortalURL` (Location only) + `ProbeURL` + display-safety contract; probe URL validation (visible ASCII, http, host, no userinfo).
 3. CLI section → exit codes **0/2/1/3** (3 = config/internal error; Unknown maps to 1, never 0), neutral `Internet: unreachable` copy, `Args: cobra.NoArgs`, root exemption; **`net portal` always probes, ignoring `check: off`**.
 4. `net status` → honors `check: off` (line omitted); skips probing entirely on config load failure; EVERY outcome names the preferred IPv4 default route when known: **`Internet:  ok (default IPv4 route: eth0)`**, **`Internet:  captive portal (URL) (default IPv4 route: eth0)`**, **`Internet:  unreachable (default IPv4 route: eth0)`** (unlabeled fallbacks when unknown); Unknown statuses print `unreachable`, never `ok`; the line prints even when the selected interface is disconnected.
@@ -2537,14 +2593,14 @@ common:
 6. Multi-home → known product gap, IPv4-labeled honesty note via lowest-metric default (`preferredDefaultIface`, not `GetDefaultRoute`), dual-stack caveat, heuristic-not-guarantee wording.
 7. Config → `common.portal` map-only rule, `check` AND `url` raw-map value validation incl. non-string rejection (weak-typing trap), `url` empty/null/absent ⇒ default.
 
-Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `default IPv4 route: `, `captive portal (`, `unreachable (default IPv4 route`, `check: off`, `exit`, `Unknown`.
+Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `Location header`, `default IPv4 route: `, `captive portal (`, `unreachable (default IPv4 route`, `check: off`, `exit`, `Unknown`.
 
 Add a "Revised after consensus review (see plan Review Log for round count)" note at the top.
 
 **Step 3: Commit**
 
 ```bash
-git add README.md config.example docs/plans/2026-07-17-captive-portal-design.md
+git add cmd/net/status.go README.md config.example docs/plans/2026-07-17-captive-portal-design.md
 git commit -m "docs: document net portal command and portal config"
 ```
 
@@ -2803,3 +2859,15 @@ git commit -m "docs: document net portal command and portal config"
 | 155 | Grok (minor) | 401/403 with a present-but-unsanitizable Location classified Offline, while the same Location on 302 yields Portal | **Accepted.** Location PRESENCE is the evidence; URL quality only affects PortalURL vs ProbeURL fallback; `TestCheck_Portal_403WithUnsanitizableLocation`; bare 401/403 stay Offline. |
 | 156 | Grok (minor) | Hand-rolled `stubRouteManager` duplicates the existing `pkg/netlink/fake.RouteManager` | **Accepted, fake verified in tree.** All fixtures use `fakenetlink.RouteManager{Routes: …}`. |
 | 157 | Grok (minor) | `ValidationError.Error()` precedence was prose-only | **Accepted.** Full method pasted with a verify-against-current-wording caveat. |
+
+### Round 18 (2026-07-18) — Codex: REVISE (4), Grok: REVISE (3) — all second-order consequences of r17's own fixes
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 158 | Codex (major) | Architecture still said "sanitized Location" after #155's presence rule | **Accepted.** Wording: presence → portal; sanitization only picks PortalURL vs ProbeURL. |
+| 159 | Codex (major) | 200 + Location + broken body → offline (interaction of the broken-body rule with #154) | **Accepted.** Location captured pre-read; evidence beats the flaky-link heuristic; `TestCheck_Portal_200LocationWithBrokenBody`. |
+| 160 | Codex (minor) | "403" unsanitizable test actually sent 401 | **Accepted.** Looped over both statuses. |
+| 161 | Codex (major) | Fresh transport clone per Check strands idle connections | **Accepted.** Proxy-free clone built once in `New`; tests overwrite the field. |
+| 162 | Grok (major) | Task 6 commit omitted `cmd/net/status.go` | **Accepted.** Staged. |
+| 163 | Grok (major) | Task 6 item 1 paraphrase re-staled the 401/403 rule; grep-back couldn't catch it | **Accepted.** Item 1 states the presence rule; `Location header` grep token added. |
+| 164 | Grok (major) | `net portal` was the one #128-class surface without route labels | **Accepted.** All RunPortal outcomes carry `(default IPv4 route: eth0)` when known; labeled + pinned-nil tests; `preferredDefaultIface` moves to Task 4 so the commit compiles; Long text de-confused. |
