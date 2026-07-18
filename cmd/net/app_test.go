@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	fakenetlink "github.com/angelfreak/net/pkg/netlink/fake"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -1288,4 +1289,159 @@ func TestApp_RunShow_MasksPSK(t *testing.T) {
 	assert.Contains(t, stdout.String(), "PSK:")
 	assert.NotContains(t, stdout.String(), "supersecretpassword")
 	assert.Contains(t, stdout.String(), "su***************rd") // masked version
+}
+
+// --- Task 4: net portal command tests ---
+
+// testPortalDetector returns results in sequence, repeating the last one.
+// err applies to every call; errs (when set) is a per-call error sequence
+// (indexed like results, repeating the last entry) and overrides err.
+type testPortalDetector struct {
+	results []types.PortalResult
+	err     error
+	errs    []error
+	calls   int
+}
+
+func (d *testPortalDetector) Check() (types.PortalResult, error) {
+	d.calls++
+	i := d.calls - 1
+	if len(d.errs) > 0 {
+		j := i
+		if j >= len(d.errs) {
+			j = len(d.errs) - 1
+		}
+		if d.errs[j] != nil {
+			return types.PortalResult{}, d.errs[j]
+		}
+	} else if d.err != nil {
+		return types.PortalResult{}, d.err
+	}
+	if len(d.results) == 0 {
+		return types.PortalResult{}, nil
+	}
+	if i >= len(d.results) {
+		i = len(d.results) - 1
+	}
+	return d.results[i], nil
+}
+
+// portalTestApp is newTestApp with a LOADED (empty) config: RunPortal treats
+// a nil config as "config failed to load" (exit 3), so RunPortal tests other
+// than NoDetector/ConfigLoadFailure need a non-nil one.
+func portalTestApp() (*App, *bytes.Buffer, *bytes.Buffer) {
+	app, stdout, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
+	return app, stdout, stderr
+}
+
+func TestApp_RunPortal_ConfigLoadFailure(t *testing.T) {
+	// nil config = load failure: error out (exit 3), don't probe defaults —
+	// silently probing the DEFAULT URL would mask the user's broken config.
+	app, _, stderr := newTestApp() // testConfigManager{} → GetConfig() == nil
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.PortalDet = det
+
+	_, err := app.RunPortal()
+	assert.Error(t, err)
+	assert.Equal(t, 0, det.calls, "must not probe with defaults when config failed to load")
+	assert.Contains(t, stderr.String(), "configuration failed to load")
+}
+
+func TestApp_RunPortal_OnlineNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := portalTestApp()
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOnline, status)
+	assert.Contains(t, stdout.String(), "Internet: ok (default IPv4 route: eth0)")
+}
+
+func TestApp_RunPortal_Online(t *testing.T) {
+	app, stdout, _ := portalTestApp()
+	app.RouteMgr = nil // pinned: expected string is the route-unlabeled form
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOnline, status)
+	assert.Contains(t, stdout.String(), "Internet: ok")
+}
+
+func TestApp_RunPortal_PortalWithLoginURL(t *testing.T) {
+	app, stdout, _ := portalTestApp()
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status:    types.PortalStatusPortal,
+		PortalURL: "http://portal.example.com/login",
+		ProbeURL:  "http://probe.example.com/",
+	}}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, status)
+	assert.Contains(t, stdout.String(), "Captive portal detected")
+	assert.Contains(t, stdout.String(), "Log in at: http://portal.example.com/login")
+}
+
+func TestApp_RunPortal_PortalWithoutLoginURL(t *testing.T) {
+	app, stdout, _ := portalTestApp()
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status:   types.PortalStatusPortal,
+		ProbeURL: "http://probe.example.com/",
+	}}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, status)
+	assert.Contains(t, stdout.String(), "Open http://probe.example.com/ in a browser")
+}
+
+func TestApp_RunPortal_Offline(t *testing.T) {
+	app, stdout, _ := portalTestApp()
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOffline, status)
+	assert.Contains(t, stdout.String(), "Internet: unreachable")
+}
+
+func TestApp_RunPortal_IgnoresCheckOff(t *testing.T) {
+	// check: off disables AUTOMATIC probes (connect/status) only — the
+	// explicit `net portal` command must always probe. Locks the contract
+	// against a future "cleanup" that gates all entry points on
+	// portalCheckEnabled.
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{Common: types.CommonConfig{Portal: types.PortalConfig{Check: "off"}}},
+	}
+	det := &testPortalDetector{results: []types.PortalResult{{
+		Status: types.PortalStatusPortal, PortalURL: "http://portal.example.com/login", ProbeURL: "http://p",
+	}}}
+	app.PortalDet = det
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, status)
+	assert.Equal(t, 1, det.calls)
+	assert.Contains(t, stdout.String(), "Captive portal detected")
+}
+
+func TestApp_RunPortal_NoDetector(t *testing.T) {
+	app, _, _ := newTestApp() // PortalDet nil
+	_, err := app.RunPortal()
+	assert.Error(t, err)
+}
+
+func TestApp_RunPortal_DetectorError(t *testing.T) {
+	app, _, stderr := portalTestApp()
+	app.PortalDet = &testPortalDetector{err: errors.New("probe URL must be plain http")}
+
+	_, err := app.RunPortal()
+	assert.Error(t, err)
+	assert.Contains(t, stderr.String(), "probe URL must be plain http")
 }

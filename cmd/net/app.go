@@ -22,6 +22,8 @@ type App struct {
 	NetworkMgr types.NetworkManager // Network configuration (DNS, MAC, routes)
 	HotspotMgr types.HotspotManager // WiFi hotspot management
 	DHCPMgr    types.DHCPManager    // DHCP server management
+	PortalDet  types.PortalDetector // Captive portal / connectivity probing
+	RouteMgr   types.RouteManager   // Route inspection for multi-home signaling (nil-safe)
 
 	// Runtime configuration
 	Interface string // Primary network interface to use
@@ -595,6 +597,85 @@ func (a *App) RunShow(networkName string) error {
 		}
 	}
 	return nil
+}
+
+// RunPortal probes for internet connectivity and captive portals, printing
+// the portal login URL when one is detected. Returns the detected status so
+// the CLI can map it to scripting-friendly exit codes; the status is only
+// meaningful when err is nil.
+func (a *App) RunPortal() (types.PortalStatus, error) {
+	if a.PortalDet == nil {
+		return types.PortalStatusOffline, fmt.Errorf("portal detection not available")
+	}
+	// GetConfig() is nil only when the config file failed to load/validate
+	// (matches RunConnect's convention). Probing silently with the DEFAULT
+	// URL would mask the user's broken portal config — surface it (exit 3).
+	if a.ConfigMgr != nil && a.ConfigMgr.GetConfig() == nil {
+		err := fmt.Errorf("configuration failed to load — fix the config file and retry")
+		a.errorf("Error: %v\n", err)
+		return types.PortalStatusOffline, err
+	}
+	result, err := a.PortalDet.Check()
+	if err != nil {
+		a.errorf("Error: %v\n", err)
+		return types.PortalStatusOffline, err
+	}
+	// Like status (#128), every outcome names the probed route when known —
+	// this command has no connect-time multi-home note either.
+	routeSuffix := ""
+	if iface := a.preferredDefaultIface(); iface != "" {
+		routeSuffix = fmt.Sprintf(" (default IPv4 route: %s)", iface)
+	}
+	switch result.Status {
+	case types.PortalStatusPortal:
+		a.printf("Captive portal detected!%s\n", routeSuffix)
+		if result.PortalURL != "" {
+			a.printf("  Log in at: %s\n", result.PortalURL)
+		} else {
+			a.printf("  Open %s in a browser to trigger the portal login page\n", result.ProbeURL)
+		}
+	case types.PortalStatusOnline:
+		a.printf("Internet: ok%s\n", routeSuffix)
+	default:
+		// Offline, Unknown, and any future status: never fail open into
+		// "ok". Neutral copy — Offline covers both no-response and HTTP
+		// error statuses from the probe endpoint.
+		a.printf("Internet: unreachable%s\n", routeSuffix)
+	}
+	return result.Status, nil
+}
+
+// preferredDefaultIface returns the outgoing interface of the LOWEST-metric
+// IPv4 default route — the kernel's preferred IPv4 path. Heuristic for the
+// route labels and the connect-time honesty note only: the probe may resolve
+// AAAA and egress IPv6 on a dual-stack host, which this cannot see
+// (ListRoutes is IPv4 main table). Returns "" when unknown (nil RouteMgr,
+// netlink error, or no default route). GetDefaultRoute is NOT used: it
+// returns the first default in the netlink dump, which on a dual-homed
+// machine may be the higher-metric one.
+func (a *App) preferredDefaultIface() string {
+	if a.RouteMgr == nil {
+		return ""
+	}
+	routes, err := a.RouteMgr.ListRoutes()
+	if err != nil {
+		return ""
+	}
+	// ListRoutes is already scoped to the IPv4 main table; types.Route
+	// carries no family/table/scope fields, so metric is the only selector
+	// available. Ties keep the first seen (kernel dump order) — deterministic
+	// per dump, and good enough for an advisory label.
+	best := ""
+	bestMetric := -1
+	for _, r := range routes {
+		if !r.IsDefault() || r.Iface == "" {
+			continue
+		}
+		if bestMetric == -1 || r.Metric < bestMetric {
+			best, bestMetric = r.Iface, r.Metric
+		}
+	}
+	return best
 }
 
 // RunStatus displays comprehensive network status including:
