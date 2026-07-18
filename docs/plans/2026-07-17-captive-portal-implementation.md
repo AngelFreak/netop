@@ -6,7 +6,7 @@
 
 **Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; redirect statuses **301/302/303/307/308** or 511 → portal (login URL from `Location`); 401/403 **with a sanitized `Location`** → portal (enterprise/hotel interception); 200 with unexpected body → portal (DNS-hijack style); transport errors **and every other status — including 304 and other non-redirect 3xx** → offline, so a probe-endpoint outage or caching intermediary is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
-**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". Binding the probe to the connected interface needs `SO_BINDTODEVICE` (CAP_NET_RAW — would break the root-exempt `net portal`) or fragile source-IP games; out of scope. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its online line host-wide, naming the route interface when known — `Internet:  ok (default route: eth0)`, plain `(default route)` otherwise; README, design doc, and `net portal --help` document the semantics.
+**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". A connect-time bound probe IS technically feasible — `net connect` runs as root (sudo re-exec), which has the caps for `SO_BINDTODEVICE` — but correct binding also requires binding DNS resolution (custom `net.Resolver` with a `Dialer.Control` hook; Go's default resolver ignores the transport dialer), and it would make `net connect` classify differently from the root-exempt `net portal`/`net status` on the same network. That complexity/consistency trade-off is REJECTED as a product decision for this feature, not an impossibility; a follow-up issue for an opt-in bound connect-time probe is reasonable future work. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its online line host-wide, naming the route interface when known — `Internet:  ok (default route: eth0)`, plain `(default route)` otherwise; README, design doc, and `net portal --help` document the semantics.
 
 **Tech Stack:** Go stdlib `net/http` + `httptest` (no new dependencies), cobra, testify.
 
@@ -523,6 +523,21 @@ func TestCheck_Online_204(t *testing.T) {
 	assert.Empty(t, result.PortalURL)
 }
 
+func TestCheck_SendsCacheBypassHeaders(t *testing.T) {
+	var gotCacheControl, gotPragma string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCacheControl = r.Header.Get("Cache-Control")
+		gotPragma = r.Header.Get("Pragma")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	_, err := newTestDetector(srv.URL).Check()
+	assert.NoError(t, err)
+	assert.Contains(t, gotCacheControl, "no-cache")
+	assert.Equal(t, "no-cache", gotPragma)
+}
+
 func TestCheck_Online_SuccessBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("success\n"))
@@ -754,13 +769,6 @@ func TestCheck_ProbeURLWithoutHostRejected(t *testing.T) {
 	}
 }
 
-(The validator's own table test `TestValidatePortalProbeURL` lives in
-`pkg/types/validation_test.go` — created in Task 2: accepts
-`http://x.example.com/p`; rejects https, `http:foo` (no host),
-`http://u:p@x.example.com/` (userinfo), `http://evil‮.com/x` and
-`http://exämple.com/` (non-ASCII — printable-ASCII-only rule), and
-`"http://x.example.com/\x1b"` (raw control).)
-
 func TestNew_DefaultURL(t *testing.T) {
 	d := New("", time.Second, &testLogger{})
 	assert.Equal(t, DefaultProbeURL, d.probeURL)
@@ -811,6 +819,7 @@ func TestLoginURL(t *testing.T) {
 		{"bidi in host is percent-encoded", "http://evil‮.com/x", "http://evil%E2%80%AE.com/x"},
 		{"percent-encoded controls stay encoded", "http://x.example.com/%1b%0d%0a", "http://x.example.com/%1b%0d%0a"},
 		{"raw space in query rejected", "http://x.example.com/login?next=a b", ""},
+		{"oversized URL rejected", "http://x.example.com/" + strings.Repeat("a", 3000), ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -823,6 +832,13 @@ func TestLoginURL(t *testing.T) {
 	}
 }
 ```
+
+(The validator's own table test `TestValidatePortalProbeURL` lives in
+`pkg/types/validation_test.go` — created in Task 2: accepts
+`http://x.example.com/p`; rejects https, `http:foo` (no host),
+`http://u:p@x.example.com/` (userinfo), `http://evil‮.com/x` and
+`http://exämple.com/` (non-ASCII — printable-ASCII-only rule), and
+`"http://x.example.com/\x1b"` (raw control).)
 
 **Step 2: Run to verify failure**
 
@@ -864,6 +880,10 @@ const DefaultProbeURL = "http://detectportal.firefox.com/success.txt"
 // maxBodyBytes caps how much of the probe response we read; the expected
 // bodies are tiny ("success" or empty).
 const maxBodyBytes = 4096
+
+// maxLoginURLBytes caps the sanitized login URL we will print — a hostile
+// portal must not be able to flood the terminal/logs via Location.
+const maxLoginURLBytes = 2048
 
 // Detector probes for captive portals. Implements types.PortalDetector.
 type Detector struct {
@@ -932,7 +952,16 @@ func (d *Detector) Check() (types.PortalResult, error) {
 		},
 	}
 
-	resp, err := client.Get(d.probeURL)
+	req, err := http.NewRequest(http.MethodGet, d.probeURL, nil)
+	if err != nil {
+		return types.PortalResult{}, fmt.Errorf("building probe request: %w", err)
+	}
+	// A stale cached "success" from an intermediary would fake Online —
+	// insist on a fresh answer (same headers Firefox/NetworkManager send).
+	req.Header.Set("Cache-Control", "no-cache, no-store")
+	req.Header.Set("Pragma", "no-cache")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		d.logger.Debug("Portal probe got no response", "url", d.probeURL, "error", err)
 		return types.PortalResult{Status: types.PortalStatusOffline, ProbeURL: d.probeURL}, nil
@@ -1036,6 +1065,10 @@ func loginURL(base *url.URL, location string, logger types.Logger) string {
 		return ""
 	}
 	s := resolved.String()
+	if len(s) > maxLoginURLBytes {
+		logger.Debug("Portal Location exceeds length cap, ignoring", "len", len(s))
+		return ""
+	}
 	for _, r := range s {
 		// Controls, format runes, and raw spaces (String() can preserve
 		// spaces in the query component) — none belong in a printed URL.
@@ -1766,6 +1799,24 @@ func TestApp_RunConnect_VPNConfiguredSuppressesOfflineWarning(t *testing.T) {
 	assert.True(t, tracker.connectCalled)
 }
 
+func TestApp_RunStatus_InternetLineWhenDisconnected(t *testing.T) {
+	// The Internet line is host-wide (#42): it must print even when the
+	// selected interface has no connection info (another link may carry
+	// the internet). Guards the insertion point staying OUTSIDE the
+	// connected-branch if/else.
+	// Requires extending testNetworkManager with a `connectionErr error`
+	// field returned first by GetConnectionInfo (behavior-preserving for
+	// all existing tests, which leave it nil).
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.NetworkMgr = &testNetworkManager{connectionErr: errors.New("no connection on iface")}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  ok (default route")
+}
+
 func TestApp_RunStatus_ConfigLoadFailureSkipsProbe(t *testing.T) {
 	// Load failure means the user's portal policy (check: off, custom URL)
 	// is unknown — auto-probing substituted defaults could report "ok"
@@ -1824,7 +1875,7 @@ func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
 
 **Step 2: Run to verify failure**
 
-Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunConnect_NilDetector|TestApp_RunConnect_Offline|TestApp_RunConnect_Online|TestApp_RunConnect_MultiHomed|TestApp_RunConnect_NoMultiHomed|TestApp_RunConnect_Misconfigured|TestApp_RunConnect_RetryError|TestApp_RunConnect_VPN|TestApp_RunConnect_NetworkVPN|TestApp_RunStatus_|TestApp_resolveVPNName|TestApp_attemptVPNConnect' -v`
+Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_(Portal|Nil|Offline|Online|Multi|NoMulti|Misconfigured|Retry|VPN|NetworkVPN|Unknown)|TestApp_RunStatus_|TestApp_resolveVPNName|TestApp_attemptVPNConnect' -v`
 Expected: FAIL (no warning printed / no Internet line); the NilDetector test may already pass — keep it as a regression guard
 
 **Step 3: Implement**
@@ -2186,7 +2237,7 @@ In `RunConnect`, replace the tail (after `a.printConnectionInfo(connectedIface)`
 	return nil
 ```
 
-In `RunStatus`, after the connection-info block (the `if connErr == nil && conn != nil { ... }` block), add (single-shot, no retry — status should stay snappy):
+In `RunStatus`, insert AFTER the ENTIRE connection-info if/else (i.e. outside both the connected and disconnected branches, before the VPN section) — the line is host-wide and MUST print even when the selected interface is disconnected (#42). Single-shot, no retry — status should stay snappy:
 
 ```go
 	// Internet reachability / captive portal (skipped when portal.check: off)
@@ -2202,12 +2253,18 @@ In `RunStatus`, after the connection-info block (the `if connErr == nil && conn 
 			if url == "" {
 				url = result.ProbeURL
 			}
-			a.printf("Internet:  captive portal (%s)\n", url)
+			// Status has no connect-time route note, so every line names
+			// the probed route when known — a portal/unreachable verdict
+			// via the wrong link misleads just like a false ok.
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  captive portal via %s (%s)\n", iface, url)
+			} else {
+				a.printf("Internet:  captive portal (%s)\n", url)
+			}
 		case result.Status == types.PortalStatusOnline:
 			// Labeled host-wide: the probe follows the default route and is
 			// not scoped to the Interface: shown above (which may even be
-			// disconnected while another link provides internet). Name the
-			// route's interface when it is known.
+			// disconnected while another link provides internet).
 			if iface := a.preferredDefaultIface(); iface != "" {
 				a.printf("Internet:  ok (default route: %s)\n", iface)
 			} else {
@@ -2215,7 +2272,11 @@ In `RunStatus`, after the connection-info block (the `if connErr == nil && conn 
 			}
 		default:
 			// Offline, Unknown, and any future status — never fail open.
-			a.printf("Internet:  unreachable\n")
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  unreachable (default route: %s)\n", iface)
+			} else {
+				a.printf("Internet:  unreachable\n")
+			}
 		}
 	}
 ```
@@ -2476,3 +2537,15 @@ git commit -m "docs: document net portal command and portal config"
 | 123 | Codex (major) | Raw-map shape (`map[string]interface{}`) unverified for nested maps | **Accepted (verification note).** Fragment intro instructs verifying the existing raw path's shape and adding an `asStringMap` normalizer if needed; null-section + parsing tests catch a mismatch. |
 | 124 | Codex (major) | Multi-home note silently suppressed by `check: off` while header claims it is "signaled" | **Accepted (documented).** The note is part of the automatic check it annotates; comment states this; `check: off` disables both. |
 | 125 | Codex (minor) | Bare `xargs` may run gofmt with no args | **Accepted.** `xargs -r`. |
+
+### Round 13 (2026-07-18) — Codex: REVISE, Grok: REVISE (both disputing one prior rejection each, with new arguments), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 126 | Codex (blocker) | Prose paragraph inside the Task 3 Go test fence — package would not compile if pasted | **Accepted.** Paragraph moved outside the fence. |
+| 127 | Codex (major) | No cache-bypass headers — a stale cached `200 success` fakes Online | **Accepted.** `Cache-Control: no-cache, no-store` + `Pragma: no-cache` via http.NewRequest; `TestCheck_SendsCacheBypassHeaders`. |
+| 128 | Codex (major, disputing #115 with new argument) | Status has no connect-time note, so wrong-route portal/unreachable lines mislead there specifically | **Accepted, #115 revised for status.** All status lines name the probed route when known: `captive portal via eth0 (…)`, `unreachable (default route: eth0)`. |
+| 129 | Codex (minor) | No length cap on printed login URLs | **Accepted.** 2048-byte cap in `loginURL`; oversized vector in `TestLoginURL`. |
+| 130 | Grok (major) | Host-wide Internet line untested when the selected iface is disconnected; insertion prose ambiguous | **Accepted.** Placement wording now says OUTSIDE the entire if/else; `TestApp_RunStatus_InternetLineWhenDisconnected` + `testNetworkManager.connectionErr` extension. |
+| 131 | Grok (major, disputing #21 with new evidence) | `net connect` runs as root — `SO_BINDTODEVICE` is available on the motivating path; rejection rationale overclaimed | **Accepted (rationale rewritten, signaling kept).** Bind is feasible but requires bound DNS (custom Resolver) and would make root and root-exempt commands classify differently; rejected as an explicit product decision with follow-up-issue note — Grok's fix option 2. |
+| 132 | Grok (minor) | Red-phase filter missed `UnknownStatusWarns` (filter drift, same class as #108/#121) | **Accepted.** Filter rewritten as a grouped pattern including `Unknown`. |
