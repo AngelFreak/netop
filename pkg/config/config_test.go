@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
@@ -993,4 +994,109 @@ home:
 	resolved, ok := cfg.Networks["work"]
 	assert.True(t, ok, "alias must be cached under its own name for connectVPN")
 	assert.Equal(t, "office-vpn", resolved.VPN)
+}
+
+// loadPortalConfig writes content to a temp config file and loads it through
+// the real Manager, so every portal test exercises actual load+validation.
+func loadPortalConfig(t *testing.T, content string) (*types.Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("writing temp config: %v", err)
+	}
+	return NewManager(&mockLogger{}).LoadConfig(path)
+}
+
+func TestPortalConfigParsing(t *testing.T) {
+	// NB: `check: off` is deliberately unquoted — yaml.v3 must keep it a string.
+	cfg, err := loadPortalConfig(t, `
+common:
+  portal:
+    check: off
+    url: http://example.com/probe
+  timeouts:
+    portal: 7
+`)
+	assert.NoError(t, err)
+	assert.Equal(t, "off", cfg.Common.Portal.Check)
+	assert.True(t, cfg.Common.Portal.CheckDisabled())
+	assert.Equal(t, "http://example.com/probe", cfg.Common.Portal.URL)
+	assert.Equal(t, 7*time.Second, cfg.Common.Timeouts.GetPortalTimeout())
+}
+
+func TestPortalConfigUnknownFieldRejected(t *testing.T) {
+	_, err := loadPortalConfig(t, "\ncommon:\n  portal:\n    chek: off\n")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "chek")
+}
+
+func TestPortalConfigBadCheckValueRejected(t *testing.T) {
+	_, err := loadPortalConfig(t, "\ncommon:\n  portal:\n    check: sometimes\n")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), `must be "auto" or "off"`)
+}
+
+func TestPortalConfigNonStringCheckRejected(t *testing.T) {
+	// Viper weak-typing coerces YAML bools/ints to "0"/"1" with NO decode
+	// error (verified empirically), which would silently invert the user's
+	// intent. Raw-map validation must reject non-strings before unmarshal.
+	for _, val := range []string{"false", "true", "1"} {
+		_, err := loadPortalConfig(t, "\ncommon:\n  portal:\n    check: "+val+"\n")
+		assert.Error(t, err, "check: %s must be rejected", val)
+		assert.Contains(t, err.Error(), `must be "auto" or "off"`)
+	}
+}
+
+func TestPortalConfigBadURLRejected(t *testing.T) {
+	// ProbeURL is printed verbatim by the CLI (display-safety contract), so
+	// the configured URL is validated at load.
+	for _, u := range []string{"https://example.com/p", "http:foo", "ftp://x/", "not a url"} {
+		_, err := loadPortalConfig(t, "\ncommon:\n  portal:\n    url: \""+u+"\"\n")
+		assert.Error(t, err, "url %q must be rejected", u)
+	}
+}
+
+func TestPortalConfigNonStringURLRejected(t *testing.T) {
+	// Same weak-typing trap as check: a YAML bool/int/list url must fail
+	// with the explicit message, not coerce or produce a mapstructure mess.
+	for _, line := range []string{"url: true", "url: 1", "url: [http://x]"} {
+		_, err := loadPortalConfig(t, "\ncommon:\n  portal:\n    "+line+"\n")
+		assert.Error(t, err, "%q must be rejected", line)
+		assert.Contains(t, err.Error(), "common.portal.url must be a string")
+	}
+}
+
+func TestPortalConfigScalarPortalRejected(t *testing.T) {
+	// A scalar or list portal: value must fail with the explicit mapping
+	// message, not a cryptic mapstructure decode error or a silent zero.
+	for _, portalLine := range []string{"portal: off", "portal: true", "portal: [auto]"} {
+		_, err := loadPortalConfig(t, "\ncommon:\n  "+portalLine+"\n")
+		assert.Error(t, err, "%q must be rejected", portalLine)
+		assert.Contains(t, err.Error(), "must be a mapping")
+	}
+}
+
+func TestPortalConfigNullPortalSectionAllowed(t *testing.T) {
+	// yaml.v3 yields exists=true, value=nil for both forms — that is a valid
+	// "stub" (defaults apply), NOT a mapping violation. Guards against a
+	// naive type-switch that rejects nil alongside scalars.
+	for name, y := range map[string]string{
+		"bare key":      "\ncommon:\n  portal:\n",
+		"explicit null": "\ncommon:\n  portal: null\n",
+	} {
+		_, err := loadPortalConfig(t, y)
+		assert.NoError(t, err, name)
+	}
+}
+
+func TestPortalConfigEmptyURLAllowed(t *testing.T) {
+	// Three explicit, complete YAML shapes: empty string, null, absent key.
+	for name, configContent := range map[string]string{
+		"empty string": "\ncommon:\n  portal:\n    url: \"\"\n",
+		"null":         "\ncommon:\n  portal:\n    url:\n",
+		"absent":       "\ncommon:\n  portal: {}\n",
+	} {
+		_, err := loadPortalConfig(t, configContent)
+		assert.NoError(t, err, "portal url form %s must be accepted", name)
+	}
 }

@@ -365,3 +365,30 @@ func TestTimeoutConfigAllCustom(t *testing.T) {
 	assert.Equal(t, 15*time.Second, config.GetCarrierTimeout())
 	assert.Equal(t, 7*time.Second, config.GetPortalTimeout())
 }
+
+func TestValidatePortalProbeURL(t *testing.T) {
+	assert.NoError(t, ValidatePortalProbeURL("http://x.example.com/p"))
+	for name, bad := range map[string]string{
+		"https undetectable": "https://x.example.com/",
+		"no host":            "http:foo",
+		"userinfo":           "http://u:p@x.example.com/",
+		"non-ascii host":     "http://exämple.com/",
+		"format rune":        "http://evil‮.com/x",
+		"raw control byte":   "http://x.example.com/\x1b",
+		"raw space":          "http://x.example.com/a b",
+		"fragment":           "http://x.example.com/p#frag",
+		"encoded CRLF":       "http://x.example.com/%0d%0a",
+		"encoded ESC":        "http://x.example.com/%1B",
+		"encoded DEL":        "http://x.example.com/%7F",
+		"unparseable":        "not a url",
+	} {
+		assert.Error(t, ValidatePortalProbeURL(bad), "%s: %q must be rejected", name, bad)
+	}
+}
+
+func TestPortalConfigCheckDisabled(t *testing.T) {
+	assert.False(t, (&PortalConfig{}).CheckDisabled())
+	assert.False(t, (&PortalConfig{Check: "auto"}).CheckDisabled())
+	assert.True(t, (&PortalConfig{Check: "off"}).CheckDisabled())
+	assert.True(t, (&PortalConfig{Check: " OFF "}).CheckDisabled()) // normalized
+}

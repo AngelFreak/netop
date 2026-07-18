@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type CommonConfig struct {
 	Hostname string        `yaml:"hostname" mapstructure:"hostname"`
 	VPN      string        `yaml:"vpn" mapstructure:"vpn"`
 	Timeouts TimeoutConfig `yaml:"timeouts" mapstructure:"timeouts"`
+	Portal   PortalConfig  `yaml:"portal" mapstructure:"portal"`
 }
 
 // TimeoutConfig holds configurable timeout values (in seconds)
@@ -75,6 +77,24 @@ func (t *TimeoutConfig) GetPortalTimeout() time.Duration {
 		return time.Duration(t.Portal) * time.Second
 	}
 	return 3 * time.Second
+}
+
+// PortalConfig controls captive-portal detection.
+type PortalConfig struct {
+	// Check is "auto" (default: probe after connect and in status) or "off"
+	// (skip those automatic checks; `net portal` always probes on demand).
+	Check string `yaml:"check" mapstructure:"check"`
+	// URL is the plain-http probe endpoint. Empty means the built-in default.
+	// A custom endpoint must respond with HTTP 204 or a 200 whose body is
+	// exactly "success" (surrounding whitespace ignored) when internet works —
+	// anything else is classified as portal/offline.
+	URL string `yaml:"url" mapstructure:"url"`
+}
+
+// CheckDisabled reports whether automatic portal checks are turned off.
+// Case- and whitespace-insensitive so "Off"/" OFF " behave as expected.
+func (p *PortalConfig) CheckDisabled() bool {
+	return strings.EqualFold(strings.TrimSpace(p.Check), "off")
 }
 
 // IgnoredConfig contains interfaces to ignore

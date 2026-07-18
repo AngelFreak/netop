@@ -29,6 +29,13 @@ var (
 		"hostname": true,
 		"vpn":      true,
 		"timeouts": true,
+		"portal":   true,
+	}
+
+	// Valid fields for PortalConfig
+	validPortalFields = map[string]bool{
+		"check": true,
+		"url":   true,
 	}
 
 	// Valid fields for IgnoredConfig
@@ -74,9 +81,15 @@ type ValidationError struct {
 	Section    string
 	Field      string
 	Suggestion string
+	// Message, when set, is used verbatim by Error() — for value-level errors
+	// (e.g. a bad common.portal.check) that are not "unknown field" reports.
+	Message string
 }
 
 func (e ValidationError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
 	if e.Suggestion != "" {
 		return fmt.Sprintf("unknown field '%s' in %s (did you mean '%s'?)", e.Field, e.Section, e.Suggestion)
 	}
@@ -193,6 +206,44 @@ func validateRawConfig(raw map[string]interface{}) ValidationErrors {
 		case "common":
 			if commonMap, ok := value.(map[string]interface{}); ok {
 				errors = append(errors, validateFields("common", commonMap, validCommonFields)...)
+				// common.portal: absent or null → defaults; map → validate; else reject.
+				if portalVal, exists := commonMap["portal"]; exists && portalVal != nil {
+					portalMap, ok := portalVal.(map[string]interface{})
+					if !ok {
+						errors = append(errors, ValidationError{
+							Section: "common.portal", Field: "portal",
+							Message: `common.portal must be a mapping with optional "check" and "url" fields`,
+						})
+					} else {
+						errors = append(errors, validateFields("common.portal", portalMap, validPortalFields)...)
+						if checkVal, ok := portalMap["check"]; ok && checkVal != nil {
+							s, isStr := checkVal.(string)
+							norm := strings.ToLower(strings.TrimSpace(s))
+							if !isStr || (norm != "" && norm != "auto" && norm != "off") {
+								errors = append(errors, ValidationError{
+									Section: "common.portal", Field: "check",
+									Message: `common.portal.check must be "auto" or "off"`,
+								})
+							}
+						}
+						if urlVal, ok := portalMap["url"]; ok && urlVal != nil {
+							s, isStr := urlVal.(string)
+							if !isStr {
+								errors = append(errors, ValidationError{
+									Section: "common.portal", Field: "url",
+									Message: "common.portal.url must be a string",
+								})
+							} else if s != "" {
+								if verr := types.ValidatePortalProbeURL(s); verr != nil {
+									errors = append(errors, ValidationError{
+										Section: "common.portal", Field: "url",
+										Message: "common.portal.url: " + verr.Error(),
+									})
+								}
+							}
+						}
+					}
+				}
 			}
 		case "ignored":
 			if ignoredMap, ok := value.(map[string]interface{}); ok {
