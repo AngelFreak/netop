@@ -2438,7 +2438,9 @@ func (a *App) checkPortalAfterConnect(connectedIface string, vpnConfigured bool)
 	return false
 }
 
-// preferredDefaultIface returns the outgoing interface of the LOWEST-metric
+// preferredDefaultIface — CREATED IN TASK 4 (RunPortal needs it); shown here
+// because the connect/status paths below use it. Do not define twice.
+// It returns the outgoing interface of the LOWEST-metric
 // IPv4 default route — the kernel's preferred IPv4 path. Heuristic for the
 // honesty note only: the probe may resolve AAAA and egress IPv6 on a
 // dual-stack host, which this cannot see (ListRoutes is IPv4 main table). Returns "" when unknown (nil RouteMgr, netlink error, or
