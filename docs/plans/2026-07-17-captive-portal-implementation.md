@@ -257,7 +257,7 @@ func TestPortalConfigNullPortalSectionAllowed(t *testing.T) {
 }
 ```
 
-(Add `"path/filepath"` to the test file's imports if absent.)
+(Add `"time"` to `pkg/config/config_test.go`'s imports — verified absent today; `path/filepath`, `os`, testify are already imported.)
 
 The shared validator's table test, in `pkg/types/validation_test.go`:
 
@@ -273,6 +273,9 @@ func TestValidatePortalProbeURL(t *testing.T) {
 		"raw control byte":    "http://x.example.com/\x1b",
 		"raw space":           "http://x.example.com/a b",
 		"fragment":            "http://x.example.com/p#frag",
+		"encoded CRLF":         "http://x.example.com/%0d%0a",
+		"encoded ESC":          "http://x.example.com/%1B",
+		"encoded DEL":          "http://x.example.com/%7F",
 		"unparseable":         "not a url",
 	} {
 		assert.Error(t, ValidatePortalProbeURL(bad), "%s: %q must be rejected", name, bad)
@@ -456,7 +459,35 @@ func ValidatePortalProbeURL(raw string) error {
 	if u.Fragment != "" {
 		return fmt.Errorf("portal probe URL %q must not contain a fragment — fragments are never sent over HTTP", raw)
 	}
+	if HasPercentEncodedControl(raw) {
+		return fmt.Errorf("portal probe URL must not contain percent-encoded control bytes")
+	}
 	return nil
+}
+
+// HasPercentEncodedControl reports whether s contains a percent-encoded C0
+// control or DEL (%00-%1F, %7F), case-insensitively. Shared by the probe-URL
+// validator and pkg/portal's loginURL — downstream tooling may decode these
+// even though they are inert on the terminal as-is.
+func HasPercentEncodedControl(s string) bool {
+	ls := strings.ToLower(s)
+	for i := 0; i+2 < len(ls); i++ {
+		if ls[i] != '%' {
+			continue
+		}
+		h := ls[i+1 : i+3]
+		if !isHexDigit(h[0]) || !isHexDigit(h[1]) {
+			continue
+		}
+		if h == "7f" || h[0] == '0' || h[0] == '1' {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 }
 ```
 
@@ -928,11 +959,12 @@ func New(probeURL string, timeout time.Duration, logger types.Logger) *Detector 
 	}
 	return &Detector{probeURL: probeURL, timeout: timeout, logger: logger}
 }
+```
 
 (`types.ValidatePortalProbeURL` was implemented and tested in Task 2 — the
 Detector simply calls it. Definition lives in `pkg/types/validation.go`.)
 
-Back in `pkg/portal/portal.go`:
+Continuing `pkg/portal/portal.go` (same file, second fence):
 
 ```go
 // Check probes the endpoint and classifies the response. Transport failures
@@ -969,6 +1001,9 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	// insist on a fresh answer (same headers Firefox/NetworkManager send).
 	req.Header.Set("Cache-Control", "no-cache, no-store")
 	req.Header.Set("Pragma", "no-cache")
+	// User-Agent stays Go's default: dedicated probe hosts don't filter by
+	// UA. Revisit (Firefox-like UA) only on field evidence of a portal that
+	// ignores non-browser agents.
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1029,20 +1064,31 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	return types.PortalResult{Status: types.PortalStatusPortal, ProbeURL: d.probeURL}, nil
 }
 
-// hasEncodedControl reports whether the URL string contains a
-// percent-encoded C0 control or DEL (%00-%1F, %7F), case-insensitively.
-func hasEncodedControl(s string) bool {
+	if u.Fragment != "" {
+		return fmt.Errorf("portal probe URL %q must not contain a fragment — fragments are never sent over HTTP", raw)
+	}
+	if HasPercentEncodedControl(raw) {
+		return fmt.Errorf("portal probe URL must not contain percent-encoded control bytes")
+	}
+	return nil
+}
+
+// HasPercentEncodedControl reports whether s contains a percent-encoded C0
+// control or DEL (%00-%1F, %7F), case-insensitively. Shared by the probe-URL
+// validator and pkg/portal's loginURL — downstream tooling may decode these
+// even though they are inert on the terminal as-is.
+func HasPercentEncodedControl(s string) bool {
 	ls := strings.ToLower(s)
 	for i := 0; i+2 < len(ls); i++ {
 		if ls[i] != '%' {
 			continue
 		}
 		h := ls[i+1 : i+3]
-		if h == "7f" || (h[0] == '0') || (h[0] == '1') {
-			// %0x / %1x / %7f — verify both are hex digits first
-			if isHexDigit(h[0]) && isHexDigit(h[1]) {
-				return true
-			}
+		if !isHexDigit(h[0]) || !isHexDigit(h[1]) {
+			continue
+		}
+		if h == "7f" || h[0] == '0' || h[0] == '1' {
+			return true
 		}
 	}
 	return false
@@ -1051,8 +1097,7 @@ func hasEncodedControl(s string) bool {
 func isHexDigit(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 }
-
-// isRedirectStatus reports whether status is a redirect that carries
+```// isRedirectStatus reports whether status is a redirect that carries
 // interception semantics. Deliberately NOT all of 3xx: 304 Not Modified is a
 // caching intermediary, and 300/305/306 carry no portal meaning — treating
 // them as portals would violate the positive-evidence rule.
@@ -1097,7 +1142,7 @@ func loginURL(base *url.URL, location string, logger types.Logger) string {
 		return ""
 	}
 	s := resolved.String()
-	if hasEncodedControl(s) {
+	if types.HasPercentEncodedControl(s) {
 		// Downstream tooling (browsers, log processors) may decode %00-%1f/
 		// %7f later — encoded controls have no place in a login URL.
 		logger.Debug("Portal Location contains percent-encoded control bytes, ignoring")
@@ -1784,11 +1829,40 @@ func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
 func TestApp_RunStatus_OnlineLabeledHostWide(t *testing.T) {
 	app, stdout, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.RouteMgr = nil // pinned: expected string is the route-unlabeled form
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
 
 	err := app.RunStatus()
 	assert.NoError(t, err)
 	assert.Contains(t, stdout.String(), "Internet:  ok (default route)")
+}
+
+func TestApp_RunStatus_PortalNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
+		Status: types.PortalStatusPortal, PortalURL: "http://portal.example.com/login", ProbeURL: "http://p",
+	}}}
+	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  captive portal (http://portal.example.com/login) (default IPv4 route: eth0)")
+}
+
+func TestApp_RunStatus_UnreachableNamesDefaultRouteIface(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
+	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
+	app.RouteMgr = &stubRouteManager{routes: []types.Route{
+		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
+	}}
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Internet:  unreachable (default IPv4 route: eth0)")
 }
 
 func TestApp_RunStatus_OnlineNamesDefaultRouteIface(t *testing.T) {
@@ -1853,6 +1927,9 @@ func TestApp_RunStatus_InternetLineWhenDisconnected(t *testing.T) {
 
 	err := app.RunStatus()
 	assert.NoError(t, err)
+	// Prove the disconnected branch actually ran (guards a no-op
+	// connectionErr harness) AND the host-wide line still printed.
+	assert.NotContains(t, stdout.String(), "State:     connected")
 	assert.Contains(t, stdout.String(), "Internet:  ok (default route")
 }
 
@@ -1918,6 +1995,24 @@ Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_(Portal|Nil|Offline|Online|Mul
 Expected: FAIL (no warning printed / no Internet line); the NilDetector test may already pass — keep it as a regression guard
 
 **Step 3: Implement**
+
+Test-harness change first (`cmd/net/app_test.go`): add `connectionErr error`
+to `testNetworkManager` and honor it FIRST in the existing mock method —
+behavior-preserving for every existing test (all leave it nil), and without
+this branch `TestApp_RunStatus_InternetLineWhenDisconnected` would silently
+run the connected path and false-green:
+
+```go
+func (n *testNetworkManager) GetConnectionInfo(iface string) (*types.Connection, error) {
+	if n.connectionErr != nil {
+		return nil, n.connectionErr
+	}
+	if n.connectionInfo != nil {
+		return n.connectionInfo, nil
+	}
+	return &types.Connection{Interface: iface, State: "connected"}, nil
+}
+```
 
 `cmd/net/app.go` — App struct gains:
 
@@ -2602,3 +2697,16 @@ git commit -m "docs: document net portal command and portal config"
 | 138 | Grok (major) | Architecture/Task 6 froze pre-#128 status labeling (same class as #84/#105) | **Accepted.** Header, Task 6 item 4, and grep-back strings now carry all three labeled forms (in the new #134 wording). |
 | 139 | Grok (minor) | Package godoc still stated the pre-#131 "would break root-exempt portal" rationale | **Accepted.** Godoc rewritten to the honest rationale (feasible-but-rejected, bound-DNS + consistency). |
 | 140 | Grok (minor) | Task 2 red phase never runs `TestValidatePortalProbeURL`; `net/url` import unstated | **Accepted.** Red filter extended; import note added (no `unicode` needed — byte-range scan). |
+
+### Round 15 (2026-07-18) — Codex: REVISE, Grok: REVISE (both now reading the live tree; prompt switched to file-reference after hitting the 128KB argv limit)
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 141 | Codex (blocker) | `pkg/config/config_test.go` lacks a `time` import — Task 2 tests won't compile | **Accepted, verified against the tree.** Import note corrected (`time` needed; `path/filepath` already present — earlier note was wrong). |
+| 142 | Codex (major) | Percent-encoded C0/DEL allowed in configured probe URLs while rejected in login URLs (#135 rationale applies to both) | **Accepted.** `types.HasPercentEncodedControl` shared helper; probe validator rejects; `loginURL` calls the same helper; three probe vectors added. |
+| 143 | Codex (major, disputing r1 #7) | Don't attempt VPN behind a detected portal; defer with a hint | **Rejected — user's explicit product decision** (brainstorming answer: "Warn, still start VPN"). WireGuard (the primary type here) succeeds locally and completes its handshake after portal login; OpenVPN failures surface their own warning. A reviewer preference does not override the recorded user choice. |
+| 144 | Codex (minor) + Grok (major) | `connectionErr` harness change existed only as a test comment; a no-op field would false-green #42 | **Accepted.** Full mock method pasted in Step 3; disconnected test also asserts `State: connected` is absent. |
+| 145 | Grok (major) | Task 3 implementation fence unbalanced after the validator relocation (same class as #126) | **Accepted.** Fence closed after `New()`, second fence opened; whole-plan fence walker now passes. |
+| 146 | Grok (major) | All-outcome status labels (#128/#134) locked only for Online | **Accepted.** `TestApp_RunStatus_PortalNamesDefaultRouteIface` + `UnreachableNamesDefaultRouteIface` with full-string assertions. |
+| 147 | Grok (minor) | `OnlineLabeledHostWide` missing the #133 RouteMgr pin | **Accepted.** Pinned nil. |
+| 148 | Grok (minor) | No User-Agent consideration | **Accepted (documented).** Default Go UA kept deliberately; comment notes the revisit condition. |
