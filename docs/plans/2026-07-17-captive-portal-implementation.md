@@ -632,6 +632,10 @@ func TestCheck_Offline_NonRedirect3xx(t *testing.T) {
 }
 
 func TestCheck_Portal_RedirectRelative(t *testing.T) {
+	// A path-relative Location is still portal EVIDENCE, but resolving it
+	// against the probe host would mislabel "probe host + path" as the
+	// login URL (wrong under transparent interception) — so PortalURL
+	// stays empty and callers use the ProbeURL fallback.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "/login")
 		w.WriteHeader(http.StatusFound)
@@ -641,7 +645,8 @@ func TestCheck_Portal_RedirectRelative(t *testing.T) {
 	result, err := newTestDetector(srv.URL).Check()
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusPortal, result.Status)
-	assert.Equal(t, srv.URL+"/login", result.PortalURL)
+	assert.Empty(t, result.PortalURL)
+	assert.Equal(t, srv.URL, result.ProbeURL)
 }
 
 func TestCheck_Portal_511(t *testing.T) {
@@ -921,7 +926,9 @@ func TestLoginURL(t *testing.T) {
 	}{
 		{"absolute http", "http://portal.example.com/login", "http://portal.example.com/login"},
 		{"absolute https", "https://portal.example.com/login", "https://portal.example.com/login"},
-		{"relative resolves against base", "/login", "http://probe.example.com/login"},
+		{"path-relative rejected (probe-host mislabeling)", "/login", ""},
+		{"bare-name relative rejected", "login", ""},
+		{"query-only relative rejected", "?next=x", ""},
 		{"empty", "", ""},
 		{"unparseable", "http://bad host/", ""},
 		{"javascript scheme rejected", "javascript:alert(1)", ""},
@@ -1192,7 +1199,9 @@ func isRedirectStatus(status int) bool {
 // from an untrusted network — it must never reach the terminal unvalidated.
 // Plain-http login URLs are accepted by design: captive-portal interception
 // necessarily starts over http, and schemeless redirects (//host/path)
-// inherit the probe's http scheme.
+// inherit the probe's http scheme. Path-relative references are rejected —
+// they can only name "probe host + path", which is not the portal's login
+// host under transparent interception.
 func loginURL(base *url.URL, location string, logger types.Logger) string {
 	if location == "" {
 		return ""
@@ -1200,6 +1209,15 @@ func loginURL(base *url.URL, location string, logger types.Logger) string {
 	ref, err := url.Parse(location)
 	if err != nil {
 		logger.Debug("Portal sent unparseable Location, ignoring", "error", err)
+		return ""
+	}
+	if ref.Scheme == "" && !strings.HasPrefix(location, "//") {
+		// Path-relative (or query/fragment-only) Location: resolving it
+		// against the probe host would label "probe host + path" as the
+		// portal's login URL — wrong under transparent interception, where
+		// the probe hostname still points at the real probe server. The
+		// ProbeURL fallback re-triggers interception either way.
+		logger.Debug("Portal sent relative Location, using probe URL fallback")
 		return ""
 	}
 	resolved := base.ResolveReference(ref)
@@ -1327,6 +1345,7 @@ func TestApp_RunPortal_ConfigLoadFailure(t *testing.T) {
 func TestApp_RunPortal_OnlineNamesDefaultRouteIface(t *testing.T) {
 	app, stdout, _ := portalTestApp()
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	// import: fakenetlink "github.com/angelfreak/net/pkg/netlink/fake"
 	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
 	}}
@@ -1444,9 +1463,45 @@ Expected: compile error (`app.PortalDet`, `app.RunPortal` undefined); after stub
 	RouteMgr   types.RouteManager   // Route inspection for multi-home signaling (nil-safe)
 ```
 
-RunPortal method (near RunStatus; it calls `preferredDefaultIface`, which is
-pasted in Task 5 — add that helper in THIS task so the commit compiles, Task 5
-then only references it):
+RunPortal calls `preferredDefaultIface` — define it in THIS task (full body
+below, right after RunPortal); Task 5 must NOT redefine it:
+
+```go
+// preferredDefaultIface returns the outgoing interface of the LOWEST-metric
+// IPv4 default route — the kernel's preferred IPv4 path. Heuristic for the
+// route labels and the connect-time honesty note only: the probe may resolve
+// AAAA and egress IPv6 on a dual-stack host, which this cannot see
+// (ListRoutes is IPv4 main table). Returns "" when unknown (nil RouteMgr,
+// netlink error, or no default route). GetDefaultRoute is NOT used: it
+// returns the first default in the netlink dump, which on a dual-homed
+// machine may be the higher-metric one.
+func (a *App) preferredDefaultIface() string {
+	if a.RouteMgr == nil {
+		return ""
+	}
+	routes, err := a.RouteMgr.ListRoutes()
+	if err != nil {
+		return ""
+	}
+	// ListRoutes is already scoped to the IPv4 main table; types.Route
+	// carries no family/table/scope fields, so metric is the only selector
+	// available. Ties keep the first seen (kernel dump order) — deterministic
+	// per dump, and good enough for an advisory label.
+	best := ""
+	bestMetric := -1
+	for _, r := range routes {
+		if !r.IsDefault() || r.Iface == "" {
+			continue
+		}
+		if bestMetric == -1 || r.Metric < bestMetric {
+			best, bestMetric = r.Iface, r.Metric
+		}
+	}
+	return best
+}
+```
+
+RunPortal method (near RunStatus):
 
 ```go
 // RunPortal probes for internet connectivity and captive portals, printing
@@ -1506,13 +1561,28 @@ plain HTTP; no CAP_NET_ADMIN needed):
 `cmd/net/main.go` — wire the detector (and the route manager used by Task 5's
 multi-home signaling) in `createApp` and add the factory:
 
+Full body — no ellipsis merging on the production wiring path (dropped
+`Stdout`/`Logger` fields would nil-panic on first print); verify against the
+current `createApp` before writing in case fields moved:
+
 ```go
 func createApp() *App {
 	return &App{
-		// ... existing fields ...
+		Logger:     logger,
+		Executor:   sysExecutor,
+		ConfigMgr:  cfgManager,
+		WiFiMgr:    wifiMgr,
+		VPNMgr:     vpnMgr,
+		NetworkMgr: netMgr,
+		HotspotMgr: hotspotMgr,
+		DHCPMgr:    dhcpMgr,
 		PortalDet:  createPortalDetector(),
 		RouteMgr:   netlink.NewRouteManager(),
-		// ...
+		Interface:  iface,
+		NoVPN:      noVPN,
+		Debug:      debug,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
 	}
 }
 ```
@@ -2438,39 +2508,8 @@ func (a *App) checkPortalAfterConnect(connectedIface string, vpnConfigured bool)
 	return false
 }
 
-// preferredDefaultIface — CREATED IN TASK 4 (RunPortal needs it); shown here
-// because the connect/status paths below use it. Do not define twice.
-// It returns the outgoing interface of the LOWEST-metric
-// IPv4 default route — the kernel's preferred IPv4 path. Heuristic for the
-// honesty note only: the probe may resolve AAAA and egress IPv6 on a
-// dual-stack host, which this cannot see (ListRoutes is IPv4 main table). Returns "" when unknown (nil RouteMgr, netlink error, or
-// no default route). GetDefaultRoute is NOT used: it returns the first
-// default in the netlink dump, which on a dual-homed machine may be the
-// higher-metric one.
-func (a *App) preferredDefaultIface() string {
-	if a.RouteMgr == nil {
-		return ""
-	}
-	routes, err := a.RouteMgr.ListRoutes()
-	if err != nil {
-		return ""
-	}
-	// ListRoutes is already scoped to the IPv4 main table; types.Route
-	// carries no family/table/scope fields, so metric is the only selector
-	// available. Ties keep the first seen (kernel dump order) — deterministic
-	// per dump, and good enough for an advisory note.
-	best := ""
-	bestMetric := -1
-	for _, r := range routes {
-		if !r.IsDefault() || r.Iface == "" {
-			continue
-		}
-		if bestMetric == -1 || r.Metric < bestMetric {
-			best, bestMetric = r.Iface, r.Metric
-		}
-	}
-	return best
-}
+// preferredDefaultIface: ALREADY DEFINED IN TASK 4 — do not redefine.
+// The connect/status paths below call it.
 ```
 
 In `RunConnect`, replace the tail (after `a.printConnectionInfo(connectedIface)`):
@@ -2873,3 +2912,11 @@ git commit -m "docs: document net portal command and portal config"
 | 162 | Grok (major) | Task 6 commit omitted `cmd/net/status.go` | **Accepted.** Staged. |
 | 163 | Grok (major) | Task 6 item 1 paraphrase re-staled the 401/403 rule; grep-back couldn't catch it | **Accepted.** Item 1 states the presence rule; `Location header` grep token added. |
 | 164 | Grok (major) | `net portal` was the one #128-class surface without route labels | **Accepted.** All RunPortal outcomes carry `(default IPv4 route: eth0)` when known; labeled + pinned-nil tests; `preferredDefaultIface` moves to Task 4 so the commit compiles; Long text de-confused. |
+
+### Round 19 (2026-07-18) — **Codex: APPROVE (2nd consecutive)**, Grok: REVISE (3), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 165 | Grok (major) | #164's "moves to Task 4" was note-only — body still lived in Task 5; `fakenetlink` import unstated in Task 4 | **Accepted.** Full helper body pasted in Task 4; Task 5 keeps a do-not-redefine pointer; import comment at the first Task 4 fixture. |
+| 166 | Grok (major) | Path-relative `Location` resolved against the probe host and mislabeled "Log in at:" (wrong under transparent interception) | **Accepted.** `loginURL` rejects path-relative/query-only references → ProbeURL fallback (works for both interception styles); `RedirectRelative` test and `TestLoginURL` vectors flipped; doc comment updated. |
+| 167 | Grok (major) | `createApp` ellipsis fence unsafe for literal/agent execution (dropped fields nil-panic) | **Accepted.** Full 16-field body pasted with verify-against-current caveat. |
