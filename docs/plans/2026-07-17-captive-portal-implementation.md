@@ -139,7 +139,7 @@ type PortalDetector interface {
 
 **Step 4: Run test to verify it passes**
 
-Run: `go test ./pkg/types/ -v -run Portal`
+Run: `go test ./pkg/types/ -run 'TestTimeoutConfigGetPortalTimeout|TestTimeoutConfigAll|Portal' -v`
 Expected: PASS
 
 **Step 5: Commit**
@@ -271,6 +271,7 @@ func TestValidatePortalProbeURL(t *testing.T) {
 		"non-ascii host":      "http://exämple.com/",
 		"format rune":         "http://evil‮.com/x",
 		"raw control byte":    "http://x.example.com/\x1b",
+		"raw space":           "http://x.example.com/a b",
 		"unparseable":         "not a url",
 	} {
 		assert.Error(t, ValidatePortalProbeURL(bad), "%s: %q must be rejected", name, bad)
@@ -336,7 +337,7 @@ func (p *PortalConfig) CheckDisabled() bool {
 	}
 ```
 
-Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), insert this complete fragment directly after the existing `validateFields("common", commonMap, validCommonFields)` append — it encodes the null-safe branch order, the field validation, and both value checks with their exact messages (adjust only the local `errors` variable name to match the surrounding code):
+Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), insert this complete fragment directly after the existing `validateFields("common", commonMap, validCommonFields)` append — it encodes the null-safe branch order, the field validation, and both value checks with their exact messages (adjust only the local `errors` variable name to match the surrounding code). Before relying on the `map[string]interface{}` assertion, verify what shape the existing raw path actually yields for nested maps (viper+yaml.v3 produce string-keyed maps, but if the existing code ever handles `map[interface{}]interface{}`, add a tiny `asStringMap(v any) (map[string]interface{}, bool)` normalizer and use it here — the null-section test plus `TestPortalConfigParsing` will catch a mismatch either way):
 
 ```go
 	// common.portal: absent or null → defaults; map → validate; else reject.
@@ -386,7 +387,7 @@ For reference, the rules this fragment encodes:
 3. Validate the `check` value **on the raw map, before unmarshal** (viper weak-typing coerces bools/ints to strings with no error): if present it must be a Go **string** whose trimmed, lowercased value is `""`, `"auto"`, or `"off"`; anything else (including YAML booleans/ints) fails with an error containing `common.portal.check must be "auto" or "off"` — via the `ValidationError.Message` mechanism specified below (no other error path).
 4. Validate the `url` value at load with these exact semantics (Grok r4: `url: ""` must not be rejected as "no host"):
    - **absent key, YAML null (`url:`), or empty string (`url: ""`)** → default probe URL, no error;
-   - **non-empty string** → must pass the shared `types.ValidatePortalProbeURL` helper (raw Cc/Cf rune scan, parse OK, scheme `http`, non-empty host, no userinfo — the CLI prints ProbeURL verbatim under the display-safety contract);
+   - **non-empty string** → must pass the shared `types.ValidatePortalProbeURL` helper (visible-ASCII-only scan `0x21..0x7e` — no spaces, controls, or non-ASCII — then parse OK, scheme `http`, non-empty host, no userinfo — the CLI prints ProbeURL verbatim under the display-safety contract);
    - **non-string** (YAML bool/int/list) → `ValidationError` with `Message: "common.portal.url must be a string"` — same raw-map mechanism as `check`.
 
 Error plumbing (exact, no implementer's choice): extend `ValidationError` with an optional `Message string` field; `Error()` returns `Message` when set, else the existing unknown-field format. Inside the `common` branch of the raw-validation pass, append value errors like:
@@ -420,6 +421,40 @@ func TestPortalConfigEmptyURLAllowed(t *testing.T) {
 This is deliberately stricter than the historically-unvalidated `timeouts` because a typo here silently re-enables probing or probes the wrong host.
 
 **Placement note:** the URL rule uses `types.ValidatePortalProbeURL`. **Add it to the EXISTING** `pkg/types/validation.go` next to the other validators (`ValidateMAC`, `ValidateSSID`, …) — the file already exists; do not create a new one. `pkg/types` is the dependency-free bottom layer both `pkg/config` and `pkg/portal` already import, so config never depends on the runtime detector package. Its test goes in the existing `pkg/types/validation_test.go`; Task 3's Detector calls the same helper.
+
+The definitive implementation (this task):
+
+```go
+// ValidatePortalProbeURL reports whether raw is acceptable as a captive-portal
+// probe endpoint: printable ASCII only in the RAW string (the CLI prints the
+// configured URL verbatim — this rules out control bytes, bidi/format runes,
+// and IDN-confusable hostnames in one check), parseable, plain http (portals
+// cannot intercept https), non-empty host, no userinfo. Shared by config
+// load-time validation and the detector's runtime guard.
+func ValidatePortalProbeURL(raw string) error {
+	for _, r := range raw {
+		// Visible ASCII only (0x21..0x7e): also excludes raw spaces, which
+		// URL.String() can preserve in queries and which break copy/paste.
+		if r < 0x21 || r > 0x7e {
+			return fmt.Errorf("portal probe URL must be visible ASCII with no spaces")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid portal probe URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" {
+		return fmt.Errorf("portal probe URL must be plain http, got %q — portals cannot intercept %s", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("portal probe URL %q has no host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("portal probe URL %q must not contain userinfo", raw)
+	}
+	return nil
+}
+```
 
 **Step 4: Run to verify pass**
 
@@ -731,6 +766,13 @@ func TestNew_DefaultURL(t *testing.T) {
 	assert.Equal(t, DefaultProbeURL, d.probeURL)
 }
 
+func TestNew_DefaultTimeoutWhenZeroOrNegative(t *testing.T) {
+	for _, tmo := range []time.Duration{0, -time.Second} {
+		d := New("", tmo, &testLogger{})
+		assert.Equal(t, 3*time.Second, d.timeout)
+	}
+}
+
 // --- loginURL pure-helper tests (hostile inputs net/http would reject on the wire) ---
 
 func mustParse(t *testing.T, raw string) *url.URL {
@@ -850,43 +892,16 @@ func New(probeURL string, timeout time.Duration, logger types.Logger) *Detector 
 	if logger == nil {
 		logger = nopLogger{}
 	}
+	if timeout <= 0 {
+		// http.Client{Timeout: 0} means NO deadline — a zero/negative value
+		// must never disable the bound on a blackholed network.
+		timeout = (&types.TimeoutConfig{}).GetPortalTimeout()
+	}
 	return &Detector{probeURL: probeURL, timeout: timeout, logger: logger}
 }
 
-In `pkg/types/validation.go` (created during Task 2, shown here for context —
-the Detector calls it):
-
-```go
-// ValidatePortalProbeURL reports whether raw is acceptable as a captive-portal
-// probe endpoint: printable ASCII only in the RAW string (the CLI prints the
-// configured URL verbatim — this rules out control bytes, bidi/format runes,
-// and IDN-confusable hostnames in one check), parseable, plain http (portals
-// cannot intercept https), non-empty host, no userinfo. Shared by config
-// load-time validation and the detector's runtime guard.
-func ValidatePortalProbeURL(raw string) error {
-	for _, r := range raw {
-		// Visible ASCII only (0x21..0x7e): also excludes raw spaces, which
-		// URL.String() can preserve in queries and which break copy/paste.
-		if r < 0x21 || r > 0x7e {
-			return fmt.Errorf("portal probe URL must be visible ASCII with no spaces")
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("invalid portal probe URL %q: %w", raw, err)
-	}
-	if u.Scheme != "http" {
-		return fmt.Errorf("portal probe URL must be plain http, got %q — portals cannot intercept %s", raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("portal probe URL %q has no host", raw)
-	}
-	if u.User != nil {
-		return fmt.Errorf("portal probe URL %q must not contain userinfo", raw)
-	}
-	return nil
-}
-```
+(`types.ValidatePortalProbeURL` was implemented and tested in Task 2 — the
+Detector simply calls it. Definition lives in `pkg/types/validation.go`.)
 
 Back in `pkg/portal/portal.go`:
 
@@ -1671,6 +1686,7 @@ func TestApp_RunConnect_RetryErrorNoOfflineWarning(t *testing.T) {
 
 func TestApp_RunStatus_ProbeErrorLine(t *testing.T) {
 	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{err: errors.New("probe URL must be plain http")}
 
 	err := app.RunStatus()
@@ -1680,6 +1696,7 @@ func TestApp_RunStatus_ProbeErrorLine(t *testing.T) {
 
 func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
 	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
 		Status:    types.PortalStatusPortal,
 		PortalURL: "http://portal.example.com/login",
@@ -1694,6 +1711,7 @@ func TestApp_RunStatus_ShowsInternetLine(t *testing.T) {
 
 func TestApp_RunStatus_OnlineLabeledHostWide(t *testing.T) {
 	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
 
 	err := app.RunStatus()
@@ -1703,6 +1721,7 @@ func TestApp_RunStatus_OnlineLabeledHostWide(t *testing.T) {
 
 func TestApp_RunStatus_OnlineNamesDefaultRouteIface(t *testing.T) {
 	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
 	app.RouteMgr = &stubRouteManager{routes: []types.Route{
 		{Dst: "default", Gw: "10.0.0.1", Iface: "eth0", Metric: 100},
@@ -1716,6 +1735,7 @@ func TestApp_RunStatus_OnlineNamesDefaultRouteIface(t *testing.T) {
 func TestApp_RunStatus_UnknownStatusNeverOk(t *testing.T) {
 	// Zero-value PortalResult (PortalStatusUnknown) must never print "ok".
 	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{} // empty results → zero-value result
 
 	err := app.RunStatus()
@@ -1746,8 +1766,40 @@ func TestApp_RunConnect_VPNConfiguredSuppressesOfflineWarning(t *testing.T) {
 	assert.True(t, tracker.connectCalled)
 }
 
+func TestApp_RunStatus_ConfigLoadFailureSkipsProbe(t *testing.T) {
+	// Load failure means the user's portal policy (check: off, custom URL)
+	// is unknown — auto-probing substituted defaults could report "ok"
+	// against their intent. Skip; the loader already surfaced the error.
+	app, stdout, _ := newTestApp() // testConfigManager{} → GetConfig() == nil
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.PortalDet = det
+
+	err := app.RunStatus()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, det.calls)
+	assert.NotContains(t, stdout.String(), "Internet:")
+}
+
+func TestApp_RunConnect_UnknownStatusWarns(t *testing.T) {
+	// Zero-value PortalResult (Unknown) must fail closed on connect too —
+	// a silent no-op reads as a clean connect with working internet.
+	app, _, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	det := &testPortalDetector{} // empty results → zero-value result
+	app.PortalDet = det
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, det.calls) // Unknown is not Offline: no settle-retry
+	assert.Contains(t, stderr.String(), "could not be determined")
+}
+
 func TestApp_RunStatus_OfflineLine(t *testing.T) {
 	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
 
 	err := app.RunStatus()
@@ -1985,7 +2037,15 @@ func (a *App) portalCheckEnabled() bool {
 		return false
 	}
 	if a.ConfigMgr != nil {
-		if cfg := a.ConfigMgr.GetConfig(); cfg != nil && cfg.Common.Portal.CheckDisabled() {
+		cfg := a.ConfigMgr.GetConfig()
+		if cfg == nil {
+			// Config failed to load: the user's portal policy (check: off,
+			// custom URL) is unknown — probing with substituted defaults
+			// could report "ok" against their intent. The load error was
+			// already surfaced by the loader; skip automatic probes.
+			return false
+		}
+		if cfg.Common.Portal.CheckDisabled() {
 			return false
 		}
 	}
@@ -2010,7 +2070,9 @@ func (a *App) checkPortalAfterConnect(connectedIface string, vpnConfigured bool)
 	}
 	// Honest multi-home signaling: the probe follows the kernel's preferred
 	// default route (lowest metric — wired 100 beats WiFi 600), which may
-	// not be the just-connected interface. Any outcome via the wrong link
+	// not be the just-connected interface. (This note is part of the
+	// automatic portal check: check: off disables it together with the
+	// probe it annotates.) Any outcome via the wrong link
 	// misleads (false ok, false offline, or a portal URL for the wrong
 	// network), so the note prints regardless of the probe result.
 	// NB: RouteMgr.GetDefaultRoute() returns the FIRST default in the
@@ -2059,6 +2121,13 @@ func (a *App) checkPortalAfterConnect(connectedIface string, vpnConfigured bool)
 		} else {
 			a.errorf("Warning: no internet connectivity detected\n")
 		}
+	case types.PortalStatusOnline:
+		// nothing to warn about
+	default:
+		// Unknown or any future status: fail closed, mirroring RunPortal
+		// and RunStatus (#93) — a silent no-op here would read as a clean
+		// connect with working internet.
+		a.errorf("Warning: internet connectivity could not be determined\n")
 	}
 	return false
 }
@@ -2213,7 +2282,7 @@ git commit -m "docs: document net portal command and portal config"
 
 ### Task 7: full verification
 
-**Step 1:** `files=$(git ls-files '*.go' | xargs gofmt -l); test -z "$files"` → exit 0 (tracked Go files only — no vendor/build-output traversal, no pipefail fragility); `go vet ./...` → clean
+**Step 1:** `files=$(git ls-files '*.go' | xargs -r gofmt -l); test -z "$files"` → exit 0 (tracked Go files only; `-r` skips the gofmt call entirely if the list is ever empty); `go vet ./...` → clean
 **Step 2:** `go test ./...` → all packages PASS (this is the required, deterministic verification: unit + httptest coverage of every classification row)
 **Step 3:** Build a real binary: `go build -o /tmp/net-portal-test ./cmd/net`
 **Step 4 (opportunistic manual QA — optional, outside acceptance criteria; explicitly requested by the user for this session):** the requesting user is literally sitting behind Amtrak_WiFi's portal; run `/tmp/net-portal-test portal` on the live network. Expect `Internet: ok` (already logged in) or `Captive portal detected!` + URL; verify exit code with `echo $?`; confirm no sudo prompt appears (root exemption). Also run `/tmp/net-portal-test status` and confirm the `Internet:` line. Required verification is Steps 1–3 (deterministic).
@@ -2394,3 +2463,16 @@ git commit -m "docs: document net portal command and portal config"
 | 115 | Codex (major) | Label ALL status lines with the default-route iface, not just online | **Rejected:** false-"ok" is the uniquely dangerous outcome (invites no further action); portal/unreachable lines prompt user action regardless of egress, and the connect-time note already fires on every outcome. Suffixing every line is noise. |
 | 116 | Grok (minor) | Header still shows the pre-#101 `(default route)` label | **Accepted.** Header matches Task 5 (`default route: <iface>` when known). |
 | 117 | Codex (minor) | Null-portal handling could be broken by implementing scalar rejection as "not a map ⇒ error" | **Accepted.** Folded into #112's branch-order fragment and test. |
+
+### Round 12 (2026-07-18) — Codex: REVISE, Grok: REVISE (both with non-objection lists), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 118 | Grok (major) | Task 2 prose still described the pre-#109 Cc/Cf rule and the definitive validator lived in a Task 3 "context" block; no space vector | **Accepted.** Full validator (0x21..0x7e) is now Task 2's normative implementation; Task 3 references it; prose fixed; `"raw space"` vector added. |
+| 119 | Grok (major) | Connect fails open on `PortalStatusUnknown` (silent no-op) | **Accepted.** Explicit Online case; `default:` warns "internet connectivity could not be determined"; `TestApp_RunConnect_UnknownStatusWarns` (1 call — Unknown ≠ Offline, no retry). |
+| 120 | Grok (major, disputing #114's carve-out with new argument) | Config load failure still auto-probes with substituted defaults on status/connect — policy substitution, not best-effort | **Accepted, #114 carve-out revised.** `portalCheckEnabled` returns false when `GetConfig() == nil` (policy unknown ⇒ no auto probe; loader already surfaced the error); `TestApp_RunStatus_ConfigLoadFailureSkipsProbe`; status tests now inject loaded configs. |
+| 121 | Grok (minor) | Task 1 green filter can't see the aggregate-suite assertions | **Accepted.** Filter extended to `TestTimeoutConfigAll`. |
+| 122 | Codex (major) | `New(url, 0, logger)` → `http.Client{Timeout: 0}` = no deadline | **Accepted.** Non-positive timeouts normalize to the 3s default; `TestNew_DefaultTimeoutWhenZeroOrNegative`. |
+| 123 | Codex (major) | Raw-map shape (`map[string]interface{}`) unverified for nested maps | **Accepted (verification note).** Fragment intro instructs verifying the existing raw path's shape and adding an `asStringMap` normalizer if needed; null-section + parsing tests catch a mismatch. |
+| 124 | Codex (major) | Multi-home note silently suppressed by `check: off` while header claims it is "signaled" | **Accepted (documented).** The note is part of the automatic check it annotates; comment states this; `check: off` disables both. |
+| 125 | Codex (minor) | Bare `xargs` may run gofmt with no args | **Accepted.** `xargs -r`. |
