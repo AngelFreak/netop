@@ -1,10 +1,10 @@
 # Captive Portal Detection Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For Claude:** Use the superpowers:executing-plans skill when it is available in the executing environment; otherwise execute the tasks in order exactly as written (each task is self-contained TDD: failing test → verify red → implement → verify green → commit).
 
-**Goal:** Detect captive portals (e.g. Amtrak_WiFi) after connect, on demand via `net portal`, and in `net status` — printing the actual portal login URL.
+**Goal:** Detect captive portals (e.g. Amtrak_WiFi) after connect, on demand via `net portal`, and in `net status` — printing the portal's login URL when the portal supplies one via redirect, otherwise the probe URL to open in a browser (which the portal will intercept).
 
-**Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; 3xx or 511 → portal (login URL from `Location`); 401/403 **with a sanitized `Location`** → portal (enterprise/hotel interception); 200 with unexpected body → portal (DNS-hijack style); transport errors **and all other HTTP statuses** → offline, so a probe-endpoint outage is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
+**Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; redirect statuses **301/302/303/307/308** or 511 → portal (login URL from `Location`); 401/403 **with a sanitized `Location`** → portal (enterprise/hotel interception); 200 with unexpected body → portal (DNS-hijack style); transport errors **and every other status — including 304 and other non-redirect 3xx** → offline, so a probe-endpoint outage or caching intermediary is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
 **Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". Binding the probe to the connected interface needs `SO_BINDTODEVICE` (CAP_NET_RAW — would break the root-exempt `net portal`) or fragile source-IP games; out of scope. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its line host-wide (`Internet:  ok (default route)`); README, design doc, and `net portal --help` document the semantics.
 
@@ -223,6 +223,16 @@ func TestPortalConfigBadURLRejected(t *testing.T) {
 	}
 }
 
+func TestPortalConfigNonStringURLRejected(t *testing.T) {
+	// Same weak-typing trap as check: a YAML bool/int/list url must fail
+	// with the explicit message, not coerce or produce a mapstructure mess.
+	for _, line := range []string{"url: true", "url: 1", "url: [http://x]"} {
+		_, err := loadPortalConfig(t, "\ncommon:\n  portal:\n    "+line+"\n")
+		assert.Error(t, err, "%q must be rejected", line)
+		assert.Contains(t, err.Error(), "common.portal.url must be a string")
+	}
+}
+
 func TestPortalConfigScalarPortalRejected(t *testing.T) {
 	// A scalar or list portal: value must fail with the explicit mapping
 	// message, not a cryptic mapstructure decode error or a silent zero.
@@ -321,7 +331,7 @@ Add `"portal": true` to `validCommonFields`. In the validation pass where `commo
 4. Validate the `url` value at load with these exact semantics (Grok r4: `url: ""` must not be rejected as "no host"):
    - **absent key, YAML null (`url:`), or empty string (`url: ""`)** → default probe URL, no error;
    - **non-empty string** → must pass the shared `types.ValidatePortalProbeURL` helper (raw Cc/Cf rune scan, parse OK, scheme `http`, non-empty host, no userinfo — the CLI prints ProbeURL verbatim under the display-safety contract);
-   - **non-string** → clear error.
+   - **non-string** (YAML bool/int/list) → `ValidationError` with `Message: "common.portal.url must be a string"` — same raw-map mechanism as `check`.
 
 Error plumbing (exact, no implementer's choice): extend `ValidationError` with an optional `Message string` field; `Error()` returns `Message` when set, else the existing unknown-field format. Inside the `common` branch of the raw-validation pass, append value errors like:
 
@@ -702,6 +712,7 @@ func TestLoginURL(t *testing.T) {
 		{"bidi in path is percent-encoded", "http://x.example.com/‮gnp.exe", "http://x.example.com/%E2%80%AEgnp.exe"},
 		{"bidi in host is percent-encoded", "http://evil‮.com/x", "http://evil%E2%80%AE.com/x"},
 		{"percent-encoded controls stay encoded", "http://x.example.com/%1b%0d%0a", "http://x.example.com/%1b%0d%0a"},
+		{"raw space in query rejected", "http://x.example.com/login?next=a b", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -798,8 +809,10 @@ the Detector calls it):
 // load-time validation and the detector's runtime guard.
 func ValidatePortalProbeURL(raw string) error {
 	for _, r := range raw {
-		if r < 0x20 || r > 0x7e {
-			return fmt.Errorf("portal probe URL must be printable ASCII")
+		// Visible ASCII only (0x21..0x7e): also excludes raw spaces, which
+		// URL.String() can preserve in queries and which break copy/paste.
+		if r < 0x21 || r > 0x7e {
+			return fmt.Errorf("portal probe URL must be visible ASCII with no spaces")
 		}
 	}
 	u, err := url.Parse(raw)
@@ -953,8 +966,10 @@ func loginURL(base *url.URL, location string, logger types.Logger) string {
 	}
 	s := resolved.String()
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			logger.Debug("Portal Location contains control/format characters, ignoring")
+		// Controls, format runes, and raw spaces (String() can preserve
+		// spaces in the query component) — none belong in a printed URL.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == ' ' {
+			logger.Debug("Portal Location contains unprintable characters, ignoring")
 			return ""
 		}
 	}
@@ -1071,6 +1086,27 @@ func TestApp_RunPortal_Offline(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, types.PortalStatusOffline, status)
 	assert.Contains(t, stdout.String(), "Internet: unreachable")
+}
+
+func TestApp_RunPortal_IgnoresCheckOff(t *testing.T) {
+	// check: off disables AUTOMATIC probes (connect/status) only — the
+	// explicit `net portal` command must always probe. Locks the contract
+	// against a future "cleanup" that gates all entry points on
+	// portalCheckEnabled.
+	app, stdout, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{Common: types.CommonConfig{Portal: types.PortalConfig{Check: "off"}}},
+	}
+	det := &testPortalDetector{results: []types.PortalResult{{
+		Status: types.PortalStatusPortal, PortalURL: "http://portal.example.com/login", ProbeURL: "http://p",
+	}}}
+	app.PortalDet = det
+
+	status, err := app.RunPortal()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusPortal, status)
+	assert.Equal(t, 1, det.calls)
+	assert.Contains(t, stdout.String(), "Captive portal detected")
 }
 
 func TestApp_RunPortal_NoDetector(t *testing.T) {
@@ -1221,6 +1257,9 @@ reflects the preferred interface, not necessarily the one just connected
 (the multi-home note is an IPv4-main-table metric heuristic, not a guarantee
 of probe egress). HTTP proxy environment variables are intentionally ignored
 — a proxy would answer on the portal's behalf and mask it.
+
+This command always probes, even with common.portal.check: off (which only
+disables the automatic checks in connect and status).
 
 Exit codes: 0 = online, 2 = captive portal detected, 1 = offline,
 3 = configuration or internal error.`,
@@ -1647,7 +1686,7 @@ func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
 
 **Step 2: Run to verify failure**
 
-Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunConnect_NilDetector|TestApp_RunConnect_Offline|TestApp_RunConnect_MultiHomed|TestApp_RunConnect_NoMultiHomed|TestApp_RunConnect_Misconfigured|TestApp_RunConnect_RetryError|TestApp_RunStatus_' -v`
+Run: `go test ./cmd/net/ -run 'TestApp_RunConnect_Portal|TestApp_RunConnect_NilDetector|TestApp_RunConnect_Offline|TestApp_RunConnect_Online|TestApp_RunConnect_MultiHomed|TestApp_RunConnect_NoMultiHomed|TestApp_RunConnect_Misconfigured|TestApp_RunConnect_RetryError|TestApp_RunConnect_VPN|TestApp_RunConnect_NetworkVPN|TestApp_RunStatus_|TestApp_resolveVPNName|TestApp_attemptVPNConnect' -v`
 Expected: FAIL (no warning printed / no Internet line); the NilDetector test may already pass — keep it as a regression guard
 
 **Step 3: Implement**
@@ -2063,17 +2102,19 @@ common:
     portal: 3     # captive-portal probe timeout in seconds
 ```
 
-**Step 2: Sync the design doc** — the design is already stale relative to seven review rounds; the sync must be EXHAUSTIVE, replacing these sections wholesale (grep the design afterwards to confirm each string landed):
+**Step 2: Sync the design doc** — the design is stale relative to ALL review rounds; the sync must be EXHAUSTIVE, replacing these sections wholesale (grep the design afterwards to confirm each string landed):
 
-1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; 3xx/511→portal; 401/403+sanitized Location→portal; 200 unexpected body→portal; everything else incl. 4xx/5xx→offline; oversized body never online; body read only on 200).
-2. `PortalResult` shape → `PortalURL` (Location only) + `ProbeURL` + display-safety contract; probe URL validation (printable ASCII, http, host, no userinfo).
-3. CLI section → exit codes **0/2/1/3** (3 = config/internal error), neutral `Internet: unreachable` copy, `Args: cobra.NoArgs`, root exemption.
-4. `net status` → honors `check: off`, host-wide `(default route)` label.
-5. Connect flow → settle-retry (500ms + one retry, offline-warn only after retry), VPN hint only when a VPN resolves, `resolveVPNName` replacing `connectVPN`.
-6. Multi-home → known product gap, IPv4-labeled honesty note via lowest-metric default, dual-stack caveat.
-7. Config → `common.portal` map-only rule, `check` value validation (raw map, weak-typing trap), `url` empty/null/absent ⇒ default.
+1. Classification table → the Architecture blurb of this plan verbatim (204/success→online; **301/302/303/307/308**/511→portal; 401/403+sanitized Location→portal; 200 unexpected body→portal; everything else — **including 304 and non-redirect 3xx** — →offline; oversized body never online; body read only on 200).
+2. `PortalResult` shape → **`PortalStatusUnknown` as fail-closed zero value**, `PortalURL` (Location only) + `ProbeURL` + display-safety contract; probe URL validation (visible ASCII, http, host, no userinfo).
+3. CLI section → exit codes **0/2/1/3** (3 = config/internal error; Unknown maps to 1, never 0), neutral `Internet: unreachable` copy, `Args: cobra.NoArgs`, root exemption; **`net portal` always probes, ignoring `check: off`**.
+4. `net status` → honors `check: off`, host-wide label naming the route interface when known: **`Internet:  ok (default route: eth0)`**, plain `(default route)` otherwise; unknown statuses print `unreachable`, never `ok`.
+5. Connect flow → settle-retry (500ms + one retry, offline-warn only after retry), VPN hint only when a VPN resolves, **offline warning demoted to debug when a VPN is configured**, `resolveVPNName` replacing `connectVPN`.
+6. Multi-home → known product gap, IPv4-labeled honesty note via lowest-metric default (`preferredDefaultIface`, not `GetDefaultRoute`), dual-stack caveat, heuristic-not-guarantee wording.
+7. Config → `common.portal` map-only rule, `check` AND `url` raw-map value validation incl. non-string rejection (weak-typing trap), `url` empty/null/absent ⇒ default.
 
-Add a "Revised after consensus review (8 rounds)" note at the top.
+Required grep-back strings (all must be present in the design after sync): `PortalStatusUnknown`, `301`, `304`, `default route: `, `check: off`, `exit`, `Unknown`.
+
+Add a "Revised after consensus review (see plan Review Log for round count)" note at the top.
 
 **Step 3: Commit**
 
@@ -2243,3 +2284,16 @@ git commit -m "docs: document net portal command and portal config"
 | 101 | Codex (major) | Status/portal don't show which interface was probed | **Accepted (status).** `Internet:  ok (default route: eth0)` when the preferred default is known; `net portal --help` documents routing. |
 | 102 | Codex (major) | Proxy disabled unconditionally breaks proxy-only enterprise networks | **Rejected (documented):** probing through a proxy defeats portal detection — the proxy answers on the portal's behalf; r1 design decision. Now documented in `net portal --help`. |
 | 103 | Codex (major) | False "no internet" warning on VPN-required networks | **Accepted.** Offline warning demoted to debug when a VPN resolves for the network (portal warnings unaffected); `TestApp_RunConnect_VPNConfiguredSuppressesOfflineWarning`. |
+
+### Round 10 (2026-07-18) — Codex: REVISE, Grok: REVISE (with explicit non-objections list), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 104 | Codex + Grok (major) | Architecture and Task 6 still said "3xx → portal", reintroducing what #96 fixed | **Accepted.** Architecture, Goal, and Task 6 item 1 name 301/302/303/307/308 explicitly and call out 304/non-redirect 3xx → offline. |
+| 105 | Grok (major) | Task 6 sync list missed R8/R9 contract changes (Unknown zero, iface label, VPN offline demotion) and said "8 rounds" | **Accepted.** All four added; required grep-back string list added; round-count wording made log-relative. |
+| 106 | Grok (major) | Non-string `url` (bool/int/list) untested — same weak-typing class as `check` | **Accepted.** Exact message `common.portal.url must be a string`; `TestPortalConfigNonStringURLRejected`. |
+| 107 | Grok (major) | "`net portal` always probes" stated but not locked by a test | **Accepted.** `TestApp_RunPortal_IgnoresCheckOff` + help-text line. |
+| 108 | Grok (minor) | Task 5 red-phase filter missed two new tests | **Accepted.** Filter extended to all Task 5 test families. |
+| 109 | Codex (major) | Visible-ASCII validation admitted raw spaces (0x20); `loginURL` could print space-containing query | **Accepted.** Probe validator requires 0x21..0x7e; `loginURL` also rejects raw spaces; test vectors added. |
+| 110 | Codex (major) | Goal claims "the actual portal login URL" but DNS-hijack portals yield only the probe fallback | **Accepted.** Goal reworded: login URL when supplied via redirect, probe URL otherwise. |
+| 111 | Codex (blocker as filed) | `superpowers:executing-plans` unavailable (third re-raise of #91/#99) | **Defused.** Header now says "when available, otherwise execute tasks in order as written" — plan is self-sufficient in any environment; no further dependency to dispute. |
