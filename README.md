@@ -248,6 +248,9 @@ sudo net scan
 # Show connection status
 sudo net list
 
+# Check for a captive portal on the current connection
+net portal
+
 # Disconnect everything
 sudo net stop
 ```
@@ -335,6 +338,8 @@ sudo net stop
 | `connect [name]` | Connect to a network |
 | `scan` | Scan for WiFi networks |
 | `list` | Show connection status |
+| `status` | Show full status (connection, internet/captive portal, VPN, hotspot, DHCP) |
+| `portal` | Check for a captive portal on the current connection |
 | `stop` | Disconnect everything |
 | `vpn <name>` | Connect to VPN |
 | `vpn stop` | Disconnect all VPNs |
@@ -354,6 +359,54 @@ sudo net stop
 | `--debug` | Enable debug logging |
 | `--no-vpn` | Skip VPN connection |
 
+### 🛜 Captive Portal Detection
+
+Networks such as hotel/airline/coffee-shop WiFi sit behind a **captive portal**:
+the connection comes up (IP, gateway, DNS) but all traffic is blackholed until
+you log in through a browser. netop probes a plain-HTTP connectivity-check URL to
+tell these apart from a working connection:
+
+- **`net portal`** — check on demand. Prints `Internet: ok`, or
+  `Captive portal detected!` followed by the login URL (when the portal supplies
+  one via redirect) or the probe URL to open in a browser (which the portal will
+  intercept). This command does **not** require root, and always probes even when
+  `common.portal.check: off` is set.
+- **`net connect`** — after connecting, a non-fatal stderr warning is printed if a
+  captive portal or no internet is detected. The VPN attempt proceeds unchanged.
+- **`net status`** — shows one `Internet:` line reflecting the same probe.
+
+**Exit codes** (for scripting `net portal`):
+
+| Code | Meaning |
+|------|---------|
+| `0` | Online — internet reachable |
+| `2` | Captive portal detected |
+| `1` | Offline — no working internet, no portal identified |
+| `3` | Configuration or internal error |
+
+**Default-route limitation.** The probe follows the process's normal routing (the
+lowest-metric default route), **not** the interface you just connected to. netop
+treats dual-homing as first-class (a wired link with metric 100 beats WiFi at
+600), so if Ethernet has internet while you connect to a captive WiFi, the probe
+egresses over Ethernet and reports `ok`. To make this honest rather than silent,
+every Internet outcome is labelled with the preferred IPv4 default route when
+known — `Internet:  ok (default IPv4 route: eth0)` — and `net connect` prints a
+stderr note when the default-route interface differs from the just-connected one,
+naming the remediation (disable/unplug the preferred link, or open a browser on
+the captive network). This is an IPv4 main-table metric heuristic, not a
+guarantee of probe egress; on a dual-stack host the probe may egress over IPv6.
+
+**Connect-time latency.** The connect-time check makes at most one settle-retry to
+avoid a false offline warning right after association, so the worst case on a
+truly offline network is roughly `settle (500ms) + 2 × portal timeout`. The retry
+is deliberately unconditional; refused or no-route probes fail in milliseconds, so
+the full cost is only paid on a blackholed network.
+
+> **Note on `timeouts.*`.** Unlike `common.portal`, the `timeouts` subfields are
+> historically **not** validated: a typo like `timeouts.portl` silently falls back
+> to the 3s default rather than erroring. Tightening that is out of scope here
+> (changing it could break configs that load today).
+
 [↑ Back to Top](#-net)
 
 ---
@@ -369,7 +422,22 @@ common:
   dns: 1.1.1.1, 8.8.8.8    # Comma-separated DNS servers
   hostname: MyLaptop       # Hostname for DHCP
   vpn: myvpn               # Default VPN name
+  portal:
+    check: auto   # "auto" (default) or "off"; anything else is rejected at load
+    url: http://detectportal.firefox.com/success.txt
+      # must be plain http with a host; a custom endpoint must answer
+      # HTTP 204 or a 200 body of exactly "success" when internet works.
+      # It should normally be an externally reachable public endpoint —
+      # a LAN-local probe answers even when the internet is down.
+      # (Self-hosted probes are allowed deliberately, for privacy.)
+  timeouts:
+    portal: 3     # captive-portal probe timeout in seconds
 ```
+
+`portal.check: off` disables only the automatic checks in `net connect` and
+`net status` (including the multi-home note); `net portal` always probes on
+demand. A non-`auto`/`off` `check` value or an invalid `url` is rejected at
+config load.
 
 </details>
 

@@ -3,6 +3,16 @@ common: # Default settings
   dns: 8.8.8.8, 8.8.4.4
   hostname: <name>s-MacBook-Pro # <name> is a table of generic names
   vpn: myvpn
+  portal:
+    check: auto   # "auto" (default) or "off"; anything else is rejected at load
+    url: http://detectportal.firefox.com/success.txt
+      # must be plain http with a host; a custom endpoint must answer
+      # HTTP 204 or a 200 body of exactly "success" when internet works.
+      # It should normally be an externally reachable public endpoint —
+      # a LAN-local probe answers even when the internet is down.
+      # (Self-hosted probes are allowed deliberately, for privacy.)
+  timeouts:
+    portal: 3     # captive-portal probe timeout in seconds
 
 ignored:
   interfaces:
