@@ -2116,4 +2116,4 @@ git commit -m "docs: document net portal command and portal config"
 | 89 | Codex (major) | `preferredDefaultIface` selector limits (family/table/ECMP ties) unstated | **Accepted (documented).** Comment states IPv4-main-table scope, metric-only selection, first-wins ties — `types.Route` carries no further fields. |
 | 90 | Codex (minor) | `gofmt -l .` traverses non-tracked paths | **Accepted.** `git ls-files '*.go' \| xargs gofmt -l`. |
 | 91 | Codex (minor) | `superpowers:executing-plans` allegedly unavailable | **Rejected with evidence:** the skill IS available in this environment's skill list; Codex cannot see it. |
-| 92 | Self (minor) | U+00A0 test literal was a pasted invisible character | **Accepted (pre-merged).** Explicit ` ` escape sequence. |
+| 92 | Self (minor) | U+00A0 test literal was a pasted invisible character | **Accepted (pre-merged).** Explicit U+00A0 escape sequence in the Go literal. |
