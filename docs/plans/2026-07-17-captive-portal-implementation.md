@@ -6,7 +6,7 @@
 
 **Architecture:** New `pkg/portal.Detector` does a plain-HTTP GET to a probe URL (default `http://detectportal.firefox.com/success.txt`) with redirects disabled. Classification: 204 or `success` body → online; redirect statuses **301/302/303/307/308** or 511 → portal (login URL from `Location`); 401/403 **with a sanitized `Location`** → portal (enterprise/hotel interception); 200 with unexpected body → portal (DNS-hijack style); transport errors **and every other status — including 304 and other non-redirect 3xx** → offline, so a probe-endpoint outage or caching intermediary is never misreported as a portal. Exposed via a new `types.PortalDetector` interface injected into `App`. Non-fatal warning in `net connect` (with one settle-retry to avoid false offline warnings), standalone root-exempt `net portal` command with scripting exit codes, one `Internet:` line in `net status`.
 
-**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". Binding the probe to the connected interface needs `SO_BINDTODEVICE` (CAP_NET_RAW — would break the root-exempt `net portal`) or fragile source-IP games; out of scope. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its line host-wide (`Internet:  ok (default route)`); README, design doc, and `net portal --help` document the semantics.
+**Known product gap (with honest signaling, not silent):** the probe uses the process's normal routing (default route), not the just-connected interface. netop models dual-homing as first-class (wired metric 100 beats WiFi 600), so connecting to a captive WiFi while Ethernet has internet would probe via Ethernet and see "ok". Binding the probe to the connected interface needs `SO_BINDTODEVICE` (CAP_NET_RAW — would break the root-exempt `net portal`) or fragile source-IP games; out of scope. Instead the gap is **signaled**: the connect-time check compares the default route's interface (via `types.RouteManager`) with the just-connected interface and prints a stderr note when they differ; `net status` labels its online line host-wide, naming the route interface when known — `Internet:  ok (default route: eth0)`, plain `(default route)` otherwise; README, design doc, and `net portal --help` document the semantics.
 
 **Tech Stack:** Go stdlib `net/http` + `httptest` (no new dependencies), cobra, testify.
 
@@ -242,6 +242,19 @@ func TestPortalConfigScalarPortalRejected(t *testing.T) {
 		assert.Contains(t, err.Error(), "must be a mapping")
 	}
 }
+
+func TestPortalConfigNullPortalSectionAllowed(t *testing.T) {
+	// yaml.v3 yields exists=true, value=nil for both forms — that is a valid
+	// "stub" (defaults apply), NOT a mapping violation. Guards against a
+	// naive type-switch that rejects nil alongside scalars.
+	for name, y := range map[string]string{
+		"bare key":      "\ncommon:\n  portal:\n",
+		"explicit null": "\ncommon:\n  portal: null\n",
+	} {
+		_, err := loadPortalConfig(t, y)
+		assert.NoError(t, err, name)
+	}
+}
 ```
 
 (Add `"path/filepath"` to the test file's imports if absent.)
@@ -323,7 +336,50 @@ func (p *PortalConfig) CheckDisabled() bool {
 	}
 ```
 
-Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), when the common map contains a `portal` key that is itself a map:
+Add `"portal": true` to `validCommonFields`. In the validation pass where `common` is validated (around `config.go:195`), insert this complete fragment directly after the existing `validateFields("common", commonMap, validCommonFields)` append — it encodes the null-safe branch order, the field validation, and both value checks with their exact messages (adjust only the local `errors` variable name to match the surrounding code):
+
+```go
+	// common.portal: absent or null → defaults; map → validate; else reject.
+	if portalVal, exists := commonMap["portal"]; exists && portalVal != nil {
+		portalMap, ok := portalVal.(map[string]interface{})
+		if !ok {
+			errors = append(errors, ValidationError{
+				Section: "common.portal", Field: "portal",
+				Message: `common.portal must be a mapping with optional "check" and "url" fields`,
+			})
+		} else {
+			errors = append(errors, validateFields("common.portal", portalMap, validPortalFields)...)
+			if checkVal, ok := portalMap["check"]; ok && checkVal != nil {
+				s, isStr := checkVal.(string)
+				norm := strings.ToLower(strings.TrimSpace(s))
+				if !isStr || (norm != "" && norm != "auto" && norm != "off") {
+					errors = append(errors, ValidationError{
+						Section: "common.portal", Field: "check",
+						Message: `common.portal.check must be "auto" or "off"`,
+					})
+				}
+			}
+			if urlVal, ok := portalMap["url"]; ok && urlVal != nil {
+				s, isStr := urlVal.(string)
+				if !isStr {
+					errors = append(errors, ValidationError{
+						Section: "common.portal", Field: "url",
+						Message: "common.portal.url must be a string",
+					})
+				} else if s != "" {
+					if verr := types.ValidatePortalProbeURL(s); verr != nil {
+						errors = append(errors, ValidationError{
+							Section: "common.portal", Field: "url",
+							Message: "common.portal.url: " + verr.Error(),
+						})
+					}
+				}
+			}
+		}
+	}
+```
+
+For reference, the rules this fragment encodes:
 
 1. Require `common.portal` to be **absent, null, or a map**. A scalar or list (`portal: off`, `portal: true`, `portal: [auto]`) appends `ValidationError{Section: "common.portal", Field: "portal", Message: "common.portal must be a mapping with optional \"check\" and \"url\" fields"}` — otherwise mapstructure produces a cryptic decode error or a silent zero struct. Test `TestPortalConfigScalarPortalRejected` covers all three shapes.
 2. Validate its subfields against `validPortalFields` (same `validateFields` helper, section name `common.portal`).
@@ -1040,8 +1096,30 @@ func (d *testPortalDetector) Check() (types.PortalResult, error) {
 	return d.results[i], nil
 }
 
+// portalTestApp is newTestApp with a LOADED (empty) config: RunPortal treats
+// a nil config as "config failed to load" (exit 3), so RunPortal tests other
+// than NoDetector/ConfigLoadFailure need a non-nil one.
+func portalTestApp() (*App, *bytes.Buffer, *bytes.Buffer) {
+	app, stdout, stderr := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}}
+	return app, stdout, stderr
+}
+
+func TestApp_RunPortal_ConfigLoadFailure(t *testing.T) {
+	// nil config = load failure: error out (exit 3), don't probe defaults —
+	// silently probing the DEFAULT URL would mask the user's broken config.
+	app, _, stderr := newTestApp() // testConfigManager{} → GetConfig() == nil
+	det := &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
+	app.PortalDet = det
+
+	_, err := app.RunPortal()
+	assert.Error(t, err)
+	assert.Equal(t, 0, det.calls, "must not probe with defaults when config failed to load")
+	assert.Contains(t, stderr.String(), "configuration failed to load")
+}
+
 func TestApp_RunPortal_Online(t *testing.T) {
-	app, stdout, _ := newTestApp()
+	app, stdout, _ := portalTestApp()
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
 
 	status, err := app.RunPortal()
@@ -1051,7 +1129,7 @@ func TestApp_RunPortal_Online(t *testing.T) {
 }
 
 func TestApp_RunPortal_PortalWithLoginURL(t *testing.T) {
-	app, stdout, _ := newTestApp()
+	app, stdout, _ := portalTestApp()
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
 		Status:    types.PortalStatusPortal,
 		PortalURL: "http://portal.example.com/login",
@@ -1066,7 +1144,7 @@ func TestApp_RunPortal_PortalWithLoginURL(t *testing.T) {
 }
 
 func TestApp_RunPortal_PortalWithoutLoginURL(t *testing.T) {
-	app, stdout, _ := newTestApp()
+	app, stdout, _ := portalTestApp()
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{
 		Status:   types.PortalStatusPortal,
 		ProbeURL: "http://probe.example.com/",
@@ -1079,7 +1157,7 @@ func TestApp_RunPortal_PortalWithoutLoginURL(t *testing.T) {
 }
 
 func TestApp_RunPortal_Offline(t *testing.T) {
-	app, stdout, _ := newTestApp()
+	app, stdout, _ := portalTestApp()
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOffline}}}
 
 	status, err := app.RunPortal()
@@ -1116,7 +1194,7 @@ func TestApp_RunPortal_NoDetector(t *testing.T) {
 }
 
 func TestApp_RunPortal_DetectorError(t *testing.T) {
-	app, _, stderr := newTestApp()
+	app, _, stderr := portalTestApp()
 	app.PortalDet = &testPortalDetector{err: errors.New("probe URL must be plain http")}
 
 	_, err := app.RunPortal()
@@ -1156,6 +1234,14 @@ RunPortal method (near RunStatus):
 func (a *App) RunPortal() (types.PortalStatus, error) {
 	if a.PortalDet == nil {
 		return types.PortalStatusOffline, fmt.Errorf("portal detection not available")
+	}
+	// GetConfig() is nil only when the config file failed to load/validate
+	// (matches RunConnect's convention). Probing silently with the DEFAULT
+	// URL would mask the user's broken portal config — surface it (exit 3).
+	if a.ConfigMgr != nil && a.ConfigMgr.GetConfig() == nil {
+		err := fmt.Errorf("configuration failed to load — fix the config file and retry")
+		a.errorf("Error: %v\n", err)
+		return types.PortalStatusOffline, err
 	}
 	result, err := a.PortalDet.Check()
 	if err != nil {
@@ -2297,3 +2383,14 @@ git commit -m "docs: document net portal command and portal config"
 | 109 | Codex (major) | Visible-ASCII validation admitted raw spaces (0x20); `loginURL` could print space-containing query | **Accepted.** Probe validator requires 0x21..0x7e; `loginURL` also rejects raw spaces; test vectors added. |
 | 110 | Codex (major) | Goal claims "the actual portal login URL" but DNS-hijack portals yield only the probe fallback | **Accepted.** Goal reworded: login URL when supplied via redirect, probe URL otherwise. |
 | 111 | Codex (blocker as filed) | `superpowers:executing-plans` unavailable (third re-raise of #91/#99) | **Defused.** Header now says "when available, otherwise execute tasks in order as written" — plan is self-sufficient in any environment; no further dependency to dispute. |
+
+### Round 11 (2026-07-18) — Codex: REVISE, Grok: REVISE (both with explicit non-objection lists), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 112 | Codex + Grok (major) | `common.portal:` null (bare key / explicit null) allowed in prose but untested — a naive type-switch rejects it | **Accepted.** `TestPortalConfigNullPortalSectionAllowed` (both forms); null-safe branch order now in code, not prose. |
+| 113 | Grok (major) | Raw-map portal validation still prose while everything else is compile-ready | **Accepted.** Complete drop-in fragment for the `common` branch pasted (null check → map assert → field validation → check/url value checks with exact `Message`s). |
+| 114 | Codex (major) | Config load failure silently probes the DEFAULT URL in `net portal`, contradicting exit-3 semantics | **Accepted (RunPortal).** Nil config with live ConfigMgr → error + exit 3, no probe; `TestApp_RunPortal_ConfigLoadFailure`; other RunPortal tests get `portalTestApp()` with a loaded empty config. Connect already refuses nil configs (`app.go:207`); status stays best-effort by design. |
+| 115 | Codex (major) | Label ALL status lines with the default-route iface, not just online | **Rejected:** false-"ok" is the uniquely dangerous outcome (invites no further action); portal/unreachable lines prompt user action regardless of egress, and the connect-time note already fires on every outcome. Suffixing every line is noise. |
+| 116 | Grok (minor) | Header still shows the pre-#101 `(default route)` label | **Accepted.** Header matches Task 5 (`default route: <iface>` when known). |
+| 117 | Codex (minor) | Null-portal handling could be broken by implementing scalar rejection as "not a map ⇒ error" | **Accepted.** Folded into #112's branch-order fragment and test. |
