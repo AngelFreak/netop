@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type CommonConfig struct {
 	Hostname string        `yaml:"hostname" mapstructure:"hostname"`
 	VPN      string        `yaml:"vpn" mapstructure:"vpn"`
 	Timeouts TimeoutConfig `yaml:"timeouts" mapstructure:"timeouts"`
+	Portal   PortalConfig  `yaml:"portal" mapstructure:"portal"`
 }
 
 // TimeoutConfig holds configurable timeout values (in seconds)
@@ -34,6 +36,7 @@ type TimeoutConfig struct {
 	Association int `yaml:"association" mapstructure:"association"` // WiFi association (default: 30s)
 	Command     int `yaml:"command" mapstructure:"command"`         // General command timeout (default: 30s)
 	Carrier     int `yaml:"carrier" mapstructure:"carrier"`         // Carrier detection (default: 5s)
+	Portal      int `yaml:"portal" mapstructure:"portal"`           // Captive portal probe (default: 3s)
 }
 
 // GetDHCPTimeout returns DHCP timeout with default fallback
@@ -66,6 +69,32 @@ func (t *TimeoutConfig) GetCarrierTimeout() time.Duration {
 		return time.Duration(t.Carrier) * time.Second
 	}
 	return 5 * time.Second
+}
+
+// GetPortalTimeout returns the captive-portal probe timeout with default fallback
+func (t *TimeoutConfig) GetPortalTimeout() time.Duration {
+	if t.Portal > 0 {
+		return time.Duration(t.Portal) * time.Second
+	}
+	return 3 * time.Second
+}
+
+// PortalConfig controls captive-portal detection.
+type PortalConfig struct {
+	// Check is "auto" (default: probe after connect and in status) or "off"
+	// (skip those automatic checks; `net portal` always probes on demand).
+	Check string `yaml:"check" mapstructure:"check"`
+	// URL is the plain-http probe endpoint. Empty means the built-in default.
+	// A custom endpoint must respond with HTTP 204 or a 200 whose body is
+	// exactly "success" (surrounding whitespace ignored) when internet works —
+	// anything else is classified as portal/offline.
+	URL string `yaml:"url" mapstructure:"url"`
+}
+
+// CheckDisabled reports whether automatic portal checks are turned off.
+// Case- and whitespace-insensitive so "Off"/" OFF " behave as expected.
+func (p *PortalConfig) CheckDisabled() bool {
+	return strings.EqualFold(strings.TrimSpace(p.Check), "off")
 }
 
 // IgnoredConfig contains interfaces to ignore
@@ -197,6 +226,50 @@ type Logger interface {
 	Info(msg string, fields ...interface{})
 	Warn(msg string, fields ...interface{})
 	Error(msg string, fields ...interface{})
+}
+
+// PortalStatus classifies internet reachability as seen by the portal probe.
+type PortalStatus int
+
+const (
+	// PortalStatusUnknown is the zero value — deliberately NOT online, so a
+	// forgotten status field or future enum value can never fail open into
+	// "internet works". CLI code treats it like offline.
+	PortalStatusUnknown PortalStatus = iota
+	// PortalStatusOnline means the probe returned the expected response — internet works.
+	PortalStatusOnline
+	// PortalStatusPortal means a captive portal intercepted the probe.
+	PortalStatusPortal
+	// PortalStatusOffline means the probe failed or returned a non-portal error
+	// status — no working internet, but no portal positively identified either.
+	PortalStatusOffline
+)
+
+// PortalResult is the outcome of a captive-portal probe.
+//
+// Display-safety contract: implementations MUST only populate PortalURL and
+// ProbeURL with validated absolute http/https URLs that contain no control or
+// format characters — CLI code prints these fields verbatim to the terminal.
+type PortalResult struct {
+	Status PortalStatus
+	// PortalURL is the portal's login URL taken from the redirect Location
+	// header, when the portal provided a usable one. Empty when the portal
+	// didn't redirect (DNS-hijack style) or sent an unusable/unsafe Location —
+	// open ProbeURL in a browser instead.
+	PortalURL string
+	// ProbeURL is the probe endpoint that was used. When PortalURL is empty,
+	// opening ProbeURL in a browser will trigger the portal's redirect.
+	ProbeURL string
+}
+
+// PortalDetector probes for internet connectivity and captive portals.
+// Transport failures and unexpected error statuses are reported as
+// PortalStatusOffline, not as errors; Check returns a non-nil error only for
+// misconfiguration (e.g. an https probe URL, which portals cannot intercept).
+// The probe uses the process's normal routing (default route); it is not
+// bound to a specific interface.
+type PortalDetector interface {
+	Check() (PortalResult, error)
 }
 
 // WiFiManager handles WiFi operations

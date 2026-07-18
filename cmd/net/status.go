@@ -8,7 +8,7 @@ import (
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Show full network status (connection, VPN, hotspot, DHCP)",
+	Short: "Show full network status (connection, internet/captive portal, VPN, hotspot, DHCP)",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := createApp().RunStatus(); err != nil {
 			os.Exit(1)

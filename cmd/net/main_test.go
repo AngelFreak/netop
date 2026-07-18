@@ -1,10 +1,13 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -27,6 +30,8 @@ func TestCommandNeedsRootArgs(t *testing.T) {
 		{"--iface=value equals form then status stays exempt", []string{"--iface=wlp1s0", "status"}, false},
 		{"--iface value then connect still needs root", []string{"--iface", "wlp1s0", "home"}, true},
 		{"debug flag then status stays exempt", []string{"--debug", "status"}, false},
+		{"portal is exempt", []string{"portal"}, false},
+		{"portal with iface flag is exempt", []string{"--iface", "wlan0", "portal"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -88,4 +93,29 @@ func TestSelectDefaultInterface(t *testing.T) {
 		assert.Equal(t, "wlan0", iface)
 		assert.Equal(t, "", why)
 	})
+}
+
+func TestCreatePortalDetector_UsesConfigURLAndTimeout(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	oldCfg := cfgManager
+	defer func() { cfgManager = oldCfg }()
+	cfgManager = &testConfigManager{config: &types.Config{
+		Common: types.CommonConfig{
+			Portal:   types.PortalConfig{URL: srv.URL},
+			Timeouts: types.TimeoutConfig{Portal: 1},
+		},
+	}}
+
+	det := createPortalDetector()
+	result, err := det.Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOnline, result.Status)
+	assert.Equal(t, 1, hits, "detector must probe the CONFIGURED url, not the default")
+	assert.Equal(t, srv.URL, result.ProbeURL)
 }

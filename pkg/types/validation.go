@@ -3,6 +3,7 @@ package types
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -134,4 +135,65 @@ func ValidateDNSServer(server string) error {
 		return fmt.Errorf("invalid DNS server IP address: %s", server)
 	}
 	return nil
+}
+
+// ValidatePortalProbeURL reports whether raw is acceptable as a captive-portal
+// probe endpoint: printable ASCII only in the RAW string (the CLI prints the
+// configured URL verbatim — this rules out control bytes, bidi/format runes,
+// and IDN-confusable hostnames in one check), parseable, plain http (portals
+// cannot intercept https), non-empty host, no userinfo. Shared by config
+// load-time validation and the detector's runtime guard.
+func ValidatePortalProbeURL(raw string) error {
+	for _, r := range raw {
+		// Visible ASCII only (0x21..0x7e): also excludes raw spaces, which
+		// URL.String() can preserve in queries and which break copy/paste.
+		if r < 0x21 || r > 0x7e {
+			return fmt.Errorf("portal probe URL must be visible ASCII with no spaces")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid portal probe URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" {
+		return fmt.Errorf("portal probe URL must be plain http, got %q — portals cannot intercept %s", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("portal probe URL %q has no host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("portal probe URL %q must not contain userinfo", raw)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("portal probe URL %q must not contain a fragment — fragments are never sent over HTTP", raw)
+	}
+	if HasPercentEncodedControl(raw) {
+		return fmt.Errorf("portal probe URL must not contain percent-encoded control bytes")
+	}
+	return nil
+}
+
+// HasPercentEncodedControl reports whether s contains a percent-encoded C0
+// control or DEL (%00-%1F, %7F), case-insensitively. Shared by the probe-URL
+// validator and pkg/portal's loginURL — downstream tooling may decode these
+// even though they are inert on the terminal as-is.
+func HasPercentEncodedControl(s string) bool {
+	ls := strings.ToLower(s)
+	for i := 0; i+2 < len(ls); i++ {
+		if ls[i] != '%' {
+			continue
+		}
+		h := ls[i+1 : i+3]
+		if !isHexDigit(h[0]) || !isHexDigit(h[1]) {
+			continue
+		}
+		if h == "7f" || h[0] == '0' || h[0] == '1' {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
@@ -22,11 +23,18 @@ type App struct {
 	NetworkMgr types.NetworkManager // Network configuration (DNS, MAC, routes)
 	HotspotMgr types.HotspotManager // WiFi hotspot management
 	DHCPMgr    types.DHCPManager    // DHCP server management
+	PortalDet  types.PortalDetector // Captive portal / connectivity probing
+	RouteMgr   types.RouteManager   // Route inspection for multi-home signaling (nil-safe)
 
 	// Runtime configuration
 	Interface string // Primary network interface to use
 	NoVPN     bool   // When true, skip automatic VPN connection
 	Debug     bool   // Enable debug output
+
+	// PortalRetryDelay is the settle delay before the one connect-time retry
+	// when the first portal probe reports offline. Zero means the 500ms
+	// default; tests set 1ms.
+	PortalRetryDelay time.Duration
 
 	// Output streams for testability
 	Stdout io.Writer // Standard output (default: os.Stdout)
@@ -80,32 +88,129 @@ func (a *App) attemptVPNConnect(vpnName string) {
 	}
 }
 
-// connectVPN connects to VPN if configured for the network.
-// Uses MergeWithCommon to properly handle VPN inheritance:
+// resolveVPNName resolves the VPN name for a network, handling inheritance:
 //   - vpn: some-vpn → uses that VPN
 //   - vpn: (empty)  → disables VPN (won't inherit from common)
 //   - no vpn key    → inherits from common.vpn
 //
-// Does nothing if no VPN is configured or if the config is nil.
-func (a *App) connectVPN(networkName string) {
+// Returns "" when no VPN is configured or the config is nil. Replaces the
+// former connectVPN (RunConnect was its only production caller and now calls
+// attemptVPNConnect itself so the portal hint and the VPN attempt resolve the
+// name exactly once).
+func (a *App) resolveVPNName(networkName string) string {
+	if a.ConfigMgr == nil {
+		return ""
+	}
 	config := a.ConfigMgr.GetConfig()
 	if config == nil {
-		return
+		return ""
 	}
-
-	// Use MergeWithCommon for VPN inheritance logic
 	if netConfig, ok := config.Networks[networkName]; ok {
-		merged := a.ConfigMgr.MergeWithCommon(networkName, &netConfig)
-		if merged.VPN != "" {
-			a.attemptVPNConnect(merged.VPN)
-		}
-		return
+		return a.ConfigMgr.MergeWithCommon(networkName, &netConfig).VPN
 	}
+	return config.Common.VPN
+}
 
-	// Network not in config, fall back to common VPN
-	if config.Common.VPN != "" {
-		a.attemptVPNConnect(config.Common.VPN)
+// portalCheckEnabled reports whether automatic portal probing is enabled
+// (a detector is wired and config doesn't say check: off).
+func (a *App) portalCheckEnabled() bool {
+	if a.PortalDet == nil {
+		return false
 	}
+	if a.ConfigMgr != nil {
+		cfg := a.ConfigMgr.GetConfig()
+		if cfg == nil {
+			// Config failed to load: the user's portal policy (check: off,
+			// custom URL) is unknown — probing with substituted defaults
+			// could report "ok" against their intent. The load error was
+			// already surfaced by the loader; skip automatic probes.
+			return false
+		}
+		if cfg.Common.Portal.CheckDisabled() {
+			return false
+		}
+	}
+	return true
+}
+
+// checkPortalAfterConnect probes for a captive portal right after a
+// connection comes up on connectedIface. An initial "offline" gets one retry
+// after a short settle delay — right after DHCP, routes/DNS can lag by a few
+// hundred ms and a premature warning trains users to ignore it. When the
+// default route egresses a different interface than the one just connected
+// (dual-homed: wired metric 100 beats WiFi 600), the probe result describes
+// the wrong path — say so instead of reporting a silent false "ok". When a
+// VPN is configured (vpnConfigured), an offline verdict is expected on
+// VPN-required networks, so the offline warning is demoted to debug — the
+// upcoming VPN attempt is the meaningful signal. Never fatal — prints
+// warnings to stderr only. Reports whether a portal was detected so
+// RunConnect can add a VPN hint.
+func (a *App) checkPortalAfterConnect(connectedIface string, vpnConfigured bool) bool {
+	if !a.portalCheckEnabled() {
+		return false
+	}
+	// Honest multi-home signaling: the probe follows the kernel's preferred
+	// default route (lowest metric — wired 100 beats WiFi 600), which may
+	// not be the just-connected interface. (This note is part of the
+	// automatic portal check: check: off disables it together with the
+	// probe it annotates.) Any outcome via the wrong link
+	// misleads (false ok, false offline, or a portal URL for the wrong
+	// network), so the note prints regardless of the probe result.
+	// NB: RouteMgr.GetDefaultRoute() returns the FIRST default in the
+	// netlink dump, not the preferred one — use preferredDefaultIface.
+	// The comparison is IPv4-main-table only (ListRoutes' scope); the note
+	// says "IPv4 default route" so a dual-stack IPv6 egress isn't overclaimed.
+	if iface := a.preferredDefaultIface(); iface != "" && connectedIface != "" && iface != connectedIface {
+		a.errorf("Note: the portal probe follows the preferred IPv4 default route (%s), not the just-connected %s — portal detection for %s is unreliable while %s stays preferred. Disable/unplug %s or open a browser while on %s.\n", iface, connectedIface, connectedIface, iface, iface, connectedIface)
+	}
+	result, err := a.PortalDet.Check()
+	if err != nil {
+		// Check errors mean misconfiguration (e.g. https probe URL) — the
+		// user asked for auto-checks, so a silent skip would look like "no
+		// portal". Surface it, but never fail the connect.
+		a.errorf("Warning: portal probe misconfigured: %v\n", err)
+		return false
+	}
+	if result.Status == types.PortalStatusOffline {
+		delay := a.PortalRetryDelay
+		if delay == 0 {
+			delay = 500 * time.Millisecond
+		}
+		time.Sleep(delay)
+		retry, retryErr := a.PortalDet.Check()
+		if retryErr != nil {
+			// Transient detector failure on the retry: don't warn "offline"
+			// based on a half-completed check.
+			a.Logger.Debug("Portal re-check failed", "error", retryErr)
+			return false
+		}
+		result = retry
+	}
+	switch result.Status {
+	case types.PortalStatusPortal:
+		if result.PortalURL != "" {
+			a.errorf("Warning: captive portal detected — log in at: %s\n", result.PortalURL)
+		} else {
+			a.errorf("Warning: captive portal detected — open %s in a browser to log in\n", result.ProbeURL)
+		}
+		return true
+	case types.PortalStatusOffline:
+		if vpnConfigured {
+			// VPN-required networks legitimately look offline pre-VPN;
+			// warning here would be noise before the meaningful attempt.
+			a.Logger.Debug("No internet before VPN attempt — VPN may provide connectivity")
+		} else {
+			a.errorf("Warning: no internet connectivity detected\n")
+		}
+	case types.PortalStatusOnline:
+		// nothing to warn about
+	default:
+		// Unknown or any future status: fail closed, mirroring RunPortal
+		// and RunStatus (#93) — a silent no-op here would read as a clean
+		// connect with working internet.
+		a.errorf("Warning: internet connectivity could not be determined\n")
+	}
+	return false
 }
 
 // RunList lists active network connections with their IP, gateway, and DNS info.
@@ -280,9 +385,20 @@ func (a *App) RunConnect(name, password string) error {
 	// Display connection information (includes "Connected!" message)
 	a.printConnectionInfo(connectedIface)
 
-	// Connect VPN if configured and not disabled
+	// Resolve the VPN name once, before the portal check, so the hint, the
+	// offline-warning suppression, and the attempt can never disagree.
+	vpnName := ""
 	if !a.NoVPN {
-		a.connectVPN(configName)
+		vpnName = a.resolveVPNName(configName)
+	}
+
+	portalDetected := a.checkPortalAfterConnect(connectedIface, vpnName != "")
+
+	if vpnName != "" {
+		if portalDetected {
+			a.errorf("Note: the VPN may not come up until the portal login is complete.\n")
+		}
+		a.attemptVPNConnect(vpnName)
 	}
 	return nil
 }
@@ -597,6 +713,85 @@ func (a *App) RunShow(networkName string) error {
 	return nil
 }
 
+// RunPortal probes for internet connectivity and captive portals, printing
+// the portal login URL when one is detected. Returns the detected status so
+// the CLI can map it to scripting-friendly exit codes; the status is only
+// meaningful when err is nil.
+func (a *App) RunPortal() (types.PortalStatus, error) {
+	if a.PortalDet == nil {
+		return types.PortalStatusOffline, fmt.Errorf("portal detection not available")
+	}
+	// GetConfig() is nil only when the config file failed to load/validate
+	// (matches RunConnect's convention). Probing silently with the DEFAULT
+	// URL would mask the user's broken portal config — surface it (exit 3).
+	if a.ConfigMgr != nil && a.ConfigMgr.GetConfig() == nil {
+		err := fmt.Errorf("configuration failed to load — fix the config file and retry")
+		a.errorf("Error: %v\n", err)
+		return types.PortalStatusOffline, err
+	}
+	result, err := a.PortalDet.Check()
+	if err != nil {
+		a.errorf("Error: %v\n", err)
+		return types.PortalStatusOffline, err
+	}
+	// Like status (#128), every outcome names the probed route when known —
+	// this command has no connect-time multi-home note either.
+	routeSuffix := ""
+	if iface := a.preferredDefaultIface(); iface != "" {
+		routeSuffix = fmt.Sprintf(" (default IPv4 route: %s)", iface)
+	}
+	switch result.Status {
+	case types.PortalStatusPortal:
+		a.printf("Captive portal detected!%s\n", routeSuffix)
+		if result.PortalURL != "" {
+			a.printf("  Log in at: %s\n", result.PortalURL)
+		} else {
+			a.printf("  Open %s in a browser to trigger the portal login page\n", result.ProbeURL)
+		}
+	case types.PortalStatusOnline:
+		a.printf("Internet: ok%s\n", routeSuffix)
+	default:
+		// Offline, Unknown, and any future status: never fail open into
+		// "ok". Neutral copy — Offline covers both no-response and HTTP
+		// error statuses from the probe endpoint.
+		a.printf("Internet: unreachable%s\n", routeSuffix)
+	}
+	return result.Status, nil
+}
+
+// preferredDefaultIface returns the outgoing interface of the LOWEST-metric
+// IPv4 default route — the kernel's preferred IPv4 path. Heuristic for the
+// route labels and the connect-time honesty note only: the probe may resolve
+// AAAA and egress IPv6 on a dual-stack host, which this cannot see
+// (ListRoutes is IPv4 main table). Returns "" when unknown (nil RouteMgr,
+// netlink error, or no default route). GetDefaultRoute is NOT used: it
+// returns the first default in the netlink dump, which on a dual-homed
+// machine may be the higher-metric one.
+func (a *App) preferredDefaultIface() string {
+	if a.RouteMgr == nil {
+		return ""
+	}
+	routes, err := a.RouteMgr.ListRoutes()
+	if err != nil {
+		return ""
+	}
+	// ListRoutes is already scoped to the IPv4 main table; types.Route
+	// carries no family/table/scope fields, so metric is the only selector
+	// available. Ties keep the first seen (kernel dump order) — deterministic
+	// per dump, and good enough for an advisory label.
+	best := ""
+	bestMetric := -1
+	for _, r := range routes {
+		if !r.IsDefault() || r.Iface == "" {
+			continue
+		}
+		if bestMetric == -1 || r.Metric < bestMetric {
+			best, bestMetric = r.Iface, r.Metric
+		}
+	}
+	return best
+}
+
 // RunStatus displays comprehensive network status including:
 // hostname, interface, MAC address, WiFi connection, VPN status,
 // hotspot status, and DHCP server status.
@@ -670,6 +865,51 @@ func (a *App) RunStatus() error {
 		}
 	} else {
 		a.println("State:     disconnected")
+	}
+
+	// Internet reachability / captive portal (skipped when portal.check: off)
+	if a.portalCheckEnabled() {
+		result, err := a.PortalDet.Check()
+		switch {
+		case err != nil:
+			// Misconfigured probe must be visible, not indistinguishable
+			// from check: off. Labeled like every other outcome (#128).
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  probe error (%v) (default IPv4 route: %s)\n", err, iface)
+			} else {
+				a.printf("Internet:  probe error (%v)\n", err)
+			}
+		case result.Status == types.PortalStatusPortal:
+			url := result.PortalURL
+			if url == "" {
+				url = result.ProbeURL
+			}
+			// Status has no connect-time route note, so every line names
+			// the probed route when known — a portal/unreachable verdict
+			// via the wrong link misleads just like a false ok. "IPv4"
+			// keeps the claim at the heuristic's actual confidence.
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  captive portal (%s) (default IPv4 route: %s)\n", url, iface)
+			} else {
+				a.printf("Internet:  captive portal (%s)\n", url)
+			}
+		case result.Status == types.PortalStatusOnline:
+			// Labeled host-wide: the probe follows the default route and is
+			// not scoped to the Interface: shown above (which may even be
+			// disconnected while another link provides internet).
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  ok (default IPv4 route: %s)\n", iface)
+			} else {
+				a.printf("Internet:  ok (default route)\n")
+			}
+		default:
+			// Offline, Unknown, and any future status — never fail open.
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  unreachable (default IPv4 route: %s)\n", iface)
+			} else {
+				a.printf("Internet:  unreachable\n")
+			}
+		}
 	}
 
 	// VPN status

@@ -14,7 +14,9 @@ import (
 	"github.com/angelfreak/net/pkg/dhcp"
 	"github.com/angelfreak/net/pkg/dhcpclient"
 	"github.com/angelfreak/net/pkg/hotspot"
+	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/network"
+	"github.com/angelfreak/net/pkg/portal"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/angelfreak/net/pkg/vpn"
@@ -127,7 +129,7 @@ func commandNeedsRootArgs(args []string) bool {
 		}
 		// First positional arg is the subcommand — check if it's root-exempt
 		switch arg {
-		case "help", "completion", "status", "show", "list":
+		case "help", "completion", "status", "show", "list", "portal":
 			return false
 		default:
 			// First positional arg is not exempt, needs root
@@ -278,12 +280,27 @@ func createApp() *App {
 		NetworkMgr: netMgr,
 		HotspotMgr: hotspotMgr,
 		DHCPMgr:    dhcpMgr,
+		PortalDet:  createPortalDetector(),
+		RouteMgr:   netlink.NewRouteManager(),
 		Interface:  iface,
 		NoVPN:      noVPN,
 		Debug:      debug,
 		Stdout:     os.Stdout,
 		Stderr:     os.Stderr,
 	}
+}
+
+// createPortalDetector builds the portal detector from config. Config is
+// loaded by PersistentPreRun (initializeManagers) before any command Run
+// calls createApp, so the nil-config fallback only covers load failures.
+func createPortalDetector() types.PortalDetector {
+	probeURL := ""
+	timeout := (&types.TimeoutConfig{}).GetPortalTimeout()
+	if cfg := cfgManager.GetConfig(); cfg != nil {
+		probeURL = cfg.Common.Portal.URL
+		timeout = cfg.Common.Timeouts.GetPortalTimeout()
+	}
+	return portal.New(probeURL, timeout, logger)
 }
 
 // findDefaultInterface picks the primary network interface by reading sysfs
