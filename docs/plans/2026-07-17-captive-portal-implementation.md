@@ -584,18 +584,37 @@ func TestCheck_Online_SuccessBody(t *testing.T) {
 	assert.Equal(t, types.PortalStatusOnline, result.Status)
 }
 
-func TestCheck_Portal_RedirectAbsolute(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "http://portal.example.com/login?res=notyet")
-		w.WriteHeader(http.StatusFound)
-	}))
-	defer srv.Close()
+func TestCheck_Portal_AllRedirectStatuses(t *testing.T) {
+	// Every status the classifier treats as interception evidence.
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", "http://portal.example.com/login?res=notyet")
+			w.WriteHeader(status)
+		}))
 
-	result, err := newTestDetector(srv.URL).Check()
-	assert.NoError(t, err)
-	assert.Equal(t, types.PortalStatusPortal, result.Status)
-	assert.Equal(t, "http://portal.example.com/login?res=notyet", result.PortalURL)
-	assert.Equal(t, srv.URL, result.ProbeURL)
+		result, err := newTestDetector(srv.URL).Check()
+		srv.Close()
+		assert.NoError(t, err, "status %d", status)
+		assert.Equal(t, types.PortalStatusPortal, result.Status, "status %d", status)
+		assert.Equal(t, "http://portal.example.com/login?res=notyet", result.PortalURL, "status %d", status)
+		assert.Equal(t, srv.URL, result.ProbeURL, "status %d", status)
+	}
+}
+
+func TestCheck_Offline_NonRedirect3xx(t *testing.T) {
+	// 3xx without interception semantics (caching / reserved / deprecated)
+	// must classify offline even WITH a Location header present.
+	for _, status := range []int{300, 304, 305} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", "http://portal.example.com/login")
+			w.WriteHeader(status)
+		}))
+
+		result, err := newTestDetector(srv.URL).Check()
+		srv.Close()
+		assert.NoError(t, err, "status %d", status)
+		assert.Equal(t, types.PortalStatusOffline, result.Status, "status %d", status)
+	}
 }
 
 func TestCheck_Portal_RedirectRelative(t *testing.T) {
@@ -1064,40 +1083,7 @@ func (d *Detector) Check() (types.PortalResult, error) {
 	return types.PortalResult{Status: types.PortalStatusPortal, ProbeURL: d.probeURL}, nil
 }
 
-	if u.Fragment != "" {
-		return fmt.Errorf("portal probe URL %q must not contain a fragment — fragments are never sent over HTTP", raw)
-	}
-	if HasPercentEncodedControl(raw) {
-		return fmt.Errorf("portal probe URL must not contain percent-encoded control bytes")
-	}
-	return nil
-}
-
-// HasPercentEncodedControl reports whether s contains a percent-encoded C0
-// control or DEL (%00-%1F, %7F), case-insensitively. Shared by the probe-URL
-// validator and pkg/portal's loginURL — downstream tooling may decode these
-// even though they are inert on the terminal as-is.
-func HasPercentEncodedControl(s string) bool {
-	ls := strings.ToLower(s)
-	for i := 0; i+2 < len(ls); i++ {
-		if ls[i] != '%' {
-			continue
-		}
-		h := ls[i+1 : i+3]
-		if !isHexDigit(h[0]) || !isHexDigit(h[1]) {
-			continue
-		}
-		if h == "7f" || h[0] == '0' || h[0] == '1' {
-			return true
-		}
-	}
-	return false
-}
-
-func isHexDigit(c byte) bool {
-	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
-}
-```// isRedirectStatus reports whether status is a redirect that carries
+// isRedirectStatus reports whether status is a redirect that carries
 // interception semantics. Deliberately NOT all of 3xx: 304 Not Modified is a
 // caching intermediary, and 300/305/306 carry no portal meaning — treating
 // them as portals would violate the positive-evidence rule.
@@ -1502,9 +1488,45 @@ func init() {
 }
 ```
 
+Wiring test — locks `createPortalDetector` to the config (a refactor that
+hard-codes defaults must fail red). It manipulates the package-global
+`cfgManager`, so restore it:
+
+```go
+func TestCreatePortalDetector_UsesConfigURLAndTimeout(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	oldCfg := cfgManager
+	defer func() { cfgManager = oldCfg }()
+	cfgManager = &testConfigManager{config: &types.Config{
+		Common: types.CommonConfig{
+			Portal:   types.PortalConfig{URL: srv.URL},
+			Timeouts: types.TimeoutConfig{Portal: 1},
+		},
+	}}
+
+	det := createPortalDetector()
+	result, err := det.Check()
+	assert.NoError(t, err)
+	assert.Equal(t, types.PortalStatusOnline, result.Status)
+	assert.Equal(t, 1, hits, "detector must probe the CONFIGURED url, not the default")
+	assert.Equal(t, srv.URL, result.ProbeURL)
+}
+```
+
+(`cfgManager` is typed as the concrete config manager in main.go — if the
+assignment above doesn't compile, retype the global as `types.ConfigManager`,
+which `initializeManagers` already satisfies. Add `net/http`/`httptest`
+imports to `cmd/net`'s test file if absent.)
+
 **Step 4: Run to verify pass**
 
-Run: `go test ./cmd/net/ -run 'TestApp_RunPortal|TestCommandNeedsRootArgs' -v && go build ./...`
+Run: `go test ./cmd/net/ -run 'TestApp_RunPortal|TestCommandNeedsRootArgs|TestCreatePortalDetector' -v && go build ./...`
 Expected: PASS, clean build — `net portal` works end-to-end from this commit on
 
 **Step 5: Commit**
@@ -1803,6 +1825,7 @@ func TestApp_RunConnect_RetryErrorNoOfflineWarning(t *testing.T) {
 func TestApp_RunStatus_ProbeErrorLine(t *testing.T) {
 	app, stdout, _ := newTestApp()
 	app.ConfigMgr = &testConfigManager{config: &types.Config{}} // loaded config: auto-probe allowed
+	app.RouteMgr = nil // pinned: expected string is the route-unlabeled form
 	app.PortalDet = &testPortalDetector{err: errors.New("probe URL must be plain http")}
 
 	err := app.RunStatus()
@@ -2380,8 +2403,12 @@ In `RunStatus`, insert AFTER the ENTIRE connection-info if/else (i.e. outside bo
 		switch {
 		case err != nil:
 			// Misconfigured probe must be visible, not indistinguishable
-			// from check: off.
-			a.printf("Internet:  probe error (%v)\n", err)
+			// from check: off. Labeled like every other outcome (#128).
+			if iface := a.preferredDefaultIface(); iface != "" {
+				a.printf("Internet:  probe error (%v) (default IPv4 route: %s)\n", err, iface)
+			} else {
+				a.printf("Internet:  probe error (%v)\n", err)
+			}
 		case result.Status == types.PortalStatusPortal:
 			url := result.PortalURL
 			if url == "" {
@@ -2433,9 +2460,14 @@ git commit -m "feat(cli): portal check after connect and Internet line in status
 ### Task 6: docs
 
 **Files:**
+- Modify: `cmd/net/status.go` (Short text)
 - Modify: `README.md` (command list + config reference; grep for existing `timeouts` docs)
 - Modify: `config.example` (portal + timeouts.portal entries)
 - Modify: `docs/plans/2026-07-17-captive-portal-design.md` (sync review-driven changes)
+
+**Step 0: CLI short help** — `cmd/net/status.go`: update `statusCmd.Short` to
+`"Show full network status (connection, internet/captive portal, VPN, hotspot, DHCP)"`
+so `net status -h` and completion summaries reflect the new Internet line.
 
 **Step 1: README** — add `net portal` to the commands section (exit codes 0/2/1/3, the default-route limitation, and the connect-time latency bound: worst case ≈ settle 500ms + 2× portal timeout when the network is truly offline — the retry is deliberately unconditional; refused/no-route probes fail in milliseconds so the full cost only hits blackholed networks). Note that `timeouts.*` subfields remain historically unvalidated (a `timeouts.portl` typo silently falls back to the 3s default) — tightening that is out of scope for this feature (pre-existing behavior; changing it could break configs that load today). Add to BOTH the README config reference and `config.example` (users copy the example):
 
@@ -2710,3 +2742,13 @@ git commit -m "docs: document net portal command and portal config"
 | 146 | Grok (major) | All-outcome status labels (#128/#134) locked only for Online | **Accepted.** `TestApp_RunStatus_PortalNamesDefaultRouteIface` + `UnreachableNamesDefaultRouteIface` with full-string assertions. |
 | 147 | Grok (minor) | `OnlineLabeledHostWide` missing the #133 RouteMgr pin | **Accepted.** Pinned nil. |
 | 148 | Grok (minor) | No User-Agent consideration | **Accepted (documented).** Default Go UA kept deliberately; comment notes the revisit condition. |
+
+### Round 16 (2026-07-18) — Codex: REVISE, **Grok: APPROVE** (assembled Task 3's fences into a module; all tests pass), Claude self-review: APPROVE
+
+| # | Source | Objection | Resolution |
+|---|--------|-----------|------------|
+| 149 | Codex (blocker ×2) | Edit debris: orphaned validator fragment + duplicated helper inside the Task 3 fence; stray fence-close stranded `isRedirectStatus`/`loginURL` outside the block | **Accepted.** Debris removed; single `types.HasPercentEncodedControl` definition remains; fence walker re-verified balanced; Grok's independent compile confirms Task 3 assembles and passes. |
+| 150 | Codex (major) | Redirect classification locked only via 302 and 304 | **Accepted.** Table tests: 301/302/303/307/308 → portal; 300/304/305 (with Location!) → offline. |
+| 151 | Grok (minor) | `probe error` status line unlabeled, breaking the every-outcome rule | **Accepted.** Labeled when the route is known; ProbeErrorLine test pinned to the unlabeled form. |
+| 152 | Grok (minor) | `createPortalDetector` config wiring untested — hard-coded defaults would stay green | **Accepted.** `TestCreatePortalDetector_UsesConfigURLAndTimeout` probes a live httptest server through the configured URL. |
+| 153 | Grok (minor) | `statusCmd.Short` stays stale after status grows the Internet line | **Accepted.** Task 6 Step 0 updates the Short text. |
