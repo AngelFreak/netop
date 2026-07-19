@@ -1972,3 +1972,42 @@ func (w *interruptingWiFiManager) Connect(ssid, password, hostname string) error
 	w.reg.run(time.Second) // interrupt fires mid-connect
 	return w.connectErr
 }
+
+func TestApp_RunConnect_InterruptDuringVPNKeepsWiFi(t *testing.T) {
+	// Once WiFi is established, `net connect` semantics match a VPN failure:
+	// the connection stays up. An interrupt during a hanging VPN bring-up must
+	// therefore NOT tear down the healthy WiFi — the abort action has to be
+	// deregistered at establishment, not at RunConnect return.
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Networks: map[string]types.NetworkConfig{"home": {SSID: "Home", VPN: "myvpn"}},
+			VPN:      map[string]types.VPNConfig{"myvpn": {Type: "wireguard"}},
+		},
+		networkConfig: &types.NetworkConfig{SSID: "Home", VPN: "myvpn"},
+	}
+	wifi := &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.WiFiMgr = wifi
+	app.VPNMgr = &interruptingVPNManager{reg: reg}
+
+	err := app.RunConnect("home", "")
+	assert.NoError(t, err)
+	assert.False(t, wifi.disconnectCalled, "interrupt during VPN must not tear down established WiFi")
+	assert.Equal(t, 0, reg.Len())
+}
+
+// interruptingVPNManager drains the cleanup registry during VPN Connect to
+// model a signal handler firing during VPN bring-up, after WiFi is up.
+type interruptingVPNManager struct {
+	testVPNManager
+	reg *cleanupRegistry
+}
+
+func (v *interruptingVPNManager) Connect(name string) error {
+	v.reg.run(time.Second) // interrupt fires during VPN bring-up
+	return nil
+}
