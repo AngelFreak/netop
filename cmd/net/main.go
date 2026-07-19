@@ -194,31 +194,33 @@ func main() {
 		}
 	}
 
-	// Setup signal handler for graceful cleanup on Ctrl+C / SIGTERM.
-	// This ensures wpa_supplicant, dhclient/udhcpc, and resolv.conf are
-	// cleaned up if the user interrupts a long-running operation (e.g.,
-	// the 30s association wait during connect).
+	// Setup signal handler for graceful cleanup on Ctrl+C / SIGTERM. Cleanup
+	// only undoes state that an in-flight mutating command registered (see the
+	// cleanupRegistry.register call sites in app.go) — read-only commands
+	// register nothing, so interrupting a scan/list/status leaves a healthy
+	// connection untouched.
 	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		// stage 2 propagates ctx to running executor calls so cleanup runs
+		// against a settled command; cancel now so nothing new starts.
 		cancel()
-		// Best-effort cleanup so the system isn't left in a dirty state.
-		if sysExecutor != nil && logger != nil {
-			logger.Debug("Signal received, cleaning up")
-			// Unlock resolv.conf so DNS isn't permanently broken
-			_ = system.SetImmutable("/etc/resolv.conf", false)
-			// Kill any wpa_supplicant/dhclient we may have started
-			if iface != "" {
-				sysExecutor.ExecuteWithTimeout(1*time.Second, "wpa_cli", "-i", iface, "terminate")
-				sysExecutor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-f", "dhclient.*"+iface)
-				sysExecutor.ExecuteWithTimeout(500*time.Millisecond, "pkill", "-f", "udhcpc.*"+iface)
-			}
+		if logger != nil {
+			logger.Debug("Interrupt received, cleaning up")
 		}
+		fmt.Fprintln(os.Stderr, "interrupt received, cleaning up")
+		// A second signal during cleanup means the user wants out now —
+		// abandon remaining cleanup and exit immediately.
+		go func() {
+			<-sigCh
+			os.Exit(130)
+		}()
+		defaultCleanups.run(5 * time.Second)
 		os.Exit(130) // Standard exit code for SIGINT
 	}()
-	_ = ctx // available for future use with ExecuteContext
+	_ = ctx // stage 2 will pass this to ExecuteContext for cooperative cancel
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)

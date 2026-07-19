@@ -37,9 +37,23 @@ type App struct {
 	// default; tests set 1ms.
 	PortalRetryDelay time.Duration
 
+	// cleanups holds interrupt-cleanup actions for mutating commands. Nil means
+	// the process-wide defaultCleanups the signal handler drains; tests inject
+	// a private registry to assert registration without touching the global.
+	cleanups *cleanupRegistry
+
 	// Output streams for testability
 	Stdout io.Writer // Standard output (default: os.Stdout)
 	Stderr io.Writer // Standard error (default: os.Stderr)
+}
+
+// cleanupRegistry returns the registry for interrupt cleanups, defaulting to
+// the process-wide one the signal handler drains.
+func (a *App) cleanupRegistry() *cleanupRegistry {
+	if a.cleanups != nil {
+		return a.cleanups
+	}
+	return defaultCleanups
 }
 
 // printf writes formatted output to stdout
@@ -289,6 +303,21 @@ func (a *App) RunScan(showOpen bool) error {
 func (a *App) RunConnect(name, password string) error {
 	a.Logger.Debug("Connect command called", "name", name)
 
+	// Register an abort action so an interrupt mid-connect restores consistent
+	// state: WiFiMgr.Disconnect terminates wpa_supplicant + DHCP clients
+	// natively, flushes addrs/routes, brings the iface down, and removes the
+	// temp wpa config. Deregistered on every return (success and error) so a
+	// completed connect isn't torn down by a later Ctrl-C.
+	abortConnect := a.cleanupRegistry().register("abort-connect", func() {
+		_ = a.WiFiMgr.Disconnect()
+	})
+	// Safety net for error returns; the primary deregistration happens at
+	// establishment (below), so an interrupt during the portal check or VPN
+	// bring-up behaves like a VPN failure — the healthy WiFi stays up.
+	defer abortConnect()
+	unlockDNS := func() {}         // assigned in the direct-SSID path, deregistered with abortConnect
+	defer func() { unlockDNS() }() // closure: picks up the reassigned deregister on error returns
+
 	// Disconnect any active VPN before connecting to new network
 	// This prevents stale VPN routes/interfaces from interfering.
 	// Skip if --no-vpn is set — user wants to keep their VPN alive.
@@ -350,6 +379,15 @@ func (a *App) RunConnect(name, password string) error {
 		}
 		connectedIface = a.WiFiMgr.GetInterface()
 
+		// LockDNS makes resolv.conf immutable — intentional persistent state on
+		// success. Register an unlock BEFORE locking so an interrupt during a
+		// later stage (portal/VPN) doesn't leave DNS permanently frozen;
+		// deregistered at the end of the success path so the lock persists when
+		// the connect completes. (This is the only LockDNS call site.)
+		unlockDNS = a.cleanupRegistry().register("unlock-resolv.conf", func() {
+			_ = system.SetImmutable("/etc/resolv.conf", false)
+		})
+
 		// Lock resolv.conf after DHCP writes DNS to prevent external tools
 		// (like netbird) from overwriting with their own DNS servers
 		a.NetworkMgr.LockDNS()
@@ -385,6 +423,13 @@ func (a *App) RunConnect(name, password string) error {
 
 	// Display connection information (includes "Connected!" message)
 	a.printConnectionInfo(connectedIface)
+
+	// WiFi is established: the connect is complete for cleanup purposes.
+	// Deregister now so an interrupt during the (read-only) portal check or
+	// the VPN attempt keeps the connection and its DNS lock, matching the
+	// VPN-failure semantics. Deregister is idempotent with the defers above.
+	abortConnect()
+	unlockDNS()
 
 	// Resolve the VPN name once, before the portal check, so the hint, the
 	// offline-warning suppression, and the attempt can never disagree.
