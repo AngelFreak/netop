@@ -15,6 +15,7 @@ import (
 	"github.com/angelfreak/net/pkg/netlink"
 	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
+	"github.com/angelfreak/net/pkg/wgconfig"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -26,12 +27,13 @@ type Manager struct {
 	executor      types.SystemExecutor
 	logger        types.Logger
 	configMgr     types.ConfigManager
-	routeMgr      types.RouteManager // netlink-backed routing table access (gateway detection, route restore)
-	addrMgr       types.AddrManager  // netlink-backed interface address access (WireGuard iface IP)
-	linkMgr       types.LinkManager  // netlink-backed link access (WireGuard iface create/delete/enumerate)
-	endpointRoute string             // Stores the VPN endpoint IP for cleanup on disconnect
-	runtimeDir    string             // Directory for runtime files (active-vpn state file)
-	mu            sync.Mutex         // Protects endpointRoute and serializes Connect/Disconnect/state file operations
+	routeMgr      types.RouteManager          // netlink-backed routing table access (gateway detection, route restore)
+	addrMgr       types.AddrManager           // netlink-backed interface address access (WireGuard iface IP)
+	linkMgr       types.LinkManager           // netlink-backed link access (WireGuard iface create/delete/enumerate)
+	wgConfig      types.WireGuardConfigurator // wgctrl-backed WireGuard config; nil until first use / injected in tests
+	endpointRoute string                      // Stores the VPN endpoint IP for cleanup on disconnect
+	runtimeDir    string                      // Directory for runtime files (active-vpn state file)
+	mu            sync.Mutex                  // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 
 	// Status verification polling for daemon-based VPNs (tailscale, netbird).
 	// Their "up" command can return before the tunnel is established, so we
@@ -69,6 +71,22 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
 	}
+}
+
+// wgConfigurator returns the WireGuard configurator, constructing the
+// wgctrl-backed one on first use. It is a field so tests can inject a fake;
+// construction is deferred (and can fail) because the wireguard kernel module
+// may be unavailable at Manager-creation time.
+func (m *Manager) wgConfigurator() (types.WireGuardConfigurator, error) {
+	if m.wgConfig != nil {
+		return m.wgConfig, nil
+	}
+	c, err := wgconfig.New()
+	if err != nil {
+		return nil, err
+	}
+	m.wgConfig = c
+	return m.wgConfig, nil
 }
 
 // Connect connects to a VPN
@@ -438,16 +456,21 @@ func (m *Manager) ListVPNs() ([]types.VPNStatus, error) {
 	}
 
 	// Check WireGuard interfaces: enumerate by type via netlink, then verify
-	// each is actually configured (has peers) via `wg show` — a stale interface
+	// each is actually configured (has peers) via wgctrl — a stale interface
 	// will have no peers.
 	wgIfaces, err := m.linkMgr.ListByType("wireguard")
 	if err != nil {
 		m.logger.Debug("Failed to list WireGuard interfaces", "error", err)
 	}
-	for _, iface := range wgIfaces {
-		wgShowOutput, err := m.executor.ExecuteWithTimeout(2*time.Second, "wg", "show", iface)
-		if err == nil && strings.Contains(wgShowOutput, "peer:") {
-			runningWireGuard[iface] = true
+	if len(wgIfaces) > 0 {
+		if wg, wgErr := m.wgConfigurator(); wgErr != nil {
+			m.logger.Debug("WireGuard configurator unavailable for peer check", "error", wgErr)
+		} else {
+			for _, iface := range wgIfaces {
+				if hasPeers, peerErr := wg.HasPeers(iface); peerErr == nil && hasPeers {
+					runningWireGuard[iface] = true
+				}
+			}
 		}
 	}
 
@@ -866,14 +889,14 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		iface = "wg0"
 	}
 
-	// Write config to temp file with secure permissions
-	tempConfig := filepath.Join(m.runtimeDir, "wg.conf")
-	err := m.writeFile(tempConfig, config.Config)
+	// Resolve the WireGuard configurator up front so we fail before creating
+	// the interface if the wireguard module is unavailable. The config is
+	// applied natively via wgctrl (no temp file / `wg setconf` shell-out), so
+	// the private key never touches disk.
+	wg, err := m.wgConfigurator()
 	if err != nil {
-		return fmt.Errorf("failed to write WireGuard config: %w", err)
+		return fmt.Errorf("WireGuard configuration unavailable: %w", err)
 	}
-	// Clean up credentials file on all paths (success and failure)
-	defer m.removeFile(tempConfig)
 
 	// Create WireGuard interface — if it already exists, delete and recreate
 	// to ensure clean state (no stale routes/config from previous connection)
@@ -887,9 +910,10 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		}
 	}
 
-	// Set config
-	_, err = m.executor.ExecuteWithTimeout(5*time.Second, "wg", "setconf", iface, tempConfig)
-	if err != nil {
+	// Set config natively via wgctrl (equivalent to `wg setconf`).
+	if err := wg.Configure(iface, config.Config); err != nil {
+		// Clean up interface on failure.
+		m.linkMgr.Delete(iface)
 		return fmt.Errorf("failed to set WireGuard config: %w", err)
 	}
 
