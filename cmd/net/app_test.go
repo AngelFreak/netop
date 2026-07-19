@@ -116,11 +116,12 @@ func (c *testConfigManager) GetVPNConfig(name string) (*types.VPNConfig, error) 
 
 // testWiFiManager implements types.WiFiManager for testing
 type testWiFiManager struct {
-	connections []types.Connection
-	networks    []types.WiFiNetwork
-	scanErr     error
-	connectErr  error
-	listErr     error
+	connections      []types.Connection
+	networks         []types.WiFiNetwork
+	scanErr          error
+	connectErr       error
+	listErr          error
+	disconnectCalled bool
 }
 
 func (w *testWiFiManager) Scan() ([]types.WiFiNetwork, error) {
@@ -139,6 +140,7 @@ func (w *testWiFiManager) ConnectWithBSSID(ssid, password, bssid, hostname strin
 }
 
 func (w *testWiFiManager) Disconnect() error {
+	w.disconnectCalled = true
 	return nil
 }
 
@@ -1910,4 +1912,63 @@ func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 0, det.calls)
 	assert.NotContains(t, stdout.String(), "Internet:")
+}
+
+// --- graceful-shutdown cleanup registration (issue #10) ---
+
+func TestApp_RunConnect_DeregistersCleanupsOnSuccess(t *testing.T) {
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	// A successful connect must leave nothing registered: the abort action is
+	// deregistered, and unlock-resolv.conf is deregistered so the intentional
+	// DNS lock persists past exit.
+	assert.Equal(t, 0, reg.Len(), "successful connect must deregister all cleanups")
+}
+
+func TestApp_RunConnect_DeregistersCleanupsOnError(t *testing.T) {
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{connectErr: errors.New("association failed")}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.Error(t, err)
+	// An error return must not leak a registered abort action.
+	assert.Equal(t, 0, reg.Len(), "failed connect must deregister its cleanups")
+}
+
+func TestApp_RunConnect_AbortRunsWiFiDisconnect(t *testing.T) {
+	// Simulate an interrupt arriving mid-connect: WiFiMgr.Connect drains the
+	// registry (as the signal handler would), and the registered abort action
+	// must invoke WiFiMgr.Disconnect to restore consistent state.
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	wifi := &interruptingWiFiManager{reg: reg}
+	app.WiFiMgr = wifi
+
+	_ = app.RunConnect("TestSSID", "password123")
+	assert.True(t, wifi.disconnectCalled, "interrupt mid-connect must run abort → WiFiMgr.Disconnect")
+}
+
+// interruptingWiFiManager drains the cleanup registry during Connect to model a
+// signal handler firing while the connect is in flight.
+type interruptingWiFiManager struct {
+	testWiFiManager
+	reg *cleanupRegistry
+}
+
+func (w *interruptingWiFiManager) Connect(ssid, password, hostname string) error {
+	w.reg.run(time.Second) // interrupt fires mid-connect
+	return w.connectErr
 }
