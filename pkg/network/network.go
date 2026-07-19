@@ -190,7 +190,7 @@ func (m *Manager) clearDNS() (bool, error) {
 		m.logger.Warn("Failed to unlock resolv.conf", "error", err)
 	}
 
-	if err := m.writeFileDirect("/etc/resolv.conf", "# DNS cleared by net\n"); err != nil {
+	if err := m.writeFileDirect(m.resolvConf(), "# DNS cleared by net\n"); err != nil {
 		return false, fmt.Errorf("failed to clear resolv.conf: %w", err)
 	}
 	m.clearDNSOwnership()
@@ -218,11 +218,11 @@ func (m *Manager) unlockResolvConf() error {
 // resolvConfHasNameserver reports whether /etc/resolv.conf currently contains
 // at least one active "nameserver" line (ignoring comments/blank lines).
 func (m *Manager) resolvConfHasNameserver() bool {
-	output, err := m.executor.Execute("cat", "/etc/resolv.conf")
+	output, err := os.ReadFile(m.resolvConf())
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(output, "\n") {
+	for _, line := range strings.Split(string(output), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
 			return true
 		}
@@ -378,12 +378,12 @@ func (m *Manager) SetHostname(hostname string) error {
 	// Update /etc/hosts FIRST to include the new hostname (required for sudo to work)
 	// This must happen before the hostname command, otherwise sudo fails with
 	// "unable to resolve host" between the hostname change and hosts update.
-	hostsContent, err := m.executor.Execute("cat", "/etc/hosts")
+	hostsBytes, err := os.ReadFile("/etc/hosts")
 	if err != nil {
 		m.logger.Warn("Failed to read /etc/hosts", "error", err)
 	} else {
 		// Check if we need to update the localhost entry
-		lines := strings.Split(hostsContent, "\n")
+		lines := strings.Split(string(hostsBytes), "\n")
 		var newLines []string
 		hostnameAdded := false
 
@@ -415,8 +415,7 @@ func (m *Manager) SetHostname(hostname string) error {
 
 		// Write updated hosts file
 		newHostsContent := strings.Join(newLines, "\n")
-		_, err = m.executor.ExecuteWithInput("tee", newHostsContent, "/etc/hosts")
-		if err != nil {
+		if err = os.WriteFile("/etc/hosts", []byte(newHostsContent), 0644); err != nil {
 			m.logger.Warn("Failed to update /etc/hosts", "error", err)
 		} else {
 			m.logger.Debug("Updated /etc/hosts with new hostname")
@@ -424,14 +423,12 @@ func (m *Manager) SetHostname(hostname string) error {
 	}
 
 	// Now set the hostname (after /etc/hosts is updated)
-	_, err = m.executor.Execute("hostname", hostname)
-	if err != nil {
+	if err = setHostname(hostname); err != nil {
 		return fmt.Errorf("failed to set hostname: %w", err)
 	}
 
 	// Also update /etc/hostname for persistence
-	_, err = m.executor.ExecuteWithInput("tee", hostname+"\n", "/etc/hostname")
-	if err != nil {
+	if err = os.WriteFile("/etc/hostname", []byte(hostname+"\n"), 0644); err != nil {
 		m.logger.Warn("Failed to update /etc/hostname", "error", err)
 	}
 
@@ -513,8 +510,7 @@ func (m *Manager) detectInterface(config *types.NetworkConfig) string {
 	if config.SSID == "" {
 		for _, candidate := range candidates {
 			// Check carrier status
-			carrier, err := m.executor.Execute("cat", "/sys/class/net/"+candidate+"/carrier")
-			if err == nil && strings.TrimSpace(carrier) == "1" {
+			if hasCarrier(candidate) {
 				m.logger.Info("Detected wired interface with carrier", "interface", candidate)
 				return candidate
 			}
@@ -633,24 +629,70 @@ func (m *Manager) getPermanentMAC(iface string) (string, error) {
 	return "", fmt.Errorf("could not parse permanent MAC from: %s", output)
 }
 
-func (m *Manager) writeFile(path, content string) error {
-	// Use a unique temp file to avoid race conditions with concurrent writes
-	tempFile := fmt.Sprintf("%s/staging.%d.conf", types.RuntimeDir, os.Getpid())
-	err := m.writeFileDirect(tempFile, content)
-	if err != nil {
-		return err
+// writeFileDirect writes content to path with 0644 permissions, preserving a
+// symlink at path by writing through to its target. Native replacement for
+// shelling out to `tee`, which also followed symlinks.
+//
+// /etc/resolv.conf is frequently a symlink (e.g. -> /run/systemd/resolve/
+// stub-resolv.conf on systemd-resolved) or a bind-mount (containers). A plain
+// temp-file+rename over path would replace the symlink with a regular file
+// (breaking resolved's management) or fail with EBUSY on a bind-mount. So we
+// resolve path to its real target and write there: atomically via temp+rename
+// when the target directory is writable (never half-written), otherwise
+// in-place through the existing file descriptor as a fallback.
+func (m *Manager) writeFileDirect(path, content string) error {
+	// Resolve symlinks so we write through to the real file, not over the link.
+	// EvalSymlinks fails if path itself doesn't exist yet; fall back to path.
+	target := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		target = resolved
 	}
 
-	_, err = m.executor.Execute("mv", tempFile, path)
-	if err != nil {
-		m.executor.Execute("rm", "-f", tempFile)
+	if err := atomicWrite(target, content); err != nil {
+		// Atomic rename can fail when the target's directory isn't writable or
+		// the target is a bind-mount (EBUSY / cross-device). Fall back to
+		// truncating and writing the existing file in place, which follows the
+		// symlink/bind-mount the same way `tee` did.
+		if writeErr := os.WriteFile(target, []byte(content), 0644); writeErr != nil {
+			return fmt.Errorf("writing %q: atomic rename failed (%v); in-place write failed: %w", target, err, writeErr)
+		}
 	}
-	return err
+	return nil
 }
 
-func (m *Manager) writeFileDirect(path, content string) error {
-	_, err := m.executor.ExecuteWithInput("tee", content, path)
-	return err
+// atomicWrite writes content to path via a temp file in the same directory
+// followed by a rename, so the file never appears half-written. The temp file
+// must be in the same directory as path for the rename to stay on one
+// filesystem.
+func atomicWrite(path, content string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".net-resolv-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file in %q: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("renaming temp file to %q: %w", path, err)
+	}
+	tmpName = ""
+	return nil
 }
 
 // waitForCarrier polls for carrier detection on an interface
@@ -660,13 +702,21 @@ func (m *Manager) waitForCarrier(iface string, timeout time.Duration) bool {
 	pollInterval := 100 * time.Millisecond
 
 	for time.Now().Before(deadline) {
-		carrier, err := m.executor.Execute("cat", "/sys/class/net/"+iface+"/carrier")
-		if err == nil && strings.TrimSpace(carrier) == "1" {
+		if hasCarrier(iface) {
 			return true
 		}
 		time.Sleep(pollInterval)
 	}
 	return false
+}
+
+// hasCarrier reports whether the interface currently has a physical link, by
+// reading /sys/class/net/<iface>/carrier (native replacement for
+// `cat .../carrier`). A missing or unreadable file (e.g. iface down) reads as
+// no carrier.
+func hasCarrier(iface string) bool {
+	b, err := os.ReadFile("/sys/class/net/" + iface + "/carrier")
+	return err == nil && strings.TrimSpace(string(b)) == "1"
 }
 
 // ConnectToConfiguredNetwork connects to a network based on the provided configuration
@@ -708,7 +758,7 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		// Clear stale DNS entries so DHCP client can write fresh ones.
 		// Without this, resolv.conf may retain DNS from a previous connection
 		// (set via SetDNS with chattr +i), or from a VPN client like netbird.
-		if err := m.writeFileDirect("/etc/resolv.conf", "# Waiting for DHCP\n"); err != nil {
+		if err := m.writeFileDirect(m.resolvConf(), "# Waiting for DHCP\n"); err != nil {
 			m.logger.Warn("Failed to clear resolv.conf", "error", err)
 		}
 	}
@@ -1006,11 +1056,11 @@ func (m *Manager) DisconnectAll() []string {
 	return torn
 }
 
-// getDNSServers reads DNS servers from /etc/resolv.conf
+// getDNSServers reads DNS servers from resolv.conf
 func (m *Manager) getDNSServers() ([]net.IP, error) {
-	output, err := m.executor.Execute("cat", "/etc/resolv.conf")
+	output, err := os.ReadFile(m.resolvConf())
 	if err != nil {
 		return nil, err
 	}
-	return system.ParseDNSFromResolvConf(output), nil
+	return system.ParseDNSFromResolvConf(string(output)), nil
 }

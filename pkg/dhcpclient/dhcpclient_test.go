@@ -403,34 +403,47 @@ func TestRelease_KillsBothClients(t *testing.T) {
 }
 
 func TestRelease_CleansUpLeaseFiles(t *testing.T) {
+	tmp := t.TempDir()
+	leaseFile := filepath.Join(tmp, "dhclient.eth0.leases")
+	assert.NoError(t, os.WriteFile(leaseFile, []byte("dummy lease data"), 0o600))
+
 	executor := newMockExecutor()
 	executor.commands["pkill -9 -f udhcpc.*eth0"] = ""
 	executor.commands["pkill -9 -f dhclient.*eth0"] = ""
-	executor.commands["rm -f /var/lib/dhcp/dhclient.eth0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.eth0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.eth0.conf"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.runtimeDir = tmp
 
 	err := manager.Release("eth0")
 	assert.NoError(t, err)
-	// Verify lease file cleanup was attempted
-	executor.assertCommandExecuted(t, "dhclient.eth0.leases")
+
+	// Verify the runDir-based lease file was actually removed from disk.
+	_, statErr := os.Stat(leaseFile)
+	assert.True(t, os.IsNotExist(statErr), "expected lease file to be removed, got err: %v", statErr)
+
+	// The hardcoded /var/lib/dhcp path can't be created/removed without root;
+	// just verify Release still succeeds when it's absent (os.Remove ignores
+	// os.IsNotExist).
 }
 
 func TestRelease_CleansUpInterfaceSpecificConfig(t *testing.T) {
+	tmp := t.TempDir()
+	confFile := filepath.Join(tmp, "dhclient.wlan0.conf")
+	assert.NoError(t, os.WriteFile(confFile, []byte("dummy config data"), 0o600))
+
 	executor := newMockExecutor()
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
-	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
-	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.runtimeDir = tmp
 
 	err := manager.Release("wlan0")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "dhclient.wlan0.conf")
+
+	// Verify the interface-specific dhclient config was actually removed.
+	_, statErr := os.Stat(confFile)
+	assert.True(t, os.IsNotExist(statErr), "expected config file to be removed, got err: %v", statErr)
 }
 
 func TestRelease_LogsCleanupErrors(t *testing.T) {

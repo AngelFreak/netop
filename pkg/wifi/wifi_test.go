@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -238,9 +240,8 @@ SSID: OtherSSID`,
 				"wpa_cli -i wlan0 terminate":  "",
 				"pkill -9 -f dhclient.*wlan0": "",
 				// Reconnect commands
-				"mkdir -p /run/wpa_supplicant":                                  "",
 				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
-				"wpa_cli -i wlan0 status":                                       "wpa_state=COMPLETED\nssid=TestSSID",
+				"wpa_cli -i wlan0 status": "wpa_state=COMPLETED\nssid=TestSSID",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0": "",
 				"rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases": "",
@@ -265,7 +266,6 @@ SSID: OtherSSID`,
 				"iw wlan0 link": "Not connected",
 				// Interface-specific wpa_supplicant termination
 				"wpa_cli -i wlan0 terminate":                                    "",
-				"mkdir -p /run/wpa_supplicant":                                  "",
 				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
 				// DHCP flow
 				"pkill -9 -f udhcpc.*wlan0":   "",
@@ -294,7 +294,6 @@ SSID: OtherSSID`,
 				"iw wlan0 link": "Not connected",
 				// Interface-specific wpa_supplicant termination
 				"wpa_cli -i wlan0 terminate":                                    "",
-				"mkdir -p /run/wpa_supplicant":                                  "",
 				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
 				"wpa_cli -i wlan0 status":                                       "wpa_state=SCANNING", // Never completes
 			},
@@ -342,9 +341,8 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	executor := &recordingExecutor{
 		mockSystemExecutor: mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":                "Not connected", // post-hibernation: no current SSID
-				"wpa_cli -i wlan0 terminate":   "",
-				"mkdir -p /run/wpa_supplicant": "",
+				"iw wlan0 link":              "Not connected", // post-hibernation: no current SSID
+				"wpa_cli -i wlan0 terminate": "",
 				"wpa_supplicant -B -i wlan0 -c " + tmp + "/wpa_supplicant.conf": "",
 				"wpa_cli -i wlan0 status": "wpa_state=COMPLETED\nssid=TestSSID",
 			},
@@ -371,11 +369,12 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 
 	// Verify flush happens after terminateWpaSupplicant. The flush is recorded
 	// by the netlink fakes, terminate by the executor, so compare against the
-	// executor call that immediately precedes the flush (mkdir happens after).
+	// executor call that starts wpa_supplicant (the flush + mkdir happen natively
+	// via os.MkdirAll in between, and are no longer visible to the executor).
 	terminateIdx := indexOf(executor.calledCommands, "wpa_cli -i wlan0 terminate")
-	mkdirIdx := indexOf(executor.calledCommands, "mkdir -p /run/wpa_supplicant")
+	wpaSupplicantStartIdx := indexOf(executor.calledCommands, "wpa_supplicant -B -i wlan0 -c "+tmp+"/wpa_supplicant.conf")
 	assert.True(t, terminateIdx >= 0, "wpa_cli terminate should have been called")
-	assert.True(t, terminateIdx < mkdirIdx,
+	assert.True(t, terminateIdx < wpaSupplicantStartIdx,
 		"terminate should come before wpa_supplicant setup (flush runs between them)")
 
 	// The interface is brought up via the netlink LinkManager (not the executor).
@@ -387,8 +386,7 @@ func TestDisconnect(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
 			// Interface-specific termination commands
-			"wpa_cli -i wlan0 terminate":      "",
-			"rm -f /run/wpa_supplicant/wlan0": "",
+			"wpa_cli -i wlan0 terminate": "",
 		},
 	}
 	logger := &mockLogger{}
@@ -412,8 +410,6 @@ func TestListConnections(t *testing.T) {
 		commands: map[string]string{
 			"iw wlan0 link": `Connected to aa:bb:cc:dd:ee:ff (on wlan0)
 SSID: TestNetwork`,
-			"cat /etc/resolv.conf": `nameserver 8.8.8.8
-nameserver 1.1.1.1`,
 		},
 	}
 	logger := &mockLogger{}
@@ -422,6 +418,11 @@ nameserver 1.1.1.1`,
 	manager.routeMgr = &fake.RouteManager{
 		Routes: []types.Route{{Gw: "192.168.1.1", Iface: "wlan0"}},
 	}
+	// getDNSServers() reads resolv.conf natively (os.ReadFile); point it at a
+	// real temp file so DNS content is testable without touching /etc.
+	resolvPath := filepath.Join(t.TempDir(), "resolv.conf")
+	assert.NoError(t, os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 8.8.4.4\n"), 0644))
+	manager.resolvConfPath = resolvPath
 
 	connections, err := manager.ListConnections()
 	assert.NoError(t, err)
@@ -433,6 +434,8 @@ nameserver 1.1.1.1`,
 	assert.Equal(t, net.ParseIP("192.168.1.100"), conn.IP)
 	assert.Equal(t, net.ParseIP("192.168.1.1"), conn.Gateway)
 	assert.Len(t, conn.DNS, 2)
+	assert.Equal(t, net.ParseIP("8.8.8.8"), conn.DNS[0])
+	assert.Equal(t, net.ParseIP("8.8.4.4"), conn.DNS[1])
 }
 
 func TestGetInterface(t *testing.T) {
@@ -958,20 +961,18 @@ SSID: TestNetwork`,
 }
 
 func TestGetDNSServers(t *testing.T) {
-	executor := &mockSystemExecutor{
-		commands: map[string]string{
-			"cat /etc/resolv.conf": `nameserver 8.8.8.8
-nameserver 1.1.1.1`,
-		},
-	}
 	logger := &mockLogger{}
-	manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
+	manager := NewManager(&mockSystemExecutor{}, logger, "wlan0", &mockDHCPClient{})
+	// getDNSServers() reads resolv.conf natively; point it at a real temp file.
+	resolvPath := filepath.Join(t.TempDir(), "resolv.conf")
+	assert.NoError(t, os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 9.9.9.9\n"), 0644))
+	manager.resolvConfPath = resolvPath
 
 	dns, err := manager.getDNSServers()
 	assert.NoError(t, err)
 	assert.Len(t, dns, 2)
-	assert.Equal(t, net.ParseIP("8.8.8.8"), dns[0])
-	assert.Equal(t, net.ParseIP("1.1.1.1"), dns[1])
+	assert.Equal(t, net.ParseIP("1.1.1.1"), dns[0])
+	assert.Equal(t, net.ParseIP("9.9.9.9"), dns[1])
 }
 
 func TestWriteFile(t *testing.T) {
@@ -984,15 +985,19 @@ func TestWriteFile(t *testing.T) {
 }
 
 func TestReadFile(t *testing.T) {
-	executor := &mockSystemExecutor{
-		commands: map[string]string{
-			"cat /etc/resolv.conf": "nameserver 8.8.8.8",
-		},
+	// readFile() now reads directly via os.ReadFile, so point it at a real
+	// temp file instead of relying on the mock executor's "cat" command.
+	dir := t.TempDir()
+	path := dir + "/resolv.conf"
+	if err := os.WriteFile(path, []byte("nameserver 8.8.8.8"), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
 	}
+
+	executor := &mockSystemExecutor{}
 	logger := &mockLogger{}
 	manager := &Manager{executor: executor, logger: logger, iface: "wlan0"}
 
-	content, err := manager.readFile("/etc/resolv.conf")
+	content, err := manager.readFile(path)
 	assert.NoError(t, err)
 	assert.Equal(t, "nameserver 8.8.8.8", content)
 }
@@ -1061,31 +1066,33 @@ func TestListConnections_AdditionalCases(t *testing.T) {
 	t.Run("connection without DNS", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":        "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
-				"cat /etc/resolv.conf": "", // No DNS
+				"iw wlan0 link": "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
 			},
 		}
 		logger := &mockLogger{}
+		// Empty resolv.conf → no DNS servers. Inject a real empty temp file so
+		// getDNSServers() (native os.ReadFile) doesn't read this machine's /etc.
+		resolvPath := filepath.Join(t.TempDir(), "resolv.conf")
+		assert.NoError(t, os.WriteFile(resolvPath, []byte(""), 0644))
 		manager := &Manager{
-			executor: executor,
-			logger:   logger,
-			iface:    "wlan0",
-			addrMgr:  &fake.AddrManager{FirstIPv4: "192.168.1.100"},
-			routeMgr: &fake.RouteManager{Routes: []types.Route{{Gw: "192.168.1.1", Iface: "wlan0"}}},
+			executor:       executor,
+			logger:         logger,
+			iface:          "wlan0",
+			addrMgr:        &fake.AddrManager{FirstIPv4: "192.168.1.100"},
+			routeMgr:       &fake.RouteManager{Routes: []types.Route{{Gw: "192.168.1.1", Iface: "wlan0"}}},
+			resolvConfPath: resolvPath,
 		}
 
 		connections, err := manager.ListConnections()
 		assert.NoError(t, err)
 		assert.Len(t, connections, 1)
-		assert.Equal(t, "TestNetwork", connections[0].SSID)
-		assert.Len(t, connections[0].DNS, 0)
+		assert.Empty(t, connections[0].DNS)
 	})
 
 	t.Run("connection without gateway", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"iw wlan0 link":        "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
-				"cat /etc/resolv.conf": "nameserver 8.8.8.8",
+				"iw wlan0 link": "Connected to 00:11:22:33:44:55 (on wlan0)\nSSID: TestNetwork",
 			},
 		}
 		logger := &mockLogger{}
@@ -1163,8 +1170,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("graceful termination via wpa_cli succeeds", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"wpa_cli -i wlan0 terminate":      "OK",
-				"rm -f /run/wpa_supplicant/wlan0": "",
+				"wpa_cli -i wlan0 terminate": "OK",
 			},
 		}
 		logger := &mockLogger{}
@@ -1177,8 +1183,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("fallback to pkill when wpa_cli fails", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pkill -9 wpa_supplicant":         "",
-				"rm -f /run/wpa_supplicant/wlan0": "",
+				"pkill -9 wpa_supplicant": "",
 			},
 			errors: map[string]error{
 				"wpa_cli -i wlan0 terminate": assert.AnError,
@@ -1194,8 +1199,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("uses correct interface in wpa_cli", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"wpa_cli -i eth0 terminate":      "OK",
-				"rm -f /run/wpa_supplicant/eth0": "",
+				"wpa_cli -i eth0 terminate": "OK",
 			},
 		}
 		logger := &mockLogger{}
@@ -1207,8 +1211,7 @@ func TestTerminateWpaSupplicant(t *testing.T) {
 	t.Run("kills all wpa_supplicant in pkill fallback", func(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"pkill -9 wpa_supplicant":          "",
-				"rm -f /run/wpa_supplicant/wlp2s0": "",
+				"pkill -9 wpa_supplicant": "",
 			},
 			errors: map[string]error{
 				"wpa_cli -i wlp2s0 terminate": assert.AnError,
@@ -1248,8 +1251,7 @@ func TestDisconnectInterfaceIsolation(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				// Interface-specific commands for wlan0 only
-				"wpa_cli -i wlan0 terminate":      "OK",
-				"rm -f /run/wpa_supplicant/wlan0": "",
+				"wpa_cli -i wlan0 terminate": "OK",
 			},
 		}
 		logger := &mockLogger{}

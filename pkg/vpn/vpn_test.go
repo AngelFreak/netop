@@ -685,7 +685,6 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		tmpDir := t.TempDir()
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
-				"rm -f " + tmpDir + "/openvpn.conf": "", // cleanup should happen
 				// KillProcessByPID will try to read PID file - mock it failing (file doesn't exist)
 			},
 			errors: map[string]error{
@@ -703,8 +702,10 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		err := manager.connectOpenVPN(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to start OpenVPN")
-		// Verify cleanup was called
-		executor.assertCommandExecuted(t, "rm -f "+tmpDir+"/openvpn.conf")
+		// Verify cleanup was called: removeFile now goes through os.Remove
+		// instead of shelling out to "rm -f", so assert on the filesystem.
+		_, statErr := os.Stat(filepath.Join(tmpDir, "openvpn.conf"))
+		assert.True(t, os.IsNotExist(statErr), "expected temp config file to be removed")
 	})
 
 	t.Run("tunnel verification timeout cleans up temp file", func(t *testing.T) {
@@ -712,12 +713,11 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"openvpn --config " + tmpDir + "/openvpn.conf --daemon --writepid " + tmpDir + "/openvpn.pid": "",
-				"rm -f " + tmpDir + "/openvpn.conf": "",      // cleanup should happen
-				"cat " + tmpDir + "/openvpn.pid":    "12345", // PID file exists
-				"kill 12345":                        "",      // graceful kill
-				"kill -0 12345":                     "",      // check if running
-				"kill -9 12345":                     "",      // force kill
-				"rm -f " + tmpDir + "/openvpn.pid":  "",      // PID file cleanup
+				"cat " + tmpDir + "/openvpn.pid":   "12345", // PID file exists
+				"kill 12345":                       "",      // graceful kill
+				"kill -0 12345":                    "",      // check if running
+				"kill -9 12345":                    "",      // force kill
+				"rm -f " + tmpDir + "/openvpn.pid": "",      // PID file cleanup
 			},
 		}
 		logger := &mockLogger{}
@@ -731,8 +731,10 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		err := manager.connectOpenVPN(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to establish tunnel")
-		// Verify cleanup was called
-		executor.assertCommandExecuted(t, "rm -f "+tmpDir+"/openvpn.conf")
+		// Verify cleanup was called: removeFile now goes through os.Remove
+		// instead of shelling out to "rm -f", so assert on the filesystem.
+		_, statErr := os.Stat(filepath.Join(tmpDir, "openvpn.conf"))
+		assert.True(t, os.IsNotExist(statErr), "expected temp config file to be removed")
 	})
 
 	t.Run("stale device with dead daemon fails", func(t *testing.T) {
@@ -740,9 +742,8 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"openvpn --config " + tmpDir + "/openvpn.conf --daemon --writepid " + tmpDir + "/openvpn.pid": "",
-				"cat " + tmpDir + "/openvpn.pid":    "12345", // PID file exists
-				"rm -f " + tmpDir + "/openvpn.conf": "",
-				"rm -f " + tmpDir + "/openvpn.pid":  "",
+				"cat " + tmpDir + "/openvpn.pid":   "12345", // PID file exists
+				"rm -f " + tmpDir + "/openvpn.pid": "",
 			},
 			errors: map[string]error{
 				"kill -0 12345": assert.AnError, // daemon already dead
@@ -760,8 +761,10 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		err := manager.connectOpenVPN(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "exited before")
-		// Verify cleanup was called
-		executor.assertCommandExecuted(t, "rm -f "+tmpDir+"/openvpn.conf")
+		// Verify cleanup was called: removeFile now goes through os.Remove
+		// instead of shelling out to "rm -f", so assert on the filesystem.
+		_, statErr := os.Stat(filepath.Join(tmpDir, "openvpn.conf"))
+		assert.True(t, os.IsNotExist(statErr), "expected temp config file to be removed")
 	})
 }
 

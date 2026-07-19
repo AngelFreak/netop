@@ -3,6 +3,7 @@ package wifi
 import (
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -48,6 +49,7 @@ type Manager struct {
 	addrMgr            types.AddrManager  // netlink-backed interface address access
 	routeMgr           types.RouteManager // netlink-backed routing table access
 	runtimeDir         string             // overridable for tests; defaults to types.RuntimeDir
+	resolvConfPath     string             // overridable for tests; defaults to /etc/resolv.conf
 }
 
 // NewManager creates a new WiFi manager
@@ -62,7 +64,17 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, iface string
 		addrMgr:            netlink.NewAddrManager(),
 		routeMgr:           netlink.NewRouteManager(),
 		runtimeDir:         types.RuntimeDir,
+		resolvConfPath:     "/etc/resolv.conf",
 	}
+}
+
+// resolvConf returns the resolv.conf path, defaulting to /etc/resolv.conf when
+// the field is empty (e.g. Manager built as a struct literal in tests).
+func (m *Manager) resolvConf() string {
+	if m.resolvConfPath == "" {
+		return "/etc/resolv.conf"
+	}
+	return m.resolvConfPath
 }
 
 // wpaConfigPath returns the path for the wpa_supplicant config file. The
@@ -169,8 +181,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// Write config to temp file in secure runtime directory
 	tempConfig := m.wpaConfigPath()
 	// Remove any existing file to avoid permission issues
-	_, err = m.executor.Execute("rm", "-f", tempConfig)
-	if err != nil {
+	if err = os.Remove(tempConfig); err != nil && !os.IsNotExist(err) {
 		m.logger.Warn("Failed to remove old config file", "error", err)
 	}
 	err = m.writeFile(tempConfig, config)
@@ -179,7 +190,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	}
 	// Clean up credentials file after wpa_supplicant reads it
 	defer func() {
-		_, _ = m.executor.Execute("rm", "-f", tempConfig)
+		_ = os.Remove(tempConfig)
 	}()
 
 	// Terminate existing wpa_supplicant for this interface only
@@ -201,7 +212,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	}
 
 	// Ensure wpa_supplicant control directory exists
-	_, _ = m.executor.Execute("mkdir", "-p", "/run/wpa_supplicant")
+	_ = os.MkdirAll("/run/wpa_supplicant", 0755)
 
 	// Start wpa_supplicant — ctrl_interface is set in the config file,
 	// don't also pass -C which can conflict and cause crashes with SAE.
@@ -611,7 +622,7 @@ func (m *Manager) otherInterfaceAssociated() bool {
 }
 
 func (m *Manager) getDNSServers() ([]net.IP, error) {
-	output, err := m.readFile("/etc/resolv.conf")
+	output, err := m.readFile(m.resolvConf())
 	if err != nil {
 		return nil, err
 	}
@@ -638,8 +649,11 @@ func (m *Manager) writeFile(path, content string) error {
 }
 
 func (m *Manager) readFile(path string) (string, error) {
-	// Use 2s timeout - file reads complete in <10ms
-	return m.executor.ExecuteWithTimeout(2*time.Second, "cat", path)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // killProcess kills processes matching a pattern with SIGKILL (fast, no graceful shutdown)
@@ -685,7 +699,7 @@ func (m *Manager) terminateWpaSupplicant() {
 	// Remove stale control socket — after suspend/resume the old wpa_supplicant
 	// process is gone but its socket file remains, causing the new instance to
 	// fail with exit code 255
-	m.executor.Execute("rm", "-f", fmt.Sprintf("/run/wpa_supplicant/%s", m.iface))
+	_ = os.Remove(fmt.Sprintf("/run/wpa_supplicant/%s", m.iface))
 }
 
 // terminateDhcpClients terminates all DHCP clients (dhclient and udhcpc) for this interface
