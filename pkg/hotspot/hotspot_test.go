@@ -20,6 +20,21 @@ import (
 
 // startFakeProcess starts a background process whose /proc/pid/comm matches
 // the given name. Returns the PID as a string and a cleanup function.
+// deadProcessPID spawns a short-lived process, reaps it, and returns its PID as
+// a string. The PID belongs to a process that has exited, so syscall.Kill
+// against it fails with ESRCH — used to exercise the "kill failed" path now
+// that killProcess is native (syscall.Kill), not a mockable executor command.
+func deadProcessPID(t *testing.T) string {
+	t.Helper()
+	cmd := exec.Command("sleep", "0")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start throwaway process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Wait() // reap it; pid is now dead
+	return strconv.Itoa(pid)
+}
+
 func startFakeProcess(name string) (string, func()) {
 	tmpDir, err := os.MkdirTemp("", "fakeproc-*")
 	if err != nil {
@@ -520,17 +535,16 @@ func TestStop_PartialFailure(t *testing.T) {
 		Interface: "wlan0",
 	}
 
-	// Create fake processes with correct /proc/pid/comm names
-	hostapdPid, cleanHostapd := startFakeProcess("hostapd")
-	defer cleanHostapd()
+	// killProcess now signals PIDs natively (syscall.Kill), so success/failure
+	// is driven by whether the PID is alive, not by executor mocks. dnsmasq gets
+	// a live PID (kill succeeds); hostapd gets a real-but-dead PID (reaped), so
+	// its SIGTERM fails with ESRCH and Stop() surfaces the hostapd error.
 	dnsmasqPid, cleanDnsmasq := startFakeProcess("dnsmasq")
 	defer cleanDnsmasq()
+	hostapdPid := deadProcessPID(t)
 	os.WriteFile(mgr.hostapdPidFile, []byte(hostapdPid), 0644)
 	os.WriteFile(mgr.dnsmasqPidFile, []byte(dnsmasqPid), 0644)
 
-	// dnsmasq kill succeeds but hostapd kill fails
-	executor.commands["kill "+dnsmasqPid] = ""
-	executor.errors["kill "+hostapdPid] = fmt.Errorf("no such process")
 	executor.commands["iw wlan0 set type managed"] = ""
 
 	err := mgr.Stop()

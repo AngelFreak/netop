@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/angelfreak/net/pkg/firewall"
@@ -465,12 +466,13 @@ func (d *dhcpManagerImpl) stopDnsmasq() error {
 	}
 
 	pid := strings.TrimSpace(string(data))
-	// Validate PID is a positive integer before passing to kill
-	if n, err := strconv.Atoi(pid); err != nil || n <= 0 {
+	// Validate PID is a positive integer before signaling.
+	n, convErr := strconv.Atoi(pid)
+	if convErr != nil || n <= 0 {
 		os.Remove(d.dnsmasqPidFile)
 		return fmt.Errorf("invalid PID in %s: %q", d.dnsmasqPidFile, pid)
 	}
-	if _, err := d.executor.Execute("kill", pid); err != nil {
+	if err := syscall.Kill(n, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("failed to kill dnsmasq: %w", err)
 	}
 

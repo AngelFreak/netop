@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -152,52 +154,145 @@ func TestKillProcessGraceful(t *testing.T) {
 // Tests for KillProcessByPID
 
 func TestKillProcessByPID(t *testing.T) {
-	t.Run("PID file not found returns nil", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.mockResponses["cat"] = mockResponse{err: assert.AnError}
+	t.Run("nonexistent pid file returns nil", func(t *testing.T) {
 		logger := &testLogger{}
 
-		err := KillProcessByPID(executor, logger, "/run/net/nonexistent.pid")
+		err := KillProcessByPID(logger, filepath.Join(t.TempDir(), "nonexistent.pid"))
 
 		assert.NoError(t, err)
 		assert.Len(t, logger.debugMsgs, 1)
 		assert.Contains(t, logger.debugMsgs[0], "PID file not found")
 	})
 
-	t.Run("empty PID file returns nil", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.mockResponses["cat"] = mockResponse{output: "  \n"}
+	t.Run("empty pid file returns nil", func(t *testing.T) {
+		pidFile := filepath.Join(t.TempDir(), "empty.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte("  \n"), 0600))
 		logger := &testLogger{}
 
-		err := KillProcessByPID(executor, logger, "/run/net/empty.pid")
+		err := KillProcessByPID(logger, pidFile)
 
 		assert.NoError(t, err)
 		assert.Len(t, logger.debugMsgs, 1)
 		assert.Contains(t, logger.debugMsgs[0], "PID file is empty")
 	})
 
-	t.Run("successfully kills process and cleans up PID file", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.mockResponses["cat"] = mockResponse{output: "12345"}
-		executor.mockResponses["kill"] = mockResponse{} // kill -0 (still running check) returns success
+	t.Run("invalid pid content returns nil", func(t *testing.T) {
+		pidFile := filepath.Join(t.TempDir(), "invalid.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte("notanumber"), 0600))
 		logger := &testLogger{}
 
-		err := KillProcessByPID(executor, logger, "/run/net/test.pid")
+		err := KillProcessByPID(logger, pidFile)
 
 		assert.NoError(t, err)
-		// Should have: cat, kill, kill -0, kill -9, rm
-		assert.GreaterOrEqual(t, len(executor.executedCommands), 3)
+		assert.Len(t, logger.debugMsgs, 1)
+		assert.Contains(t, logger.debugMsgs[0], "PID file does not contain a valid PID")
 	})
 
-	t.Run("process already dead returns nil", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.mockResponses["cat"] = mockResponse{output: "12345"}
-		executor.mockResponses["kill"] = mockResponse{err: assert.AnError} // Process already dead
+	t.Run("kills a real process and cleans up pidfile", func(t *testing.T) {
+		cmd := exec.Command("sleep", "60")
+		assert.NoError(t, cmd.Start())
+		defer func() { _ = cmd.Process.Kill() }()
+
+		pidFile := filepath.Join(t.TempDir(), "real.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0600))
 		logger := &testLogger{}
 
-		err := KillProcessByPID(executor, logger, "/run/net/dead.pid")
+		err := KillProcessByPID(logger, pidFile)
+		assert.NoError(t, err)
+
+		_, statErr := os.Stat(pidFile)
+		assert.True(t, os.IsNotExist(statErr), "pidfile should be removed")
+
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// process exited as expected
+		case <-time.After(2 * time.Second):
+			t.Fatal("process was not killed within timeout")
+		}
+	})
+
+	t.Run("dead process pidfile returns nil and removes pidfile", func(t *testing.T) {
+		cmd := exec.Command("sleep", "60")
+		assert.NoError(t, cmd.Start())
+		pid := cmd.Process.Pid
+		assert.NoError(t, cmd.Process.Kill())
+		_ = cmd.Wait()
+
+		pidFile := filepath.Join(t.TempDir(), "dead.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0600))
+		logger := &testLogger{}
+
+		err := KillProcessByPID(logger, pidFile)
 
 		assert.NoError(t, err)
+		_, statErr := os.Stat(pidFile)
+		assert.True(t, os.IsNotExist(statErr), "pidfile should be removed")
+	})
+}
+
+// Tests for ProcessAliveFromPIDFile
+
+func TestProcessAliveFromPIDFile(t *testing.T) {
+	t.Run("missing pidfile returns false, nil", func(t *testing.T) {
+		alive, err := ProcessAliveFromPIDFile(filepath.Join(t.TempDir(), "nonexistent.pid"))
+
+		assert.False(t, alive)
+		assert.NoError(t, err)
+	})
+
+	t.Run("empty pidfile returns false, nil", func(t *testing.T) {
+		pidFile := filepath.Join(t.TempDir(), "empty.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte(""), 0600))
+
+		alive, err := ProcessAliveFromPIDFile(pidFile)
+
+		assert.False(t, alive)
+		assert.NoError(t, err)
+	})
+
+	t.Run("non-integer pidfile returns false, nil", func(t *testing.T) {
+		pidFile := filepath.Join(t.TempDir(), "invalid.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte("notanumber"), 0600))
+
+		alive, err := ProcessAliveFromPIDFile(pidFile)
+
+		assert.False(t, alive)
+		assert.NoError(t, err)
+	})
+
+	t.Run("live process returns true, nil", func(t *testing.T) {
+		cmd := exec.Command("sleep", "60")
+		assert.NoError(t, cmd.Start())
+		defer func() { _ = cmd.Process.Kill() }()
+
+		pidFile := filepath.Join(t.TempDir(), "live.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0600))
+
+		alive, err := ProcessAliveFromPIDFile(pidFile)
+
+		assert.True(t, alive)
+		assert.NoError(t, err)
+	})
+
+	t.Run("dead process returns false, error", func(t *testing.T) {
+		cmd := exec.Command("sleep", "60")
+		assert.NoError(t, cmd.Start())
+		pid := cmd.Process.Pid
+		assert.NoError(t, cmd.Process.Kill())
+		_ = cmd.Wait()
+
+		pidFile := filepath.Join(t.TempDir(), "dead.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0600))
+
+		alive, err := ProcessAliveFromPIDFile(pidFile)
+
+		assert.False(t, alive)
+		assert.Error(t, err)
 	})
 }
 

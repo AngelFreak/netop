@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -191,6 +193,46 @@ func (s *sequencingExecutor) ExecuteWithInput(cmd string, input string, args ...
 
 func (s *sequencingExecutor) ExecuteWithInputContext(ctx context.Context, cmd string, input string, args ...string) (string, error) {
 	return s.mockSystemExecutor.ExecuteWithInputContext(ctx, cmd, input, args...)
+}
+
+// pidWritingExecutor wraps mockSystemExecutor and simulates the real
+// "openvpn --writepid <pidFile>" behavior: after a successful (mocked)
+// "openvpn" invocation, it writes pidToWrite into the pidfile path that was
+// passed via --writepid. connectOpenVPN removes any stale pidfile
+// synchronously before invoking the executor, so tests that need a specific
+// (dead or alive) PID present once the daemon has "started" must materialize
+// it via this side effect rather than pre-seeding the file.
+type pidWritingExecutor struct {
+	mockSystemExecutor
+	pidToWrite string
+}
+
+func (p *pidWritingExecutor) writePIDIfNeeded(cmd string, args []string) {
+	if cmd != "openvpn" {
+		return
+	}
+	for i, arg := range args {
+		if arg == "--writepid" && i+1 < len(args) {
+			_ = os.WriteFile(args[i+1], []byte(p.pidToWrite), 0600)
+			return
+		}
+	}
+}
+
+func (p *pidWritingExecutor) Execute(cmd string, args ...string) (string, error) {
+	out, err := p.mockSystemExecutor.Execute(cmd, args...)
+	if err == nil {
+		p.writePIDIfNeeded(cmd, args)
+	}
+	return out, err
+}
+
+func (p *pidWritingExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
+	return p.Execute(cmd, args...)
+}
+
+func (p *pidWritingExecutor) ExecuteContext(ctx context.Context, cmd string, args ...string) (string, error) {
+	return p.Execute(cmd, args...)
 }
 
 type mockLogger struct{}
@@ -684,12 +726,9 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 	t.Run("openvpn execution error cleans up temp file", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				// KillProcessByPID will try to read PID file - mock it failing (file doesn't exist)
-			},
+			commands: map[string]string{},
 			errors: map[string]error{
 				"openvpn --config " + tmpDir + "/openvpn.conf --daemon --writepid " + tmpDir + "/openvpn.pid": assert.AnError,
-				"cat " + tmpDir + "/openvpn.pid": assert.AnError, // PID file doesn't exist
 			},
 		}
 		logger := &mockLogger{}
@@ -713,15 +752,15 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 		executor := &mockSystemExecutor{
 			commands: map[string]string{
 				"openvpn --config " + tmpDir + "/openvpn.conf --daemon --writepid " + tmpDir + "/openvpn.pid": "",
-				"cat " + tmpDir + "/openvpn.pid":   "12345", // PID file exists
-				"kill 12345":                       "",      // graceful kill
-				"kill -0 12345":                    "",      // check if running
-				"kill -9 12345":                    "",      // force kill
-				"rm -f " + tmpDir + "/openvpn.pid": "",      // PID file cleanup
 			},
 		}
 		logger := &mockLogger{}
-		// tun0 never appears (netlink probe reports it absent).
+		// No pidfile is ever written (the mocked "openvpn" has no filesystem
+		// side effect), so ProcessAliveFromPIDFile sees a missing file
+		// (alive=false, err=nil) on every iteration - that's "not observed
+		// yet", not "dead", so the loop just keeps waiting on the device.
+		// tun0 never appears (netlink probe reports it absent), so this
+		// exercises the 30s timeout path rather than the dead-daemon path.
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, runtimeDir: tmpDir}
 
 		config := &types.VPNConfig{
@@ -739,15 +778,25 @@ func TestConnectOpenVPN_ErrorCases(t *testing.T) {
 
 	t.Run("stale device with dead daemon fails", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"openvpn --config " + tmpDir + "/openvpn.conf --daemon --writepid " + tmpDir + "/openvpn.pid": "",
-				"cat " + tmpDir + "/openvpn.pid":   "12345", // PID file exists
-				"rm -f " + tmpDir + "/openvpn.pid": "",
+
+		// Spawn a throwaway process and kill it immediately so we have a PID
+		// that is real but guaranteed dead. system.ProcessAliveFromPIDFile
+		// probes the pidfile's PID with signal 0, so writing this dead PID
+		// into openvpn.pid (once the mocked daemon "starts") makes the
+		// liveness check observe a valid-but-dead process, exercising the
+		// native "daemon died" path instead of the old cat/kill-0 mocking.
+		deadCmd := exec.Command("sleep", "60")
+		assert.NoError(t, deadCmd.Start())
+		deadPID := deadCmd.Process.Pid
+		assert.NoError(t, deadCmd.Process.Kill())
+		_ = deadCmd.Wait()
+
+		executor := &pidWritingExecutor{
+			mockSystemExecutor: mockSystemExecutor{
+				commands: map[string]string{},
+				errors:   map[string]error{},
 			},
-			errors: map[string]error{
-				"kill -0 12345": assert.AnError, // daemon already dead
-			},
+			pidToWrite: strconv.Itoa(deadPID),
 		}
 		logger := &mockLogger{}
 		// Stale interface still exists (netlink probe reports it present), but the
@@ -1225,17 +1274,22 @@ func TestExtractEndpoint(t *testing.T) {
 func TestDisconnectTracked(t *testing.T) {
 	t.Run("openvpn uses PID file", func(t *testing.T) {
 		tempDir := t.TempDir()
+
+		// disconnectTracked now calls system.KillProcessByPID, which reads
+		// the real pidfile and signals the PID directly (no cat/kill
+		// shell-outs). Spawn a real, live process so the SIGTERM path is
+		// exercised, and verify it actually gets killed and the pidfile
+		// is removed.
+		cmd := exec.Command("sleep", "60")
+		assert.NoError(t, cmd.Start())
+		defer func() { _ = cmd.Process.Kill() }()
+		pid := cmd.Process.Pid
+
+		pidFile := filepath.Join(tempDir, "openvpn.pid")
+		assert.NoError(t, os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0600))
+
 		executor := &mockSystemExecutor{
-			commands: map[string]string{
-				"cat " + tempDir + "/openvpn.pid":   "12345",
-				"kill 12345":                        "",
-				"kill -0 12345":                     "",
-				"kill -9 12345":                     "",
-				"rm -f " + tempDir + "/openvpn.pid": "",
-			},
-			errors: map[string]error{
-				"kill -0 12345": assert.AnError, // Process already dead
-			},
+			commands: map[string]string{},
 		}
 		logger := &mockLogger{}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger, runtimeDir: tempDir}
@@ -1246,8 +1300,20 @@ func TestDisconnectTracked(t *testing.T) {
 		}
 		manager.disconnectTracked(state)
 
-		executor.assertCommandExecuted(t, "cat "+tempDir+"/openvpn.pid")
-		executor.assertCommandExecuted(t, "kill 12345")
+		_, statErr := os.Stat(pidFile)
+		assert.True(t, os.IsNotExist(statErr), "expected pidfile to be removed")
+
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// process exited as expected
+		case <-time.After(2 * time.Second):
+			t.Fatal("process was not killed within timeout")
+		}
 	})
 
 	t.Run("wireguard deletes only tracked interface", func(t *testing.T) {

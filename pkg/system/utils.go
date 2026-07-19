@@ -5,7 +5,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -152,43 +154,78 @@ func ParseDNSFromResolvConf(content string) []net.IP {
 	return dns
 }
 
+// ProcessAliveFromPIDFile reports whether the process whose PID is recorded in
+// pidFile is currently alive, by probing it with signal 0 (native replacement
+// for `cat <pidfile>` + `kill -0 <pid>`). It returns:
+//   - (false, nil) if the pidfile is missing/empty/unparseable — treat as "no
+//     tracked process", not an error.
+//   - (true, nil)  if the process exists.
+//   - (false, err) only when the pidfile held a valid PID and the liveness
+//     probe reported the process is gone (ESRCH) or otherwise unreachable.
+func ProcessAliveFromPIDFile(pidFile string) (bool, error) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return false, nil
+	}
+	pidStr := strings.TrimSpace(string(data))
+	if pidStr == "" {
+		return false, nil
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return false, nil
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // KillProcessByPID kills a process by reading its PID from a file.
 // Returns nil if successful or if the PID file doesn't exist.
 // Uses SIGTERM first, then SIGKILL after a short delay if still running.
-func KillProcessByPID(executor types.SystemExecutor, logger types.Logger, pidFile string) error {
+// Native: reads the pidfile and signals the process directly (no cat/kill/rm
+// shell-outs).
+func KillProcessByPID(logger types.Logger, pidFile string) error {
 	// Read PID from file
-	pid, err := executor.ExecuteWithTimeout(1*time.Second, "cat", pidFile)
+	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		logger.Debug("PID file not found or unreadable", "file", pidFile, "error", err)
 		return nil // Not an error - process may not be running
 	}
 
-	pid = strings.TrimSpace(pid)
-	if pid == "" {
+	pidStr := strings.TrimSpace(string(data))
+	if pidStr == "" {
 		logger.Debug("PID file is empty", "file", pidFile)
+		return nil
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		logger.Debug("PID file does not contain a valid PID", "file", pidFile, "value", pidStr)
 		return nil
 	}
 
 	// Try graceful shutdown first (SIGTERM)
-	_, err = executor.ExecuteWithTimeout(1*time.Second, "kill", pid)
-	if err != nil {
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		logger.Debug("Process may already be dead", "pid", pid, "error", err)
+		// Still clean up the stale pidfile before returning.
+		_ = os.Remove(pidFile)
 		return nil
 	}
 
 	// Wait briefly for graceful shutdown
 	time.Sleep(200 * time.Millisecond)
 
-	// Check if still running and force kill if necessary
-	_, err = executor.ExecuteWithTimeout(500*time.Millisecond, "kill", "-0", pid)
-	if err == nil {
+	// Check if still running (signal 0 probes liveness without delivering a
+	// signal) and force kill if necessary.
+	if err := syscall.Kill(pid, 0); err == nil {
 		// Process still running, send SIGKILL
 		logger.Debug("Process still running after SIGTERM, sending SIGKILL", "pid", pid)
-		_, _ = executor.ExecuteWithTimeout(1*time.Second, "kill", "-9", pid)
+		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 
 	// Clean up PID file
-	_, _ = executor.ExecuteWithTimeout(500*time.Millisecond, "rm", "-f", pidFile)
+	_ = os.Remove(pidFile)
 
 	return nil
 }
