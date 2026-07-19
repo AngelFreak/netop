@@ -405,6 +405,47 @@ func TestDisconnect(t *testing.T) {
 	assert.Contains(t, routes.Flushed, "wlan0")
 }
 
+func TestDisconnect_RemovesTempWPAConfig(t *testing.T) {
+	// An interrupt mid-Connect leaves the temp wpa config behind (Connect's own
+	// defer never fires). The abort action calls Disconnect, so Disconnect must
+	// remove the temp config to fully restore state.
+	executor := &mockSystemExecutor{
+		commands: map[string]string{"wpa_cli -i wlan0 terminate": ""},
+	}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+	manager.linkMgr = &fake.LinkManager{}
+	manager.addrMgr = &fake.AddrManager{}
+	manager.routeMgr = &fake.RouteManager{}
+	manager.runtimeDir = t.TempDir()
+
+	// Simulate the leftover temp config.
+	tempConfig := manager.wpaConfigPath()
+	assert.NoError(t, os.WriteFile(tempConfig, []byte("network={}"), 0600))
+
+	err := manager.Disconnect()
+	assert.NoError(t, err)
+	_, statErr := os.Stat(tempConfig)
+	assert.True(t, os.IsNotExist(statErr), "Disconnect must remove the temp wpa config")
+}
+
+func TestDisconnect_MissingTempWPAConfigIsFine(t *testing.T) {
+	// Best-effort removal: no temp config present (the common Disconnect case)
+	// must not error.
+	executor := &mockSystemExecutor{
+		commands: map[string]string{"wpa_cli -i wlan0 terminate": ""},
+	}
+	logger := &mockLogger{}
+	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
+	manager.linkMgr = &fake.LinkManager{}
+	manager.addrMgr = &fake.AddrManager{}
+	manager.routeMgr = &fake.RouteManager{}
+	manager.runtimeDir = t.TempDir()
+
+	err := manager.Disconnect()
+	assert.NoError(t, err)
+}
+
 func TestListConnections(t *testing.T) {
 	executor := &mockSystemExecutor{
 		commands: map[string]string{
