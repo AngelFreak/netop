@@ -65,7 +65,11 @@ Examples:
   net vpn work            Connect to VPN "work"
   net dns 1.1.1.1 8.8.8.8 Set custom DNS servers
   net mac random          Randomize MAC address
-  net status              Show full network status`,
+  net status              Show full network status
+
+Sharing this machine's connection with other devices:
+  net share start --interface eth0   Share internet over ethernet (DHCP + NAT)
+  net hotspot start                  Share internet over WiFi (access point)`,
 	// Allow unknown args so that "net damon" works (handled in Run function)
 	FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
 	Args:               cobra.ArbitraryArgs,

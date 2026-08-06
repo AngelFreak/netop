@@ -31,6 +31,7 @@ type dhcpManagerImpl struct {
 	addrMgr         types.AddrManager     // netlink-backed interface address access
 	routeMgr        types.RouteManager    // netlink-backed routing table access
 	firewall        types.FirewallManager // go-iptables-backed NAT rules; nil until first use / injected in tests
+	natState        types.NATState        // whether internet sharing is active, and why not if it isn't
 }
 
 // NewDHCPManager creates a new DHCP server manager
@@ -110,10 +111,20 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 		return fmt.Errorf("failed to start dnsmasq: %w", err)
 	}
 
-	// Setup NAT/IP forwarding for internet sharing
+	// Setup NAT/IP forwarding for internet sharing. A failure here leaves a
+	// server that hands out leases with no route to the internet, so the reason
+	// is recorded in natState for callers to surface rather than only logged.
 	if err := d.setupNAT(config.Interface); err != nil {
-		d.logger.Warn("Failed to setup NAT", "error", err.Error())
-		// Continue anyway - DHCP will work but without internet sharing
+		d.natState = types.NATState{Reason: err.Error()}
+		d.logger.Warn("Internet sharing is NOT active", "error", err.Error())
+		if config.RequireNAT {
+			// Strict mode: don't leave a half-working server behind.
+			d.currentConfig = config
+			if stopErr := d.Stop(); stopErr != nil {
+				d.logger.Warn("Failed to roll back after NAT failure", "error", stopErr.Error())
+			}
+			return fmt.Errorf("internet sharing could not be configured: %w", err)
+		}
 	}
 
 	d.currentConfig = config
@@ -174,6 +185,7 @@ func (d *dhcpManagerImpl) Stop() error {
 
 	d.currentConfig = nil
 	d.outInterface = ""
+	d.natState = types.NATState{}
 	os.Remove(d.stateFile)
 	d.logger.Info("DHCP server stopped successfully")
 	return nil
@@ -331,11 +343,12 @@ func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
 		return fmt.Errorf("failed to enable IP forwarding: %w", err)
 	}
 
-	// Find outbound interface (excluding the DHCP server interface)
+	// Find outbound interface (excluding the DHCP server interface). Without one
+	// there is nothing to masquerade through, which is a NAT failure rather than
+	// a benign skip — clients would get leases but no route to the internet.
 	outIface := d.detectOutInterface(dhcpIface)
 	if outIface == "" {
-		d.logger.Warn("No outbound interface detected, skipping NAT setup")
-		return nil
+		return fmt.Errorf("no outbound interface detected (no default route other than %s)", dhcpIface)
 	}
 
 	d.logger.Debug("Setting up NAT", "outInterface", outIface, "dhcpInterface", dhcpIface)
@@ -351,7 +364,13 @@ func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
 	}
 
 	d.outInterface = outIface
+	d.natState = types.NATState{Active: true, OutInterface: outIface}
 	return nil
+}
+
+// NATStatus reports whether internet sharing is active for the running server.
+func (d *dhcpManagerImpl) NATStatus() types.NATState {
+	return d.natState
 }
 
 // detectOutInterface finds the default route interface (excluding the given interface)

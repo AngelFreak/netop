@@ -1083,3 +1083,140 @@ func TestStart_WithDifferentNetmasks(t *testing.T) {
 		})
 	}
 }
+
+// Tests for NAT failure surfacing (internet sharing did not happen)
+
+// TestStart_NATStatusReportedWhenNoUplink asserts that a DHCP server started
+// with no usable uplink records *why* NAT was skipped, rather than only
+// emitting a log line. Without this the CLI cannot tell the user their clients
+// will get leases but no internet.
+func TestStart_NATStatusReportedWhenNoUplink(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	// No default route -> no outbound interface -> NAT cannot be configured.
+	mgr.routeMgr.(*fake.RouteManager).Routes = nil
+
+	err := mgr.Start(config)
+	assert.NoError(t, err, "server should still start without an uplink")
+
+	status := mgr.NATStatus()
+	assert.False(t, status.Active, "NAT must not be reported active with no uplink")
+	assert.Contains(t, status.Reason, "no outbound interface")
+}
+
+// TestStart_NATStatusActiveWhenConfigured is the positive counterpart: with a
+// usable uplink, NATStatus reports active and names the interface.
+func TestStart_NATStatusActiveWhenConfigured(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	err := mgr.Start(config)
+	assert.NoError(t, err)
+
+	status := mgr.NATStatus()
+	assert.True(t, status.Active)
+	assert.Equal(t, "wlan0", status.OutInterface)
+}
+
+// TestStart_RequireNATFailsWhenNoUplink asserts the opt-in strict mode: with
+// RequireNAT set, a server that cannot share the connection is an error, not a
+// warning, and the half-started server is torn down.
+func TestStart_RequireNATFailsWhenNoUplink(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
+	config := &types.DHCPServerConfig{
+		Interface:  "eth0",
+		Gateway:    "192.168.100.1",
+		IPRange:    "192.168.100.50,192.168.100.150",
+		RequireNAT: true,
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+	mgr.routeMgr.(*fake.RouteManager).Routes = nil
+
+	err := mgr.Start(config)
+	assert.Error(t, err, "RequireNAT must turn a NAT failure into a start failure")
+	assert.Contains(t, err.Error(), "no outbound interface")
+}
+
+// TestStart_RequireNATFailsWhenFirewallErrors covers the other NAT failure
+// path: an uplink exists but installing the rules fails.
+func TestStart_RequireNATFailsWhenFirewallErrors(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
+	config := &types.DHCPServerConfig{
+		Interface:  "eth0",
+		Gateway:    "192.168.100.1",
+		IPRange:    "192.168.100.50,192.168.100.150",
+		RequireNAT: true,
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+	mgr.firewall.(*fwfake.Manager).EnableErr = fmt.Errorf("iptables refused")
+
+	err := mgr.Start(config)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "iptables refused")
+}
+
+// TestStart_NATStatusReportedWhenFirewallErrors asserts the non-strict default
+// still records the firewall failure instead of swallowing it.
+func TestStart_NATStatusReportedWhenFirewallErrors(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+	mgr.firewall.(*fwfake.Manager).EnableErr = fmt.Errorf("iptables refused")
+
+	err := mgr.Start(config)
+	assert.NoError(t, err, "non-strict start should still succeed")
+
+	status := mgr.NATStatus()
+	assert.False(t, status.Active)
+	assert.Contains(t, status.Reason, "iptables refused")
+}

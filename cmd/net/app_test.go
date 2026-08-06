@@ -301,6 +301,7 @@ type testDHCPManager struct {
 	leases        []types.DHCPLease
 	leasesErr     error
 	currentConfig *types.DHCPServerConfig
+	natState      types.NATState
 }
 
 func (d *testDHCPManager) Start(config *types.DHCPServerConfig) error {
@@ -321,6 +322,10 @@ func (d *testDHCPManager) GetLeases() ([]types.DHCPLease, error) {
 
 func (d *testDHCPManager) GetCurrentConfig() *types.DHCPServerConfig {
 	return d.currentConfig
+}
+
+func (d *testDHCPManager) NATStatus() types.NATState {
+	return d.natState
 }
 
 // Helper to create a test App
@@ -1910,4 +1915,73 @@ func TestApp_RunStatus_PortalCheckOffSkipsProbe(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 0, det.calls)
 	assert.NotContains(t, stdout.String(), "Internet:")
+}
+
+// TestApp_RunDHCPServer_StartWarnsWhenSharingInactive asserts the user is told,
+// loudly and on stderr, when the server started but internet sharing did not.
+// Without this the only signal is a log line the user never sees.
+func TestApp_RunDHCPServer_StartWarnsWhenSharingInactive(t *testing.T) {
+	app, stdout, stderr := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		natState: types.NATState{
+			Active: false,
+			Reason: "no outbound interface detected (no default route other than eth0)",
+		},
+	}
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+		LeaseTime: "12h",
+	}
+
+	err := app.RunDHCPServer("start", config)
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "DHCP server started successfully")
+
+	out := stderr.String()
+	assert.Contains(t, out, "Internet sharing is NOT active")
+	assert.Contains(t, out, "no outbound interface")
+	assert.Contains(t, out, "will not reach the internet",
+		"warning must state the user-visible consequence")
+}
+
+// TestApp_RunDHCPServer_StartReportsSharingActive is the positive counterpart:
+// a working share names the uplink and warns about nothing.
+func TestApp_RunDHCPServer_StartReportsSharingActive(t *testing.T) {
+	app, stdout, stderr := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		natState: types.NATState{Active: true, OutInterface: "wlan0"},
+	}
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+		LeaseTime: "12h",
+	}
+
+	err := app.RunDHCPServer("start", config)
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Sharing:   via wlan0")
+	assert.NotContains(t, stderr.String(), "NOT active")
+}
+
+// TestApp_RunDHCPServer_StatusShowsSharingState asserts `net share status`
+// surfaces sharing state too, not just at start time.
+func TestApp_RunDHCPServer_StatusShowsSharingState(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{
+		running: true,
+		currentConfig: &types.DHCPServerConfig{
+			Interface: "eth0",
+			Gateway:   "192.168.100.1",
+			IPRange:   "192.168.100.50,192.168.100.150",
+		},
+		natState: types.NATState{Active: false, Reason: "iptables refused"},
+	}
+
+	err := app.RunDHCPServer("status", nil)
+	assert.NoError(t, err)
+	assert.Contains(t, stdout.String(), "Sharing:   NOT active")
+	assert.Contains(t, stdout.String(), "iptables refused")
 }

@@ -1119,6 +1119,18 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 		a.printf("  IP Range:  %s\n", config.IPRange)
 		a.printf("  Lease:     %s\n", config.LeaseTime)
 
+		// Internet sharing is the reason most people run this command, and it can
+		// fail independently of the server starting. Say so plainly instead of
+		// leaving the user to discover it from a client with no connectivity.
+		nat := a.DHCPMgr.NATStatus()
+		if nat.Active {
+			a.printf("  Sharing:   via %s\n", nat.OutInterface)
+		} else {
+			a.errorf("\n⚠ Internet sharing is NOT active: %s\n", nat.Reason)
+			a.errorf("  Clients will get an IP address but will not reach the internet.\n")
+			a.errorf("  Check that another interface has a default route, then re-run.\n")
+		}
+
 	case "stop":
 		err := a.DHCPMgr.Stop()
 		if err != nil {
@@ -1138,6 +1150,11 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 			a.printf("  Interface: %s\n", cfg.Interface)
 			a.printf("  Gateway:   %s\n", cfg.Gateway)
 			a.printf("  IP Range:  %s\n", cfg.IPRange)
+		}
+		if nat := a.DHCPMgr.NATStatus(); nat.Active {
+			a.printf("  Sharing:   via %s\n", nat.OutInterface)
+		} else {
+			a.printf("  Sharing:   NOT active (%s)\n", nat.Reason)
 		}
 		leases, err := a.DHCPMgr.GetLeases()
 		if err != nil {
