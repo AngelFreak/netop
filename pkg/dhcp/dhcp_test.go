@@ -1220,3 +1220,30 @@ func TestStart_NATStatusReportedWhenFirewallErrors(t *testing.T) {
 	assert.False(t, status.Active)
 	assert.Contains(t, status.Reason, "iptables refused")
 }
+
+// After a strict-mode failure the reason must survive the rollback, otherwise
+// callers that inspect NATStatus() after a failed start learn nothing.
+func TestStart_RequireNATPreservesReasonAfterRollback(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	restore := system.SetIPForwardPathForTest(ipfPath)
+	defer restore()
+
+	config := &types.DHCPServerConfig{
+		Interface: "eth0", Gateway: "192.168.100.1",
+		IPRange: "192.168.100.50,192.168.100.150", RequireNAT: true,
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+	mgr.routeMgr.(*fake.RouteManager).Routes = nil
+
+	err := mgr.Start(config)
+	assert.Error(t, err)
+
+	status := mgr.NATStatus()
+	assert.False(t, status.Active)
+	assert.Contains(t, status.Reason, "no outbound interface",
+		"rollback must not erase why sharing failed")
+}

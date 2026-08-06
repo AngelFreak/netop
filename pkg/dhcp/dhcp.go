@@ -115,7 +115,8 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 	// server that hands out leases with no route to the internet, so the reason
 	// is recorded in natState for callers to surface rather than only logged.
 	if err := d.setupNAT(config.Interface); err != nil {
-		d.natState = types.NATState{Reason: err.Error()}
+		failed := types.NATState{Reason: err.Error()}
+		d.natState = failed
 		d.logger.Warn("Internet sharing is NOT active", "error", err.Error())
 		if config.RequireNAT {
 			// Strict mode: don't leave a half-working server behind.
@@ -123,6 +124,9 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 			if stopErr := d.Stop(); stopErr != nil {
 				d.logger.Warn("Failed to roll back after NAT failure", "error", stopErr.Error())
 			}
+			// Stop clears natState; restore the reason so callers inspecting
+			// NATStatus() after a failed strict start still learn why.
+			d.natState = failed
 			return fmt.Errorf("internet sharing could not be configured: %w", err)
 		}
 	}
