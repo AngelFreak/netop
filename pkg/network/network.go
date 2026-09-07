@@ -208,6 +208,13 @@ func (m *Manager) LockDNS() {
 	m.markDNSOwned()
 }
 
+// UnlockDNS undoes LockDNS: the immutable flag comes off and the ownership
+// marker is removed, so an aborted connect leaves no claim on resolv.conf.
+func (m *Manager) UnlockDNS() error {
+	m.clearDNSOwnership()
+	return m.unlockResolvConf()
+}
+
 // unlockResolvConf removes the immutable flag from /etc/resolv.conf natively
 // (replacing `chattr -i`). VPN clients like netbird set this flag and may leave
 // it after disconnecting, which prevents DHCP or net from updating DNS.

@@ -326,6 +326,10 @@ type NetworkManager interface {
 	// ClearDNSIfOwned clears DNS only if netop set it. Returns (cleared, err).
 	ClearDNSIfOwned() (bool, error)
 	LockDNS()
+	// UnlockDNS is the inverse of LockDNS: it clears the immutable flag on
+	// /etc/resolv.conf and drops netop's ownership marker. Used when a connect
+	// is aborted so a later `net stop` does not believe netop still owns DNS.
+	UnlockDNS() error
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
 	SetIP(iface, addr, gateway string, metric int) error
