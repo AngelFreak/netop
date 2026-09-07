@@ -213,9 +213,6 @@ func main() {
 		// stage 2 propagates ctx to running executor calls so cleanup runs
 		// against a settled command; cancel now so nothing new starts.
 		cancel()
-		if logger != nil {
-			logger.Debug("Interrupt received, cleaning up")
-		}
 		fmt.Fprintln(os.Stderr, "interrupt received, cleaning up")
 		// A second signal during cleanup means the user wants out now —
 		// abandon remaining cleanup and exit immediately.
