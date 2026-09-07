@@ -132,17 +132,18 @@ func aiCommandLines() []string {
 	return lines
 }
 
-// readDocsAI reads the checked-in guide, searching upward for the repo root so
-// it works from any package directory during tests.
-func readDocsAI() (string, error) {
+// findDocsAI locates the checked-in guide by searching upward from the
+// working directory, so both the test and `go generate` (which runs in
+// cmd/net) find the repo-root copy.
+func findDocsAI() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
 	for {
 		candidate := filepath.Join(dir, docsAIPath)
-		if data, err := os.ReadFile(candidate); err == nil {
-			return string(data), nil
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -150,6 +151,19 @@ func readDocsAI() (string, error) {
 		}
 		dir = parent
 	}
+}
+
+// readDocsAI reads the checked-in guide.
+func readDocsAI() (string, error) {
+	path, err := findDocsAI()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // RunAI prints the agent guide. It touches no managers and no config, so it
@@ -173,7 +187,12 @@ the privilege rule, and what each command changes on the system.
 Needs no privileges and no config file.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if write, _ := cmd.Flags().GetBool("write-docs"); write {
-			if err := os.WriteFile(docsAIPath, []byte(aiGuide()), 0o644); err != nil {
+			path, err := findDocsAI()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(exitFailed)
+			}
+			if err := os.WriteFile(path, []byte(aiGuide()), 0o644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(exitFailed)
 			}

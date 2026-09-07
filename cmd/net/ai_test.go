@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -106,5 +105,3 @@ func TestAI_DocFileMatchesGuide(t *testing.T) {
 	require.NoError(t, err, "docs/AI.md must exist; regenerate with: go generate ./cmd/net")
 	assert.Equal(t, aiGuide(), onDisk, "docs/AI.md is stale; regenerate with: go generate ./cmd/net")
 }
-
-var _ = cobra.Command{}
