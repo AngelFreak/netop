@@ -28,6 +28,7 @@ Examples:
 		return getNetworkNames(), cobra.ShellCompDirectiveNoFileComp
 	},
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("connect")
 		name := args[0]
 		password := ""
 		if len(args) > 1 {

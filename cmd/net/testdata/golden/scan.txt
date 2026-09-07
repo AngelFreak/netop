@@ -1,0 +1,4 @@
+Scanning for networks...
+Found 2 networks
+HomeNet (aa:bb:cc:dd:ee:ff) - Signal: -40 dBm - Security: WPA2
+Cafe (11:22:33:44:55:66) - Signal: -70 dBm - Security: Open

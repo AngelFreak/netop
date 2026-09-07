@@ -11,7 +11,7 @@ var statusCmd = &cobra.Command{
 	Short: "Show full network status (connection, internet/captive portal, VPN, hotspot, DHCP)",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := createApp().RunStatus(); err != nil {
-			os.Exit(1)
+			os.Exit(exitCode(err))
 		}
 	},
 }
@@ -33,7 +33,7 @@ Examples:
 			networkName = args[0]
 		}
 		if err := createApp().RunShow(networkName); err != nil {
-			os.Exit(1)
+			os.Exit(exitCode(err))
 		}
 	},
 }

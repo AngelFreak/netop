@@ -31,6 +31,7 @@ type App struct {
 	Interface string // Primary network interface to use
 	NoVPN     bool   // When true, skip automatic VPN connection
 	Debug     bool   // Enable debug output
+	JSON      bool   // Emit one JSON envelope on stdout instead of text (see output.go)
 
 	// PortalRetryDelay is the settle delay before the one connect-time retry
 	// when the first portal probe reports offline. Zero means the 500ms
@@ -42,21 +43,28 @@ type App struct {
 	Stderr io.Writer // Standard error (default: os.Stderr)
 }
 
-// printf writes formatted output to stdout
+// printf writes formatted output to stdout. Silent in JSON mode: stdout then
+// carries exactly one envelope, written by emit/emitError.
 func (a *App) printf(format string, args ...interface{}) {
+	if a.JSON {
+		return
+	}
 	fmt.Fprintf(a.Stdout, format, args...)
 }
 
 // progress prints a progress message to stdout only when not in debug mode.
 // In debug mode, detailed logs are already shown so progress messages are redundant.
 func (a *App) progress(format string, args ...interface{}) {
-	if !a.Debug {
+	if !a.Debug && !a.JSON {
 		fmt.Fprintf(a.Stdout, format, args...)
 	}
 }
 
-// println writes a line to stdout
+// println writes a line to stdout. Silent in JSON mode (see printf).
 func (a *App) println(args ...interface{}) {
+	if a.JSON {
+		return
+	}
 	fmt.Fprintln(a.Stdout, args...)
 }
 
@@ -221,7 +229,14 @@ func (a *App) RunList() error {
 	if err != nil {
 		a.Logger.Error("Failed to list connections", "error", err)
 		a.errorf("Error: %v\n", err)
-		return err
+		return a.fail("list", err)
+	}
+
+	if a.JSON {
+		if connections == nil {
+			connections = []types.Connection{}
+		}
+		return a.emit("list", listResult{Connections: connections})
 	}
 
 	if len(connections) == 0 {
@@ -258,23 +273,27 @@ func (a *App) RunScan(showOpen bool) error {
 	if err != nil {
 		a.Logger.Error("Failed to scan networks", "error", err)
 		a.errorf("Error: %v\n", err)
-		return err
+		return a.fail("scan", err)
 	}
 
-	// Count networks to display (respecting showOpen filter)
-	displayCount := 0
+	shown := make([]types.WiFiNetwork, 0, len(networks))
 	for _, network := range networks {
 		if showOpen && network.Security != "Open" {
 			continue
 		}
-		displayCount++
+		shown = append(shown, network)
 	}
-	a.progress("Found %d networks\n", displayCount)
 
-	for _, network := range networks {
-		if showOpen && network.Security != "Open" {
-			continue
-		}
+	if a.JSON {
+		// SSIDs are attacker-controlled; the JSON encoder escapes control
+		// characters, so the value round-trips intact without reaching the
+		// terminal raw.
+		return a.emit("scan", scanResult{Networks: shown})
+	}
+
+	a.progress("Found %d networks\n", len(shown))
+
+	for _, network := range shown {
 		// Scanned SSIDs are attacker-controlled over the air; sanitize before
 		// printing to prevent terminal-escape injection.
 		a.printf("%s (%s) - Signal: %d dBm - Security: %s\n",
@@ -565,17 +584,19 @@ func (a *App) RunMAC(mac string) error {
 	return nil
 }
 
-// RunVPN manages VPN connections.
-// If arg is empty, lists all configured VPNs with their status.
-// If arg is "stop", disconnects all active VPNs.
-// Otherwise connects to the VPN with the given name.
+// RunVPN lists VPNs (arg == ""), disconnects all ("stop"), or connects to
+// the named VPN.
 func (a *App) RunVPN(arg string) error {
 	if arg == "" {
 		// List VPNs
 		vpns, err := a.VPNMgr.ListVPNs()
 		if err != nil {
 			a.Logger.Error("Failed to list VPNs", "error", err)
-			return err
+			return a.fail("vpn", err)
+		}
+
+		if a.JSON {
+			return a.emit("vpn", vpnListResult{VPNs: vpnEntries(vpns)})
 		}
 
 		if len(vpns) == 0 {
@@ -588,6 +609,10 @@ func (a *App) RunVPN(arg string) error {
 			a.printf("%s (%s) - %s\n", v.Name, v.Type, status)
 		}
 		return nil
+	}
+
+	if a.JSON {
+		return a.fail("vpn", errJSONUnsupported("vpn "+arg))
 	}
 
 	if arg == "stop" {
@@ -615,7 +640,11 @@ func (a *App) RunGenkey() error {
 	if err != nil {
 		a.Logger.Error("Failed to generate WireGuard key", "error", err)
 		a.errorf("Error: %v\n", err)
-		return err
+		return a.fail("genkey", err)
+	}
+
+	if a.JSON {
+		return a.emit("genkey", genkeyResult{PrivateKey: private, PublicKey: public})
 	}
 
 	a.println("✓ WireGuard keys generated")
@@ -633,8 +662,17 @@ func (a *App) RunShow(networkName string) error {
 		// Show all configurations
 		config := a.ConfigMgr.GetConfig()
 		if config == nil {
+			if a.JSON {
+				// Text mode reports this and exits 0; an agent needs a
+				// real failure so ok:false and the exit code agree.
+				return a.fail("show", withCode(codeNotFound, fmt.Errorf("no configuration loaded")))
+			}
 			a.println("No configuration loaded")
 			return nil
+		}
+
+		if a.JSON {
+			return a.emit("show", newShowAllResult(config))
 		}
 
 		a.println("Common Configuration:")
@@ -674,39 +712,44 @@ func (a *App) RunShow(networkName string) error {
 		for _, iface := range config.Ignored.Interfaces {
 			a.printf("  %s\n", iface)
 		}
-	} else {
-		// Show specific network
-		config, err := a.ConfigMgr.GetNetworkConfig(networkName)
-		if err != nil {
-			a.Logger.Error("Failed to get network config", "name", networkName, "error", err)
-			a.errorf("Error: %v\n", err)
-			return err
-		}
+		return nil
+	}
 
-		merged := a.ConfigMgr.MergeWithCommon(networkName, config)
+	// Show specific network
+	config, err := a.ConfigMgr.GetNetworkConfig(networkName)
+	if err != nil {
+		a.Logger.Error("Failed to get network config", "name", networkName, "error", err)
+		a.errorf("Error: %v\n", err)
+		return a.fail("show", err)
+	}
 
-		a.printf("Network: %s\n", networkName)
-		if merged.Interface != "" {
-			a.printf("Interface: %s\n", merged.Interface)
-		}
-		if merged.SSID != "" {
-			a.printf("SSID: %s\n", merged.SSID)
-		}
-		if merged.PSK != "" {
-			a.printf("PSK: %s\n", maskSecret(merged.PSK))
-		}
-		if len(merged.DNS) > 0 {
-			a.printf("DNS: %s\n", strings.Join(merged.DNS, ", "))
-		}
-		if merged.MAC != "" {
-			a.printf("MAC: %s\n", merged.MAC)
-		}
-		if merged.Hostname != "" {
-			a.printf("Hostname: %s\n", merged.Hostname)
-		}
-		if merged.VPN != "" {
-			a.printf("VPN: %s\n", merged.VPN)
-		}
+	merged := a.ConfigMgr.MergeWithCommon(networkName, config)
+
+	if a.JSON {
+		return a.emit("show", newShowNetworkResult(networkName, merged))
+	}
+
+	a.printf("Network: %s\n", networkName)
+	if merged.Interface != "" {
+		a.printf("Interface: %s\n", merged.Interface)
+	}
+	if merged.SSID != "" {
+		a.printf("SSID: %s\n", merged.SSID)
+	}
+	if merged.PSK != "" {
+		a.printf("PSK: %s\n", maskSecret(merged.PSK))
+	}
+	if len(merged.DNS) > 0 {
+		a.printf("DNS: %s\n", strings.Join(merged.DNS, ", "))
+	}
+	if merged.MAC != "" {
+		a.printf("MAC: %s\n", merged.MAC)
+	}
+	if merged.Hostname != "" {
+		a.printf("Hostname: %s\n", merged.Hostname)
+	}
+	if merged.VPN != "" {
+		a.printf("VPN: %s\n", merged.VPN)
 	}
 	return nil
 }
@@ -790,67 +833,129 @@ func (a *App) preferredDefaultIface() string {
 	return best
 }
 
-// RunStatus displays comprehensive network status including:
-// hostname, interface, MAC address, WiFi connection, VPN status,
-// hotspot status, and DHCP server status.
+// RunStatus shows the full network status: connection, internet reachability,
+// VPNs, hotspot and DHCP server. Data is gathered first, then rendered as
+// text or emitted as JSON, so both views come from the same facts.
 func (a *App) RunStatus() error {
+	st := a.gatherStatus()
+	if a.JSON {
+		return a.emit("status", st)
+	}
+	a.renderStatus(st)
+	return nil
+}
+
+// gatherStatus collects every fact RunStatus reports. Failures of individual
+// probes are recorded in the result rather than aborting, matching the text
+// view where each section degrades independently.
+func (a *App) gatherStatus() statusResult {
+	st := statusResult{Interface: a.Interface, VPNs: []vpnEntry{}}
+
+	conn, err := a.NetworkMgr.GetConnectionInfo(a.Interface)
+	if err != nil {
+		a.Logger.Debug("Failed to get connection info", "error", err)
+	} else {
+		st.Connection = conn
+	}
+
+	if hostname, err := os.Hostname(); err != nil {
+		a.Logger.Debug("Failed to get hostname", "error", err)
+	} else {
+		st.Hostname = strings.TrimSpace(hostname)
+	}
+
+	if mac, err := a.NetworkMgr.GetMAC(a.Interface); err != nil {
+		a.Logger.Debug("Failed to get MAC address", "error", err)
+	} else {
+		st.MAC = mac
+		st.macKnown = true
+		if config := a.ConfigMgr.GetConfig(); config != nil {
+			policy := config.Common.MAC
+			if policy == "random" || policy == "default" || strings.Contains(policy, "??") {
+				st.MACPolicy = policy
+			}
+		}
+	}
+
+	// Internet reachability / captive portal (skipped when portal.check: off)
+	if a.portalCheckEnabled() {
+		inet := &internetResult{DefaultRoute: a.preferredDefaultIface()}
+		result, err := a.PortalDet.Check()
+		switch {
+		case err != nil:
+			// Misconfigured probe must be visible, not indistinguishable
+			// from check: off. Labeled like every other outcome (#128).
+			inet.Status = internetError
+			inet.Error = err.Error()
+		case result.Status == types.PortalStatusPortal:
+			inet.Status = internetPortal
+			inet.PortalURL = result.PortalURL
+			if inet.PortalURL == "" {
+				inet.PortalURL = result.ProbeURL
+			}
+		case result.Status == types.PortalStatusOnline:
+			inet.Status = internetOK
+		default:
+			// Offline, Unknown, and any future status — never fail open.
+			inet.Status = internetUnreachable
+		}
+		st.Internet = inet
+	}
+
+	if vpns, err := a.VPNMgr.ListVPNs(); err != nil {
+		a.Logger.Debug("Failed to list VPNs", "error", err)
+		st.VPNError = err.Error()
+	} else {
+		st.VPNs = vpnEntries(vpns)
+	}
+
+	if hs, err := a.HotspotMgr.GetStatus(); err != nil {
+		a.Logger.Debug("Failed to get hotspot status", "error", err)
+		st.HotspotError = err.Error()
+	} else if hs.Running {
+		st.Hotspot = hs
+	}
+
+	st.DHCPServer.Running = a.DHCPMgr.IsRunning()
+	return st
+}
+
+// renderStatus prints st in the human-readable layout.
+func (a *App) renderStatus(st statusResult) {
 	a.println("Network Status")
 	a.println("==============")
 
-	// Get current connection info
-	conn, connErr := a.NetworkMgr.GetConnectionInfo(a.Interface)
-	if connErr != nil {
-		a.Logger.Debug("Failed to get connection info", "error", connErr)
+	if st.Hostname != "" {
+		a.printf("\nHostname:  %s\n", st.Hostname)
 	}
+	a.printf("Interface: %s\n", st.Interface)
 
-	// Get hostname
-	hostname, err := os.Hostname()
-	if err != nil {
-		a.Logger.Debug("Failed to get hostname", "error", err)
-	} else {
-		a.printf("\nHostname:  %s\n", strings.TrimSpace(hostname))
-	}
-
-	// Interface info
-	a.printf("Interface: %s\n", a.Interface)
-
-	// Get current MAC address
-	mac, err := a.NetworkMgr.GetMAC(a.Interface)
-	if err != nil {
-		a.Logger.Debug("Failed to get MAC address", "error", err)
-	} else {
-		macInfo := mac
-		config := a.ConfigMgr.GetConfig()
-		if config != nil {
-			commonMAC := config.Common.MAC
-			if commonMAC == "random" {
-				macInfo = mac + " (random)"
-			} else if commonMAC == "default" {
-				macInfo = mac + " (randomized Apple OUI)"
-			} else if strings.Contains(commonMAC, "??") {
-				macInfo = mac + " (randomized from " + commonMAC + ")"
-			}
+	if st.macKnown {
+		macInfo := st.MAC
+		switch {
+		case st.MACPolicy == "random":
+			macInfo += " (random)"
+		case st.MACPolicy == "default":
+			macInfo += " (randomized Apple OUI)"
+		case st.MACPolicy != "":
+			macInfo += " (randomized from " + st.MACPolicy + ")"
 		}
 		a.printf("MAC:       %s\n", macInfo)
 	}
 
-	if connErr == nil && conn != nil {
+	if conn := st.Connection; conn != nil {
 		if conn.SSID != "" {
 			a.printf("SSID:      %s\n", conn.SSID)
 		}
-
 		a.printf("State:     %s\n", conn.State)
-
 		if conn.IP != nil {
 			a.printf("IP:        %s\n", conn.IP.String())
 		} else {
 			a.printf("IP:        (none)\n")
 		}
-
 		if conn.Gateway != nil {
 			a.printf("Gateway:   %s\n", conn.Gateway.String())
 		}
-
 		if len(conn.DNS) > 0 {
 			a.printf("DNS:       ")
 			for i, dns := range conn.DNS {
@@ -865,98 +970,70 @@ func (a *App) RunStatus() error {
 		a.println("State:     disconnected")
 	}
 
-	// Internet reachability / captive portal (skipped when portal.check: off)
-	if a.portalCheckEnabled() {
-		result, err := a.PortalDet.Check()
-		switch {
-		case err != nil:
-			// Misconfigured probe must be visible, not indistinguishable
-			// from check: off. Labeled like every other outcome (#128).
-			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  probe error (%v) (default IPv4 route: %s)\n", err, iface)
-			} else {
-				a.printf("Internet:  probe error (%v)\n", err)
+	if inet := st.Internet; inet != nil {
+		// Status has no connect-time route note, so every line names the
+		// probed route when known — a portal/unreachable verdict via the
+		// wrong link misleads just like a false ok. "IPv4" keeps the claim
+		// at the heuristic's actual confidence. The probe is host-wide: it
+		// follows the default route and is not scoped to Interface: above.
+		route := ""
+		if inet.DefaultRoute != "" {
+			route = " (default IPv4 route: " + inet.DefaultRoute + ")"
+		}
+		switch inet.Status {
+		case internetError:
+			a.printf("Internet:  probe error (%s)%s\n", inet.Error, route)
+		case internetPortal:
+			a.printf("Internet:  captive portal (%s)%s\n", inet.PortalURL, route)
+		case internetOK:
+			if route == "" {
+				route = " (default route)"
 			}
-		case result.Status == types.PortalStatusPortal:
-			url := result.PortalURL
-			if url == "" {
-				url = result.ProbeURL
-			}
-			// Status has no connect-time route note, so every line names
-			// the probed route when known — a portal/unreachable verdict
-			// via the wrong link misleads just like a false ok. "IPv4"
-			// keeps the claim at the heuristic's actual confidence.
-			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  captive portal (%s) (default IPv4 route: %s)\n", url, iface)
-			} else {
-				a.printf("Internet:  captive portal (%s)\n", url)
-			}
-		case result.Status == types.PortalStatusOnline:
-			// Labeled host-wide: the probe follows the default route and is
-			// not scoped to the Interface: shown above (which may even be
-			// disconnected while another link provides internet).
-			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  ok (default IPv4 route: %s)\n", iface)
-			} else {
-				a.printf("Internet:  ok (default route)\n")
-			}
+			a.printf("Internet:  ok%s\n", route)
 		default:
-			// Offline, Unknown, and any future status — never fail open.
-			if iface := a.preferredDefaultIface(); iface != "" {
-				a.printf("Internet:  unreachable (default IPv4 route: %s)\n", iface)
-			} else {
-				a.printf("Internet:  unreachable\n")
-			}
+			a.printf("Internet:  unreachable%s\n", route)
 		}
 	}
 
-	// VPN status
 	a.println("\nVPN")
 	a.println("---")
-	vpns, err := a.VPNMgr.ListVPNs()
-	if err != nil {
-		a.Logger.Debug("Failed to list VPNs", "error", err)
+	switch {
+	case st.VPNError != "":
 		a.println("(unable to query VPN status)")
-	} else if len(vpns) == 0 {
+	case len(st.VPNs) == 0:
 		a.println("(none active)")
-	} else {
-		for _, v := range vpns {
-			status := vpnStatusLabel(v)
-			a.printf("%s (%s): %s\n", v.Name, v.Type, status)
+	default:
+		for _, v := range st.VPNs {
+			a.printf("%s (%s): %s\n", v.Name, v.Type, vpnStatusLabel(v.VPNStatus))
 			if v.Interface != "" {
 				a.printf("  Interface: %s\n", v.Interface)
 			}
 		}
 	}
 
-	// Hotspot status
 	a.println("\nHotspot")
 	a.println("-------")
-	hotspotStatus, err := a.HotspotMgr.GetStatus()
-	if err != nil {
-		a.Logger.Debug("Failed to get hotspot status", "error", err)
+	switch {
+	case st.HotspotError != "":
 		a.println("(unable to query hotspot status)")
-	} else if !hotspotStatus.Running {
+	case st.Hotspot == nil:
 		a.println("(not running)")
-	} else {
-		a.printf("SSID:      %s\n", hotspotStatus.SSID)
-		a.printf("Interface: %s\n", hotspotStatus.Interface)
-		if hotspotStatus.Gateway != nil {
-			a.printf("Gateway:   %s\n", hotspotStatus.Gateway.String())
+	default:
+		a.printf("SSID:      %s\n", st.Hotspot.SSID)
+		a.printf("Interface: %s\n", st.Hotspot.Interface)
+		if st.Hotspot.Gateway != nil {
+			a.printf("Gateway:   %s\n", st.Hotspot.Gateway.String())
 		}
-		a.printf("Clients:   %d\n", hotspotStatus.Clients)
+		a.printf("Clients:   %d\n", st.Hotspot.Clients)
 	}
 
-	// DHCP server status
 	a.println("\nDHCP Server")
 	a.println("-----------")
-	if a.DHCPMgr.IsRunning() {
+	if st.DHCPServer.Running {
 		a.println("running")
 	} else {
 		a.println("(not running)")
 	}
-
-	return nil
 }
 
 // RunHotspot manages the WiFi hotspot.

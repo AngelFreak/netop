@@ -30,6 +30,7 @@ var (
 	iface      string
 	noVPN      bool
 	debug      bool
+	jsonOut    bool // --json: emit one JSON envelope on stdout
 )
 
 // Global managers (initialized in PersistentPreRun)
@@ -95,6 +96,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&iface, "iface", "", "Select networking interface")
 	rootCmd.PersistentFlags().BoolVar(&noVPN, "no-vpn", false, "Don't connect to VPN")
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug logging")
+	rootCmd.PersistentFlags().BoolVar(&jsonOut, "json", false, "Machine-readable output: one JSON envelope on stdout (see 'net ai')")
 }
 
 // commandNeedsRoot returns false for commands that can run without root privileges.
@@ -221,8 +223,14 @@ func main() {
 	_ = ctx // available for future use with ExecuteContext
 
 	if err := rootCmd.Execute(); err != nil {
+		// Every command uses Run (not RunE), so an Execute error is a
+		// flag or argument problem: a usage error.
+		if jsonOut {
+			_ = writeEnvelope(os.Stdout, envelope{Command: "net", Error: &cmdError{Code: codeUsage, Message: err.Error()}})
+			os.Exit(exitUsage)
+		}
 		fmt.Println(err)
-		os.Exit(1)
+		os.Exit(exitUsage)
 	}
 }
 
@@ -285,6 +293,7 @@ func createApp() *App {
 		Interface:  iface,
 		NoVPN:      noVPN,
 		Debug:      debug,
+		JSON:       jsonOut,
 		Stdout:     os.Stdout,
 		Stderr:     os.Stderr,
 	}

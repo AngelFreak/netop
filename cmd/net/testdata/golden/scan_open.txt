@@ -1,0 +1,3 @@
+Scanning for networks...
+Found 1 networks
+Cafe (11:22:33:44:55:66) - Signal: -70 dBm - Security: Open

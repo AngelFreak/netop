@@ -20,6 +20,7 @@ Examples:
   net mac AA:BB:CC:DD:EE:FF       Set specific MAC
   net mac default                 Randomize with Apple OUI prefix`,
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("mac")
 		mac := ""
 		if len(args) > 0 {
 			mac = args[0]

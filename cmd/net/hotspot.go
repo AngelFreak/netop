@@ -27,6 +27,7 @@ Examples:
   net hotspot start --channel 36        Start on 5GHz channel 36
   net hotspot stop                      Stop the hotspot`,
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("hotspot")
 		action := "status"
 		if len(args) > 0 {
 			action = args[0]

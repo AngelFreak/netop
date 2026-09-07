@@ -19,6 +19,7 @@ Examples:
   net stop wlan0        Bring down wlan0 only
   net stop eth0 wlan0   Bring down multiple interfaces`,
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("stop")
 		if err := createApp().RunStop(args); err != nil {
 			os.Exit(1)
 		}

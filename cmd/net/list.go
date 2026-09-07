@@ -11,7 +11,7 @@ var listCmd = &cobra.Command{
 	Short: "List active connections with IP, gateway, and DNS info",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := createApp().RunList(); err != nil {
-			os.Exit(1)
+			os.Exit(exitCode(err))
 		}
 	},
 }

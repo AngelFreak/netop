@@ -31,6 +31,7 @@ disables the automatic checks in connect and status).
 Exit codes: 0 = online, 2 = captive portal detected, 1 = offline,
 3 = configuration or internal error.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("portal")
 		status, err := createApp().RunPortal()
 		if err != nil {
 			os.Exit(3)

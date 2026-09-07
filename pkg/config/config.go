@@ -650,7 +650,7 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 
 	// Lazy load the specific network from viper
 	if !m.viper.IsSet(name) {
-		return nil, fmt.Errorf("network configuration '%s' not found", name)
+		return nil, fmt.Errorf("network configuration '%s' %w", name, types.ErrNotFound)
 	}
 
 	// Handle aliases: if the value is a plain string (e.g., "work: home"),
@@ -713,7 +713,7 @@ func (m *Manager) resolveAlias(name string, maxDepth int) (*types.NetworkConfig,
 	}
 
 	if !m.viper.IsSet(name) {
-		return nil, fmt.Errorf("alias target '%s' not found", name)
+		return nil, fmt.Errorf("alias target '%s' %w", name, types.ErrNotFound)
 	}
 
 	subV := m.viper.Sub(name)
@@ -748,7 +748,7 @@ func (m *Manager) GetVPNConfig(name string) (*types.VPNConfig, error) {
 		config, exists = m.config.VPN[strings.ToLower(name)]
 	}
 	if !exists {
-		return nil, fmt.Errorf("VPN configuration '%s' not found", name)
+		return nil, fmt.Errorf("VPN configuration '%s' %w", name, types.ErrNotFound)
 	}
 
 	return &config, nil
