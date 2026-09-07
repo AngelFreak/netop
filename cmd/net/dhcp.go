@@ -21,6 +21,7 @@ Examples:
   net dhcp start --interface eth0 --gateway 10.0.0.1  Custom gateway
   net dhcp stop                                     Stop the server`,
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("dhcp")
 		action := "status"
 		if len(args) > 0 {
 			action = args[0]

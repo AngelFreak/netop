@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,7 +15,7 @@ import (
 func decodeEnvelope(t *testing.T, out string) envelope {
 	t.Helper()
 	var env envelope
-	dec := json.NewDecoder(stringsReader(out))
+	dec := json.NewDecoder(strings.NewReader(out))
 	require.NoError(t, dec.Decode(&env), "stdout was not a JSON envelope: %q", out)
 	assert.False(t, dec.More(), "stdout carried more than one JSON document: %q", out)
 	return env

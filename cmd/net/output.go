@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/angelfreak/net/pkg/types"
 )
@@ -123,4 +124,22 @@ func (a *App) fail(command string, err error) error {
 		a.emitError(command, err)
 	}
 	return err
+}
+
+// errJSONUnsupported is returned by commands that do not implement --json
+// yet, so an agent gets an explicit usage error instead of empty stdout and
+// exit 0.
+func errJSONUnsupported(command string) error {
+	return withCode(codeUsage, fmt.Errorf("--json is not supported by 'net %s' yet", command))
+}
+
+// rejectJSON is the cobra-level guard for commands whose App method has no
+// JSON path: it writes the usage envelope and exits when --json is set.
+func rejectJSON(command string) {
+	if !jsonOut {
+		return
+	}
+	err := errJSONUnsupported(command)
+	_ = writeEnvelope(os.Stdout, envelope{Command: command, Error: &cmdError{Code: errorCode(err), Message: err.Error()}})
+	os.Exit(exitCode(err))
 }

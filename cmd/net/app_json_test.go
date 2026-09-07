@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/angelfreak/net/pkg/types"
@@ -12,8 +11,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func stringsReader(s string) *strings.Reader { return strings.NewReader(s) }
 
 // runJSON runs one read command against the golden fixture in JSON mode and
 // returns the decoded envelope plus the data payload as a generic map.
@@ -224,4 +221,16 @@ func TestJSON_Genkey(t *testing.T) {
 	require.NoError(t, json.Unmarshal(env.Data, &data))
 	assert.NotEmpty(t, data["private_key"])
 	assert.NotEmpty(t, data["public_key"])
+}
+
+func TestJSON_VPNConnect_NotYetSupported(t *testing.T) {
+	app, stdout := goldenApp()
+	app.JSON = true
+	err := app.RunVPN("work")
+	require.Error(t, err)
+	assert.Equal(t, exitUsage, exitCode(err))
+	env := decodeEnvelope(t, stdout.String())
+	assert.False(t, env.OK)
+	assert.Equal(t, "usage", env.Error.Code)
+	assert.Contains(t, env.Error.Message, "not supported")
 }

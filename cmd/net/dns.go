@@ -17,6 +17,7 @@ Examples:
   net dns 1.1.1.1 9.9.9.9      Cloudflare + Quad9
   net dns dhcp                 Restore DHCP-provided DNS`,
 	Run: func(cmd *cobra.Command, args []string) {
+		rejectJSON("dns")
 		if err := createApp().RunDNS(args); err != nil {
 			os.Exit(1)
 		}

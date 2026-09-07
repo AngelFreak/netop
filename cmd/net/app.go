@@ -611,6 +611,10 @@ func (a *App) RunVPN(arg string) error {
 		return nil
 	}
 
+	if a.JSON {
+		return a.fail("vpn", errJSONUnsupported("vpn "+arg))
+	}
+
 	if arg == "stop" {
 		err := a.VPNMgr.Disconnect("")
 		if err != nil {
