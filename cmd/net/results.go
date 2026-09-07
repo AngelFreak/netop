@@ -13,6 +13,12 @@ type scanResult struct {
 	Networks []types.WiFiNetwork `json:"networks"`
 }
 
+// aiResult carries the agent guide as one string so `net --json ai` stays a
+// normal envelope rather than a special case.
+type aiResult struct {
+	Guide string `json:"guide"`
+}
+
 type genkeyResult struct {
 	PrivateKey string `json:"private_key"`
 	PublicKey  string `json:"public_key"`

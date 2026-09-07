@@ -135,7 +135,7 @@ func commandNeedsRootArgs(args []string) bool {
 		}
 		// First positional arg is the subcommand — check if it's root-exempt
 		switch arg {
-		case "help", "completion", "status", "show", "list", "portal":
+		case "help", "completion", "status", "show", "list", "portal", "ai":
 			return false
 		default:
 			// First positional arg is not exempt, needs root
