@@ -7,12 +7,10 @@ import (
 	"time"
 )
 
-// cleanupEntry is one registered cleanup action. done guards against running
-// the action more than once (via run, or a deregister racing a run).
+// cleanupEntry is one registered cleanup action.
 type cleanupEntry struct {
 	name string
 	fn   func()
-	done bool
 }
 
 // cleanupRegistry holds cleanup actions to run on interrupt. Actions run in
@@ -56,33 +54,22 @@ func (r *cleanupRegistry) Len() int {
 	return len(r.entries)
 }
 
-// run executes all registered entries LIFO within an overall timeout budget,
-// each entry at most once. Entries run in a goroutine so a hanging one is
-// abandoned at the deadline instead of blocking process exit; abandoned
-// entries are noted on stderr.
+// run executes all registered entries LIFO within an overall timeout budget.
+// Entries are taken off the registry under the lock before anything runs, so
+// each runs at most once and a concurrent deregister cannot touch them. Each
+// entry runs in a goroutine so a hanging one is abandoned at the deadline
+// instead of blocking process exit; abandoned entries are noted on stderr.
 func (r *cleanupRegistry) run(timeout time.Duration) {
 	r.mu.Lock()
-	// Snapshot LIFO and mark consumed under the lock so a concurrent run or a
-	// deregister can't touch the same entries.
 	pending := make([]*cleanupEntry, 0, len(r.entries))
 	for i := len(r.entries) - 1; i >= 0; i-- {
-		e := r.entries[i]
-		if e.done {
-			continue
-		}
-		e.done = true
-		pending = append(pending, e)
+		pending = append(pending, r.entries[i])
 	}
 	r.entries = nil
 	r.mu.Unlock()
 
 	deadline := time.Now().Add(timeout)
 	for _, e := range pending {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			fmt.Fprintf(os.Stderr, "cleanup: timeout reached, skipping %q\n", e.name)
-			continue
-		}
 		done := make(chan struct{})
 		go func(fn func()) {
 			defer close(done)
@@ -90,7 +77,7 @@ func (r *cleanupRegistry) run(timeout time.Duration) {
 		}(e.fn)
 		select {
 		case <-done:
-		case <-time.After(remaining):
+		case <-time.After(time.Until(deadline)):
 			fmt.Fprintf(os.Stderr, "cleanup: %q did not finish within budget, abandoning\n", e.name)
 		}
 	}
