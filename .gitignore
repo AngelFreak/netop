@@ -46,3 +46,9 @@ Thumbs.db
 
 # Claude Code instructions (local only)
 CLAUDE.md
+
+# Claude Code per-machine state (skills in .claude/skills/ are tracked)
+.claude/settings.local.json
+.claude/proven-config.json
+.claude/.proven-config-version
+.claude-flow/
