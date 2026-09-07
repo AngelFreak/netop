@@ -256,6 +256,16 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 func (m *Manager) Disconnect() error {
 	m.logger.Info("Disconnecting from WiFi network", "interface", m.iface)
 
+	// Remove the temp wpa config whatever else happens below. Connect removes
+	// it on its own paths, but an interrupt mid-Connect skips that defer — the
+	// graceful-shutdown abort routes through Disconnect, so it is cleaned up
+	// here too (best-effort), and not left behind because SetDown failed.
+	defer func() {
+		if err := os.Remove(m.wpaConfigPath()); err != nil && !os.IsNotExist(err) {
+			m.logger.Debug("Failed to remove temp wpa config", "error", err)
+		}
+	}()
+
 	// Terminate wpa_supplicant for this interface only (not global)
 	m.terminateWpaSupplicant()
 

@@ -116,11 +116,12 @@ func (c *testConfigManager) GetVPNConfig(name string) (*types.VPNConfig, error) 
 
 // testWiFiManager implements types.WiFiManager for testing
 type testWiFiManager struct {
-	connections []types.Connection
-	networks    []types.WiFiNetwork
-	scanErr     error
-	connectErr  error
-	listErr     error
+	connections      []types.Connection
+	networks         []types.WiFiNetwork
+	scanErr          error
+	connectErr       error
+	listErr          error
+	disconnectCalled bool
 }
 
 func (w *testWiFiManager) Scan() ([]types.WiFiNetwork, error) {
@@ -139,6 +140,7 @@ func (w *testWiFiManager) ConnectWithBSSID(ssid, password, bssid, hostname strin
 }
 
 func (w *testWiFiManager) Disconnect() error {
+	w.disconnectCalled = true
 	return nil
 }
 
@@ -185,13 +187,21 @@ func (v *testVPNManager) GenerateWireGuardKey() (string, string, error) {
 
 // testNetworkManager implements types.NetworkManager for testing
 type testNetworkManager struct {
-	mac            string
-	setMACErr      error
-	setDNSErr      error
-	dhcpErr        error
-	connectErr     error
-	connectionInfo *types.Connection
-	connectionErr  error
+	mac             string
+	setMACErr       error
+	setDNSErr       error
+	dhcpErr         error
+	connectErr      error
+	connectionInfo  *types.Connection
+	connectionErr   error
+	disconnected    []string // interfaces passed to Disconnect, in order
+	unlockDNSCalled bool
+	lockDNSHook     func() // runs inside LockDNS, to model an interrupt there
+}
+
+func (n *testNetworkManager) UnlockDNS() error {
+	n.unlockDNSCalled = true
+	return nil
 }
 
 func (n *testNetworkManager) SetMAC(iface, mac string) error {
@@ -215,6 +225,9 @@ func (n *testNetworkManager) ClearDNSIfOwned() (bool, error) {
 }
 
 func (n *testNetworkManager) LockDNS() {
+	if n.lockDNSHook != nil {
+		n.lockDNSHook()
+	}
 }
 
 func (n *testNetworkManager) DHCPRenew(iface, hostname string) error {
@@ -260,6 +273,7 @@ func (n *testNetworkManager) GetConnectionInfo(iface string) (*types.Connection,
 }
 
 func (n *testNetworkManager) Disconnect(iface string) error {
+	n.disconnected = append(n.disconnected, iface)
 	return nil
 }
 
@@ -2013,4 +2027,205 @@ func TestApp_RunDHCPServer_StatusUnknownReasonHasNoEmptyParens(t *testing.T) {
 	assert.NoError(t, app.RunDHCPServer("status", nil))
 	assert.Contains(t, stdout.String(), "Sharing:   NOT active\n")
 	assert.NotContains(t, stdout.String(), "()")
+}
+
+// --- graceful-shutdown cleanup registration (issue #10) ---
+
+func TestApp_RunConnect_DeregistersCleanupsOnSuccess(t *testing.T) {
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.NoError(t, err)
+	// A successful connect must leave nothing registered: the abort action is
+	// deregistered, and unlock-resolv.conf is deregistered so the intentional
+	// DNS lock persists past exit.
+	assert.Equal(t, 0, reg.Len(), "successful connect must deregister all cleanups")
+}
+
+func TestApp_RunConnect_DeregistersCleanupsOnError(t *testing.T) {
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	app.WiFiMgr = &testWiFiManager{connectErr: errors.New("association failed")}
+
+	err := app.RunConnect("TestSSID", "password123")
+	assert.Error(t, err)
+	// An error return must not leak a registered abort action.
+	assert.Equal(t, 0, reg.Len(), "failed connect must deregister its cleanups")
+}
+
+func TestApp_RunConnect_AbortRunsWiFiDisconnect(t *testing.T) {
+	// Simulate an interrupt arriving mid-connect: WiFiMgr.Connect drains the
+	// registry (as the signal handler would), and the registered abort action
+	// must invoke WiFiMgr.Disconnect to restore consistent state.
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	wifi := &interruptingWiFiManager{reg: reg}
+	app.WiFiMgr = wifi
+
+	_ = app.RunConnect("TestSSID", "password123")
+	assert.True(t, wifi.disconnectCalled, "interrupt mid-connect must run abort → WiFiMgr.Disconnect")
+}
+
+// interruptingWiFiManager drains the cleanup registry during Connect to model a
+// signal handler firing while the connect is in flight.
+type interruptingWiFiManager struct {
+	testWiFiManager
+	reg *cleanupRegistry
+}
+
+func (w *interruptingWiFiManager) Connect(ssid, password, hostname string) error {
+	w.reg.run(time.Second) // interrupt fires mid-connect
+	return w.connectErr
+}
+
+func TestApp_RunConnect_InterruptDuringVPNKeepsWiFi(t *testing.T) {
+	// Once WiFi is established, `net connect` semantics match a VPN failure:
+	// the connection stays up. An interrupt during a hanging VPN bring-up must
+	// therefore NOT tear down the healthy WiFi — the abort action has to be
+	// deregistered at establishment, not at RunConnect return.
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{
+		config: &types.Config{
+			Networks: map[string]types.NetworkConfig{"home": {SSID: "Home", VPN: "myvpn"}},
+			VPN:      map[string]types.VPNConfig{"myvpn": {Type: "wireguard"}},
+		},
+		networkConfig: &types.NetworkConfig{SSID: "Home", VPN: "myvpn"},
+	}
+	wifi := &testWiFiManager{
+		connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}},
+	}
+	app.WiFiMgr = wifi
+	app.VPNMgr = &interruptingVPNManager{reg: reg}
+
+	err := app.RunConnect("home", "")
+	assert.NoError(t, err)
+	assert.False(t, wifi.disconnectCalled, "interrupt during VPN must not tear down established WiFi")
+	assert.Equal(t, 0, reg.Len())
+}
+
+// interruptingVPNManager drains the cleanup registry during VPN Connect to
+// model a signal handler firing during VPN bring-up, after WiFi is up.
+type interruptingVPNManager struct {
+	testVPNManager
+	reg *cleanupRegistry
+}
+
+func (v *interruptingVPNManager) Connect(name string) error {
+	v.reg.run(time.Second) // interrupt fires during VPN bring-up
+	return nil
+}
+
+// preflightInterruptingVPNManager drains the registry during the preflight
+// VPN disconnect, i.e. before any new link has been touched.
+type preflightInterruptingVPNManager struct {
+	testVPNManager
+	reg *cleanupRegistry
+}
+
+func (v *preflightInterruptingVPNManager) Disconnect(name string) error {
+	v.reg.run(time.Second)
+	return nil
+}
+
+func TestApp_RunConnect_InterruptDuringPreflightLeavesExistingLinkAlone(t *testing.T) {
+	// Ctrl-C while the preflight VPN teardown hangs: nothing new was brought
+	// up, so the user's current WiFi and DNS must survive untouched.
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	wifi := &testWiFiManager{}
+	app.WiFiMgr = wifi
+	netMgr := &testNetworkManager{}
+	app.NetworkMgr = netMgr
+	app.VPNMgr = &preflightInterruptingVPNManager{reg: reg}
+
+	_ = app.RunConnect("TestSSID", "password123")
+	assert.False(t, wifi.disconnectCalled, "preflight interrupt must not tear down the existing WiFi")
+	assert.Empty(t, netMgr.disconnected)
+	assert.False(t, netMgr.unlockDNSCalled)
+}
+
+// interruptingNetworkManager drains the registry inside
+// ConnectToConfiguredNetwork, after the interface has been auto-detected,
+// modelling an interrupt while DHCP is in flight on the configured path.
+type interruptingNetworkManager struct {
+	testNetworkManager
+	reg *cleanupRegistry
+}
+
+func (n *interruptingNetworkManager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
+	if config.SSID != "" {
+		config.Interface = "wlan0"
+	} else {
+		config.Interface = "eth0"
+	}
+	n.reg.run(time.Second)
+	return errors.New("interrupted")
+}
+
+func TestApp_RunConnect_InterruptDuringConfiguredWiredTearsDownWired(t *testing.T) {
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{
+		config:        &types.Config{Networks: map[string]types.NetworkConfig{"wired": {}}},
+		networkConfig: &types.NetworkConfig{},
+	}
+	netMgr := &interruptingNetworkManager{reg: reg}
+	app.NetworkMgr = netMgr
+
+	_ = app.RunConnect("wired", "")
+	assert.Equal(t, []string{"eth0"}, netMgr.disconnected, "wired abort must tear down the wired interface")
+	assert.True(t, netMgr.unlockDNSCalled, "configured path locks DNS inside the manager; abort must unlock it")
+	assert.Equal(t, 0, reg.Len())
+}
+
+func TestApp_RunConnect_InterruptDuringConfiguredWiFiTearsDownWiFiAndUnlocksDNS(t *testing.T) {
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{
+		config:        &types.Config{Networks: map[string]types.NetworkConfig{"home": {SSID: "Home"}}},
+		networkConfig: &types.NetworkConfig{SSID: "Home"},
+	}
+	wifi := &testWiFiManager{}
+	app.WiFiMgr = wifi
+	netMgr := &interruptingNetworkManager{reg: reg}
+	app.NetworkMgr = netMgr
+
+	_ = app.RunConnect("home", "")
+	assert.True(t, wifi.disconnectCalled)
+	assert.Empty(t, netMgr.disconnected, "WiFi abort must not touch wired interfaces")
+	assert.True(t, netMgr.unlockDNSCalled)
+	assert.Equal(t, 0, reg.Len())
+}
+
+func TestApp_RunConnect_PlainSSIDUnlockGoesThroughNetworkManager(t *testing.T) {
+	// Interrupt while LockDNS is in progress on the plain-SSID path: the
+	// unlock must go through NetworkManager so the ownership marker is
+	// cleared too, not just the immutable bit.
+	app, _, _ := newTestApp()
+	reg := &cleanupRegistry{}
+	app.cleanups = reg
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	netMgr := &testNetworkManager{}
+	netMgr.lockDNSHook = func() { reg.run(time.Second) }
+	app.NetworkMgr = netMgr
+	app.WiFiMgr = &testWiFiManager{connections: []types.Connection{{Interface: "wlan0", IP: net.ParseIP("192.168.1.100")}}}
+
+	_ = app.RunConnect("TestSSID", "password123")
+	assert.True(t, netMgr.unlockDNSCalled)
 }
