@@ -916,7 +916,10 @@ func (a *App) gatherStatus() statusResult {
 		st.Hotspot = hs
 	}
 
-	st.DHCPServer.Running = a.DHCPMgr.IsRunning()
+	if st.DHCPServer.Running = a.DHCPMgr.IsRunning(); st.DHCPServer.Running {
+		nat := a.DHCPMgr.NATStatus()
+		st.DHCPServer.Sharing = &nat
+	}
 	return st
 }
 
@@ -1031,8 +1034,22 @@ func (a *App) renderStatus(st statusResult) {
 	a.println("-----------")
 	if st.DHCPServer.Running {
 		a.println("running")
+		a.printf("Sharing:   %s\n", sharingLabel(*st.DHCPServer.Sharing))
 	} else {
 		a.println("(not running)")
+	}
+}
+
+// sharingLabel renders a NAT verdict for status output. An unknown reason
+// (state written by an older version) gets no empty parentheses.
+func sharingLabel(nat types.NATState) string {
+	switch {
+	case nat.Active:
+		return "via " + nat.OutInterface
+	case nat.Reason != "":
+		return "NOT active (" + nat.Reason + ")"
+	default:
+		return "NOT active"
 	}
 }
 
@@ -1119,6 +1136,18 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 		a.printf("  IP Range:  %s\n", config.IPRange)
 		a.printf("  Lease:     %s\n", config.LeaseTime)
 
+		// Internet sharing is the reason most people run this command, and it can
+		// fail independently of the server starting. Say so plainly instead of
+		// leaving the user to discover it from a client with no connectivity.
+		nat := a.DHCPMgr.NATStatus()
+		if nat.Active {
+			a.printf("  Sharing:   via %s\n", nat.OutInterface)
+		} else {
+			a.errorf("\n⚠ Internet sharing is NOT active: %s\n", nat.Reason)
+			a.errorf("  Clients will get an IP address but will not reach the internet.\n")
+			a.errorf("  Check that another interface has a default route, then re-run.\n")
+		}
+
 	case "stop":
 		err := a.DHCPMgr.Stop()
 		if err != nil {
@@ -1139,6 +1168,7 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 			a.printf("  Gateway:   %s\n", cfg.Gateway)
 			a.printf("  IP Range:  %s\n", cfg.IPRange)
 		}
+		a.printf("  Sharing:   %s\n", sharingLabel(a.DHCPMgr.NATStatus()))
 		leases, err := a.DHCPMgr.GetLeases()
 		if err != nil {
 			a.Logger.Warn("Failed to read leases", "error", err)

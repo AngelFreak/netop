@@ -65,7 +65,7 @@ func goldenApp() (*App, *bytes.Buffer) {
 	app.HotspotMgr = &testHotspotManager{status: &types.HotspotStatus{
 		Interface: "wlan1", SSID: "Share", Running: true, Clients: 2, Gateway: net.ParseIP("192.168.50.1"),
 	}}
-	app.DHCPMgr = &testDHCPManager{running: true}
+	app.DHCPMgr = &testDHCPManager{running: true, natState: types.NATState{Active: true, OutInterface: "wlan0"}}
 	app.PortalDet = &testPortalDetector{results: []types.PortalResult{{Status: types.PortalStatusOnline}}}
 	app.RouteMgr = &fakenetlink.RouteManager{Routes: []types.Route{
 		{Dst: "default", Gw: "192.168.1.1", Iface: "wlan0", Metric: 600},

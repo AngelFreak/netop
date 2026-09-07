@@ -27,3 +27,4 @@ Clients:   2
 DHCP Server
 -----------
 running
+Sharing:   via wlan0

@@ -222,6 +222,19 @@ type DHCPServerConfig struct {
 	Netmask   string   `yaml:"netmask" mapstructure:"netmask"`   // CIDR bits, e.g., "24" for /24. Defaults to "24"
 	DNS       []string `yaml:"dns" mapstructure:"dns"`
 	LeaseTime string   `yaml:"lease_time" mapstructure:"lease_time"` // e.g., "12h"
+	// RequireNAT makes internet sharing mandatory: if NAT/forwarding cannot be
+	// configured, Start fails instead of leaving a DHCP server that hands out
+	// leases with no route to the internet.
+	RequireNAT bool `yaml:"require_nat" mapstructure:"require_nat"`
+}
+
+// NATState reports whether internet sharing is actually active for a running
+// DHCP server. Reason explains why it is not when Active is false, so callers
+// can tell the user their clients will get leases but no internet.
+type NATState struct {
+	Active       bool   `json:"active"`
+	OutInterface string `json:"out_interface,omitempty"` // uplink being masqueraded through, when Active
+	Reason       string `json:"reason,omitempty"`        // why sharing is not active, when !Active; empty if unknown
 }
 
 // Interfaces for dependency injection and testing
@@ -362,6 +375,9 @@ type DHCPManager interface {
 	IsRunning() bool
 	GetLeases() ([]DHCPLease, error)
 	GetCurrentConfig() *DHCPServerConfig
+	// NATStatus reports whether internet sharing is active, and why not if it
+	// isn't. Callers use it to warn that clients will get leases but no route out.
+	NATStatus() NATState
 }
 
 // DHCPClientManager handles DHCP client operations (obtaining leases from a server)
