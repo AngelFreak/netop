@@ -349,6 +349,10 @@ sudo net stop
 | `mac random` | Randomize MAC |
 | `mac default` | Restore original MAC |
 | `genkey` | Generate WireGuard keypair |
+| `hotspot start\|stop\|status` | Share your connection over WiFi (AP mode) |
+| `share start --interface <iface>` | Share your connection over ethernet (DHCP + NAT); `dhcp` is an alias |
+| `share status` | Show sharing state and DHCP leases |
+| `share stop` | Stop sharing |
 | `show <name>` | Show network config |
 
 ### 🚩 Global Flags

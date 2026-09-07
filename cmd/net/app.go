@@ -916,7 +916,10 @@ func (a *App) gatherStatus() statusResult {
 		st.Hotspot = hs
 	}
 
-	st.DHCPServer.Running = a.DHCPMgr.IsRunning()
+	if st.DHCPServer.Running = a.DHCPMgr.IsRunning(); st.DHCPServer.Running {
+		nat := a.DHCPMgr.NATStatus()
+		st.DHCPServer.Sharing = &nat
+	}
 	return st
 }
 
@@ -1031,8 +1034,22 @@ func (a *App) renderStatus(st statusResult) {
 	a.println("-----------")
 	if st.DHCPServer.Running {
 		a.println("running")
+		a.printf("Sharing:   %s\n", sharingLabel(*st.DHCPServer.Sharing))
 	} else {
 		a.println("(not running)")
+	}
+}
+
+// sharingLabel renders a NAT verdict for status output. An unknown reason
+// (state written by an older version) gets no empty parentheses.
+func sharingLabel(nat types.NATState) string {
+	switch {
+	case nat.Active:
+		return "via " + nat.OutInterface
+	case nat.Reason != "":
+		return "NOT active (" + nat.Reason + ")"
+	default:
+		return "NOT active"
 	}
 }
 
@@ -1151,11 +1168,7 @@ func (a *App) RunDHCPServer(action string, config *types.DHCPServerConfig) error
 			a.printf("  Gateway:   %s\n", cfg.Gateway)
 			a.printf("  IP Range:  %s\n", cfg.IPRange)
 		}
-		if nat := a.DHCPMgr.NATStatus(); nat.Active {
-			a.printf("  Sharing:   via %s\n", nat.OutInterface)
-		} else {
-			a.printf("  Sharing:   NOT active (%s)\n", nat.Reason)
-		}
+		a.printf("  Sharing:   %s\n", sharingLabel(a.DHCPMgr.NATStatus()))
 		leases, err := a.DHCPMgr.GetLeases()
 		if err != nil {
 			a.Logger.Warn("Failed to read leases", "error", err)

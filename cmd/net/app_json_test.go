@@ -70,7 +70,9 @@ func TestJSON_Status(t *testing.T) {
 	assert.Equal(t, float64(2), hs["clients"])
 	assert.Equal(t, "192.168.50.1", hs["gateway"])
 
-	assert.Equal(t, map[string]any{"running": true}, data["dhcp_server"])
+	dhcp := data["dhcp_server"].(map[string]any)
+	assert.Equal(t, true, dhcp["running"])
+	assert.Equal(t, map[string]any{"active": true, "out_interface": "wlan0"}, dhcp["sharing"])
 }
 
 func TestJSON_Status_DisconnectedAndPortal(t *testing.T) {
@@ -233,4 +235,32 @@ func TestJSON_VPNConnect_NotYetSupported(t *testing.T) {
 	assert.False(t, env.OK)
 	assert.Equal(t, "usage", env.Error.Code)
 	assert.Contains(t, env.Error.Message, "not supported")
+}
+
+func TestJSON_Status_IncludesSharingWhenDHCPRunning(t *testing.T) {
+	app, stdout := goldenApp()
+	app.JSON = true
+	app.DHCPMgr = &testDHCPManager{running: true, natState: types.NATState{Active: true, OutInterface: "wlan0"}}
+
+	require.NoError(t, app.RunStatus())
+	env := decodeEnvelope(t, stdout.String())
+	var data map[string]any
+	require.NoError(t, json.Unmarshal(env.Data, &data))
+	dhcp := data["dhcp_server"].(map[string]any)
+	assert.Equal(t, true, dhcp["running"])
+	sharing := dhcp["sharing"].(map[string]any)
+	assert.Equal(t, true, sharing["active"])
+	assert.Equal(t, "wlan0", sharing["out_interface"])
+}
+
+func TestJSON_Status_NoSharingBlockWhenDHCPStopped(t *testing.T) {
+	app, stdout := goldenApp()
+	app.JSON = true
+	app.DHCPMgr = &testDHCPManager{}
+
+	require.NoError(t, app.RunStatus())
+	env := decodeEnvelope(t, stdout.String())
+	var data map[string]any
+	require.NoError(t, json.Unmarshal(env.Data, &data))
+	assert.Equal(t, map[string]any{"running": false}, data["dhcp_server"])
 }

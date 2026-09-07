@@ -1046,7 +1046,7 @@ func TestStart_PersistsStateFile(t *testing.T) {
 	// recorded prior ip_forward value ("0" from the redirected sysctl file).
 	data, err := os.ReadFile(mgr.stateFile)
 	assert.NoError(t, err)
-	assert.Equal(t, "eth0|wlan0|0", string(data))
+	assert.Equal(t, "eth0|wlan0|0|", string(data), "iface|uplink|prev ip_forward|reason (empty while sharing is active)")
 }
 
 func TestStart_WithDifferentNetmasks(t *testing.T) {
@@ -1246,4 +1246,112 @@ func TestStart_RequireNATPreservesReasonAfterRollback(t *testing.T) {
 	assert.False(t, status.Active)
 	assert.Contains(t, status.Reason, "no outbound interface",
 		"rollback must not erase why sharing failed")
+}
+
+// newSiblingManager returns a fresh manager over the same runtime files as
+// mgr: the way a second `net share status` invocation sees the first one's
+// state, since every CLI call is a new process with empty in-memory fields.
+func newSiblingManager(mgr *dhcpManagerImpl) *dhcpManagerImpl {
+	sib := NewDHCPManager(newMockExecutor(), &mockLogger{}).(*dhcpManagerImpl)
+	sib.dnsmasqPidFile = mgr.dnsmasqPidFile
+	sib.dnsmasqConfFile = mgr.dnsmasqConfFile
+	sib.stateFile = mgr.stateFile
+	sib.linkMgr, sib.addrMgr, sib.routeMgr, sib.firewall = mgr.linkMgr, mgr.addrMgr, mgr.routeMgr, mgr.firewall
+	return sib
+}
+
+func startForNATTest(t *testing.T, mgr *dhcpManagerImpl, executor *mockExecutor) {
+	t.Helper()
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	t.Cleanup(system.SetIPForwardPathForTest(ipfPath))
+	config := &types.DHCPServerConfig{
+		Interface: "eth0",
+		Gateway:   "192.168.100.1",
+		IPRange:   "192.168.100.50,192.168.100.150",
+	}
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+	assert.NoError(t, mgr.Start(config))
+}
+
+// TestNATStatus_ActiveStateVisibleToNewProcess is the cross-process contract:
+// a manager that did not itself call Start must still report the sharing
+// state (and the config) persisted by the one that did.
+func TestNATStatus_ActiveStateVisibleToNewProcess(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+	startForNATTest(t, mgr, executor)
+
+	sib := newSiblingManager(mgr)
+	status := sib.NATStatus()
+	assert.True(t, status.Active, "sharing state must survive a process boundary")
+	assert.Equal(t, "wlan0", status.OutInterface)
+	assert.Empty(t, status.Reason)
+
+	cfg := sib.GetCurrentConfig()
+	if assert.NotNil(t, cfg, "current config must be recoverable from the state file") {
+		assert.Equal(t, "eth0", cfg.Interface)
+	}
+}
+
+// TestNATStatus_FailureReasonVisibleToNewProcess: the non-strict "started
+// without an uplink" case must explain itself to a later status call too.
+func TestNATStatus_FailureReasonVisibleToNewProcess(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+	mgr.routeMgr.(*fake.RouteManager).Routes = nil
+	startForNATTest(t, mgr, executor)
+
+	status := newSiblingManager(mgr).NATStatus()
+	assert.False(t, status.Active)
+	assert.Contains(t, status.Reason, "no outbound interface")
+}
+
+// TestNATStatus_NothingPersistedIsZero guards the other direction: with no
+// state file at all, a fresh manager reports the zero value and does not
+// invent a config.
+func TestNATStatus_NothingPersistedIsZero(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+	os.Remove(mgr.stateFile)
+
+	assert.Equal(t, types.NATState{}, mgr.NATStatus())
+	assert.Nil(t, mgr.GetCurrentConfig())
+}
+
+// TestNATStatus_LegacyStateFileWithoutReason: state files written before the
+// reason field existed have three fields; they must still load and must not
+// fabricate a reason.
+func TestNATStatus_LegacyStateFileWithoutReason(t *testing.T) {
+	mgr, _ := setupTestManager()
+	defer cleanup(mgr)
+	assert.NoError(t, os.WriteFile(mgr.stateFile, []byte("eth0|wlan0|0"), 0600))
+
+	status := mgr.NATStatus()
+	assert.True(t, status.Active)
+	assert.Equal(t, "wlan0", status.OutInterface)
+	assert.Equal(t, "eth0", mgr.GetCurrentConfig().Interface)
+}
+
+// TestStart_RequireNAT_ReasonSurvivesRollback pins the strict-mode contract
+// after the rollback restructure: the server is torn down, and the reason is
+// still reported by the same manager.
+func TestStart_RequireNAT_ReasonSurvivesRollback(t *testing.T) {
+	mgr, executor := setupTestManager()
+	defer cleanup(mgr)
+	mgr.routeMgr.(*fake.RouteManager).Routes = nil
+
+	ipfPath := filepath.Join(t.TempDir(), "ip_forward")
+	assert.NoError(t, os.WriteFile(ipfPath, []byte("0"), 0644))
+	t.Cleanup(system.SetIPForwardPathForTest(ipfPath))
+	executor.commands[fmt.Sprintf("dnsmasq -C %s -x %s", mgr.dnsmasqConfFile, mgr.dnsmasqPidFile)] = ""
+
+	err := mgr.Start(&types.DHCPServerConfig{
+		Interface: "eth0", Gateway: "192.168.100.1", IPRange: "192.168.100.50,192.168.100.150", RequireNAT: true,
+	})
+	assert.Error(t, err)
+	assert.Nil(t, mgr.GetCurrentConfig(), "rolled back")
+	_, statErr := os.Stat(mgr.stateFile)
+	assert.True(t, os.IsNotExist(statErr), "state file removed on rollback")
+	assert.Contains(t, mgr.NATStatus().Reason, "no outbound interface")
 }

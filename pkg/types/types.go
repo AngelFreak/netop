@@ -232,9 +232,9 @@ type DHCPServerConfig struct {
 // DHCP server. Reason explains why it is not when Active is false, so callers
 // can tell the user their clients will get leases but no internet.
 type NATState struct {
-	Active       bool
-	OutInterface string // uplink being masqueraded through, when Active
-	Reason       string // why sharing is not active, when !Active
+	Active       bool   `json:"active"`
+	OutInterface string `json:"out_interface,omitempty"` // uplink being masqueraded through, when Active
+	Reason       string `json:"reason,omitempty"`        // why sharing is not active, when !Active; empty if unknown
 }
 
 // Interfaces for dependency injection and testing

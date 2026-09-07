@@ -1985,3 +1985,32 @@ func TestApp_RunDHCPServer_StatusShowsSharingState(t *testing.T) {
 	assert.Contains(t, stdout.String(), "Sharing:   NOT active")
 	assert.Contains(t, stdout.String(), "iptables refused")
 }
+
+// TestApp_RunStatus_ShowsSharingState: the aggregate status command is what
+// users run when something is wrong, so it must carry the same sharing
+// signal `share status` does.
+func TestApp_RunStatus_ShowsSharingState(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{running: true, natState: types.NATState{Active: true, OutInterface: "wlan0"}}
+
+	assert.NoError(t, app.RunStatus())
+	assert.Contains(t, stdout.String(), "running\nSharing:   via wlan0\n")
+}
+
+func TestApp_RunStatus_ShowsSharingFailure(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{running: true, natState: types.NATState{Reason: "iptables refused"}}
+
+	assert.NoError(t, app.RunStatus())
+	assert.Contains(t, stdout.String(), "Sharing:   NOT active (iptables refused)")
+}
+
+// An unknown reason (legacy state file) must not print empty parentheses.
+func TestApp_RunDHCPServer_StatusUnknownReasonHasNoEmptyParens(t *testing.T) {
+	app, stdout, _ := newTestApp()
+	app.DHCPMgr = &testDHCPManager{running: true, currentConfig: &types.DHCPServerConfig{Interface: "eth0"}}
+
+	assert.NoError(t, app.RunDHCPServer("status", nil))
+	assert.Contains(t, stdout.String(), "Sharing:   NOT active\n")
+	assert.NotContains(t, stdout.String(), "()")
+}

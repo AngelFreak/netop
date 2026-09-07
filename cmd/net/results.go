@@ -72,13 +72,18 @@ type statusResult struct {
 	VPNError     string               `json:"vpn_error,omitempty"`
 	Hotspot      *types.HotspotStatus `json:"hotspot"`
 	HotspotError string               `json:"hotspot_error,omitempty"`
-	DHCPServer   struct {
-		Running bool `json:"running"`
-	} `json:"dhcp_server"`
+	DHCPServer   dhcpServerResult     `json:"dhcp_server"`
 
 	// macKnown distinguishes "MAC lookup failed" (line omitted in text)
 	// from an empty address; JSON just omits the field.
 	macKnown bool
+}
+
+type dhcpServerResult struct {
+	Running bool `json:"running"`
+	// Sharing is present only while the server runs: whether clients get a
+	// route to the internet, and why not if they don't.
+	Sharing *types.NATState `json:"sharing,omitempty"`
 }
 
 type showCommon struct {

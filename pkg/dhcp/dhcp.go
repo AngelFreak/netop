@@ -115,18 +115,15 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 	// server that hands out leases with no route to the internet, so the reason
 	// is recorded in natState for callers to surface rather than only logged.
 	if err := d.setupNAT(config.Interface); err != nil {
-		failed := types.NATState{Reason: err.Error()}
-		d.natState = failed
+		d.natState = types.NATState{Reason: err.Error()}
 		d.logger.Warn("Internet sharing is NOT active", "error", err.Error())
 		if config.RequireNAT {
-			// Strict mode: don't leave a half-working server behind.
+			// Strict mode: don't leave a half-working server behind. teardown
+			// leaves natState alone, so the reason stays reportable.
 			d.currentConfig = config
-			if stopErr := d.Stop(); stopErr != nil {
+			if stopErr := d.teardown(); stopErr != nil {
 				d.logger.Warn("Failed to roll back after NAT failure", "error", stopErr.Error())
 			}
-			// Stop clears natState; restore the reason so callers inspecting
-			// NATStatus() after a failed strict start still learn why.
-			d.natState = failed
 			return fmt.Errorf("internet sharing could not be configured: %w", err)
 		}
 	}
@@ -140,11 +137,7 @@ func (d *dhcpManagerImpl) Start(config *types.DHCPServerConfig) error {
 // Stop stops the running DHCP server
 func (d *dhcpManagerImpl) Stop() error {
 	d.logger.Info("Stopping DHCP server")
-
-	// Recover state from file if needed (e.g., after crash/restart)
-	if d.currentConfig == nil || d.outInterface == "" {
-		d.loadState()
-	}
+	d.hydrate()
 
 	if !d.IsRunning() {
 		// dnsmasq isn't running. If we have no recorded state either, there's
@@ -158,6 +151,19 @@ func (d *dhcpManagerImpl) Stop() error {
 		}
 	}
 
+	if err := d.teardown(); err != nil {
+		return err
+	}
+	d.natState = types.NATState{}
+	d.logger.Info("DHCP server stopped successfully")
+	return nil
+}
+
+// teardown removes NAT rules, stops dnsmasq, releases the interface, and
+// deletes runtime files and the persisted state. It resets the server fields
+// but deliberately leaves natState untouched: Stop clears it, while the
+// strict-mode rollback in Start keeps the failure reason reportable.
+func (d *dhcpManagerImpl) teardown() error {
 	// Clean up NAT rules first
 	if d.currentConfig != nil {
 		d.cleanupNAT(d.currentConfig.Interface)
@@ -189,10 +195,17 @@ func (d *dhcpManagerImpl) Stop() error {
 
 	d.currentConfig = nil
 	d.outInterface = ""
-	d.natState = types.NATState{}
 	os.Remove(d.stateFile)
-	d.logger.Info("DHCP server stopped successfully")
 	return nil
+}
+
+// hydrate fills in-memory state from the state file when this process has
+// none of its own. Every CLI invocation is a new process, so status and stop
+// calls would otherwise see nothing the starting process recorded.
+func (d *dhcpManagerImpl) hydrate() {
+	if d.currentConfig == nil {
+		d.loadState()
+	}
 }
 
 // IsRunning checks if the DHCP server is currently running
@@ -202,6 +215,7 @@ func (d *dhcpManagerImpl) IsRunning() bool {
 
 // GetCurrentConfig returns the current DHCP server configuration, or nil if not running
 func (d *dhcpManagerImpl) GetCurrentConfig() *types.DHCPServerConfig {
+	d.hydrate()
 	return d.currentConfig
 }
 
@@ -373,7 +387,10 @@ func (d *dhcpManagerImpl) setupNAT(dhcpIface string) error {
 }
 
 // NATStatus reports whether internet sharing is active for the running server.
+// The verdict is persisted alongside the server state, so a status call from
+// a later process sees what the starting process determined.
 func (d *dhcpManagerImpl) NATStatus() types.NATState {
+	d.hydrate()
 	return d.natState
 }
 
@@ -414,21 +431,32 @@ func (d *dhcpManagerImpl) cleanupNAT(dhcpIface string) {
 	}
 }
 
-// saveState persists DHCP interface and outInterface to a state file for crash recovery
+// saveState persists the server interface, the NAT uplink, the previous
+// ip_forward value and, when sharing is not active, the reason, so a later
+// process can recover both crash-cleanup data and the sharing verdict.
+// Fields are "|"-separated; the reason has any "|" replaced to keep the
+// format unambiguous.
 func (d *dhcpManagerImpl) saveState(dhcpIface string) {
-	content := dhcpIface + "|" + d.outInterface + "|" + d.prevIPForward
+	reason := ""
+	if !d.natState.Active {
+		reason = strings.ReplaceAll(d.natState.Reason, "|", "/")
+	}
+	content := dhcpIface + "|" + d.outInterface + "|" + d.prevIPForward + "|" + reason
 	if err := os.WriteFile(d.stateFile, []byte(content), 0600); err != nil {
 		d.logger.Debug("Failed to save DHCP state", "error", err)
 	}
 }
 
-// loadState recovers DHCP state from the state file (e.g., after crash/restart)
+// loadState recovers DHCP state from the state file (e.g., after crash/restart
+// or from a different process). Files written before the reason field existed
+// have three fields and load without one. In-memory values are never
+// overwritten: only missing fields are filled.
 func (d *dhcpManagerImpl) loadState() {
 	data, err := os.ReadFile(d.stateFile)
 	if err != nil {
 		return
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 3)
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "|", 4)
 	if len(parts) >= 1 && parts[0] != "" && d.currentConfig == nil {
 		d.currentConfig = &types.DHCPServerConfig{Interface: parts[0]}
 	}
@@ -437,6 +465,14 @@ func (d *dhcpManagerImpl) loadState() {
 	}
 	if len(parts) >= 3 && parts[2] != "" {
 		d.prevIPForward = parts[2]
+	}
+	if d.natState == (types.NATState{}) {
+		switch {
+		case d.outInterface != "":
+			d.natState = types.NATState{Active: true, OutInterface: d.outInterface}
+		case len(parts) >= 4 && parts[3] != "":
+			d.natState = types.NATState{Reason: parts[3]}
+		}
 	}
 }
 
