@@ -1,0 +1,18 @@
+Common Configuration:
+  DNS: [1.1.1.1 9.9.9.9]
+  MAC: 00:??:??:??:??:??
+  Hostname: laptop
+  VPN: work
+
+Networks:
+  home:
+    Interface: wlan0
+    SSID: HomeNet
+    VPN: work
+
+VPNs:
+  work: wireguard
+
+Ignored Interfaces:
+  docker[0-9]+
+  veth.*

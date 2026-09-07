@@ -1,0 +1,29 @@
+Network Status
+==============
+
+Hostname:  <host>
+Interface: wlan0
+MAC:       02:11:22:33:44:55 (randomized from 00:??:??:??:??:??)
+SSID:      HomeNet
+State:     connected
+IP:        192.168.1.50
+Gateway:   192.168.1.1
+DNS:       1.1.1.1, 9.9.9.9
+Internet:  ok (default IPv4 route: wlan0)
+
+VPN
+---
+work (wireguard): connected
+  Interface: wg0
+nb (netbird): disconnected? (a netbird tunnel is up; run as root to identify which profile)
+
+Hotspot
+-------
+SSID:      Share
+Interface: wlan1
+Gateway:   192.168.50.1
+Clients:   2
+
+DHCP Server
+-----------
+running

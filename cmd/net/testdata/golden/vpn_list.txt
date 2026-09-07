@@ -1,0 +1,2 @@
+work (wireguard) - connected
+nb (netbird) - disconnected? (a netbird tunnel is up; run as root to identify which profile)

@@ -2,6 +2,7 @@ package types
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"time"
@@ -10,6 +11,10 @@ import (
 // RuntimeDir is the directory for temporary runtime files (configs, pid files)
 // Using /run/net/ instead of /tmp/ to avoid symlink attacks
 const RuntimeDir = "/run/net"
+
+// ErrNotFound marks lookups of a config entry (network, VPN, alias) that
+// does not exist. Wrap it with %w so callers can classify the failure.
+var ErrNotFound = errors.New("not found")
 
 // Config represents the main configuration structure
 type Config struct {
@@ -151,30 +156,30 @@ func (n *NetworkConfig) DefaultRouteMetric() int {
 
 // WiFiNetwork represents a discovered WiFi network
 type WiFiNetwork struct {
-	SSID      string
-	BSSID     string
-	Signal    int
-	Security  string
-	Frequency int
+	SSID      string `json:"ssid"`
+	BSSID     string `json:"bssid"`
+	Signal    int    `json:"signal"`
+	Security  string `json:"security"`
+	Frequency int    `json:"frequency"`
 }
 
 // Connection represents an active network connection
 type Connection struct {
-	Interface string
-	SSID      string
-	State     string
-	IP        net.IP
-	Gateway   net.IP
-	DNS       []net.IP
+	Interface string   `json:"interface"`
+	SSID      string   `json:"ssid,omitempty"`
+	State     string   `json:"state"`
+	IP        net.IP   `json:"ip,omitempty"`
+	Gateway   net.IP   `json:"gateway,omitempty"`
+	DNS       []net.IP `json:"dns,omitempty"`
 }
 
 // VPNStatus represents VPN connection status
 type VPNStatus struct {
-	Name      string
-	Type      string
-	Connected bool
-	Interface string
-	IP        net.IP
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Connected bool   `json:"connected"`
+	Interface string `json:"interface,omitempty"`
+	IP        net.IP `json:"ip,omitempty"`
 
 	// Ambiguous marks a daemon-backed VPN (netbird, tailscale) that is known
 	// to be up while the specific config entry responsible cannot be
@@ -185,7 +190,7 @@ type VPNStatus struct {
 	// Connected stays false because attributing the session to one entry
 	// would be a guess; Ambiguous lets callers report that a tunnel exists
 	// rather than claiming everything is down.
-	Ambiguous bool
+	Ambiguous bool `json:"ambiguous"`
 }
 
 // HotspotConfig represents hotspot configuration
@@ -202,11 +207,11 @@ type HotspotConfig struct {
 
 // HotspotStatus represents hotspot status
 type HotspotStatus struct {
-	Interface string
-	SSID      string
-	Running   bool
-	Clients   int
-	Gateway   net.IP
+	Interface string `json:"interface"`
+	SSID      string `json:"ssid"`
+	Running   bool   `json:"running"`
+	Clients   int    `json:"clients"`
+	Gateway   net.IP `json:"gateway,omitempty"`
 }
 
 // DHCPServerConfig represents DHCP server configuration

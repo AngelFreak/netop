@@ -25,7 +25,7 @@ Examples:
 			arg = args[0]
 		}
 		if err := createApp().RunVPN(arg); err != nil {
-			os.Exit(1)
+			os.Exit(exitCode(err))
 		}
 	},
 }
@@ -35,7 +35,7 @@ var genkeyCmd = &cobra.Command{
 	Short: "Generate a WireGuard private/public key pair",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := createApp().RunGenkey(); err != nil {
-			os.Exit(1)
+			os.Exit(exitCode(err))
 		}
 	},
 }

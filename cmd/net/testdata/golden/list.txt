@@ -1,0 +1,7 @@
+Interface: wlan0
+SSID: HomeNet
+State: connected
+IP: 192.168.1.50
+Gateway: 192.168.1.1
+DNS: [1.1.1.1 9.9.9.9]
+

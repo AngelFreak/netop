@@ -12,7 +12,7 @@ var scanCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		showOpen := len(args) > 0 && args[0] == "open"
 		if err := createApp().RunScan(showOpen); err != nil {
-			os.Exit(1)
+			os.Exit(exitCode(err))
 		}
 	},
 }
