@@ -106,6 +106,24 @@ func (m *LinkManager) GetMAC(iface string) (string, error) {
 	return hwAddr.String(), nil
 }
 
+// GetPermanentMAC returns the factory/permanent hardware address of iface.
+//
+// The kernel populates IFLA_PERM_ADDRESS only when the current address differs
+// from the permanent one, so an empty result with a nil error means the
+// interface is currently using its permanent MAC. Unlike `ethtool -P`, this
+// needs no external binary — ethtool is absent on many minimal systems.
+func (m *LinkManager) GetPermanentMAC(iface string) (string, error) {
+	link, err := vnl.LinkByName(iface)
+	if err != nil {
+		return "", fmt.Errorf("resolving interface %q: %w", iface, err)
+	}
+	permAddr := link.Attrs().PermHWAddr
+	if permAddr == nil {
+		return "", nil
+	}
+	return permAddr.String(), nil
+}
+
 // SetMAC sets the hardware (MAC) address of iface. The interface must be down.
 func (m *LinkManager) SetMAC(iface, mac string) error {
 	hwAddr, err := parseMAC(mac)
