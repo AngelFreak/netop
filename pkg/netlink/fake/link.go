@@ -17,6 +17,9 @@ type LinkManager struct {
 	Existing map[string]bool
 	ByType   map[string][]string
 	MACs     map[string]string
+	// PermMACs maps an interface to its factory MAC (for GetPermanentMAC). As
+	// with the kernel, an absent entry means "currently on the permanent MAC".
+	PermMACs map[string]string
 
 	Upped       []string
 	Downed      []string
@@ -24,14 +27,15 @@ type LinkManager struct {
 	AddedWG     []string
 	SetMACCalls []MACCall
 
-	SetUpErr   error
-	SetDownErr error
-	DeleteErr  error
-	ExistsErr  error
-	AddWGErr   error
-	ListErr    error
-	GetMACErr  error
-	SetMACErr  error
+	SetUpErr      error
+	SetDownErr    error
+	DeleteErr     error
+	ExistsErr     error
+	AddWGErr      error
+	ListErr       error
+	GetMACErr     error
+	GetPermMACErr error
+	SetMACErr     error
 }
 
 // MACCall records the arguments of a single SetMAC invocation.
@@ -105,6 +109,14 @@ func (m *LinkManager) GetMAC(iface string) (string, error) {
 		return "", m.GetMACErr
 	}
 	return m.MACs[iface], nil
+}
+
+// GetPermanentMAC returns the configured permanent MAC for iface.
+func (m *LinkManager) GetPermanentMAC(iface string) (string, error) {
+	if m.GetPermMACErr != nil {
+		return "", m.GetPermMACErr
+	}
+	return m.PermMACs[iface], nil
 }
 
 // SetMAC records the call and updates the in-memory MAC.
