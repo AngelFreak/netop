@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ type Manager struct {
 	// system.SetImmutable (native FS_IOC_SETFLAGS ioctl); overridable in tests
 	// so lock/unlock intent can be observed without CAP_LINUX_IMMUTABLE.
 	setImmutable func(path string, immutable bool) error
+	// rxPacketsFn reads an interface's received-frame counter, returning -1
+	// when unavailable. Defaults to a sysfs read; overridable in tests, which
+	// have no real interface.
+	rxPacketsFn func(iface string) int64
 }
 
 // NewManager creates a new network manager
@@ -49,6 +54,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
 		resolvConfPath:   "/etc/resolv.conf",
 		setImmutable:     system.SetImmutable,
+		rxPacketsFn:      rxPackets,
 	}
 }
 
@@ -725,6 +731,50 @@ func hasCarrier(iface string) bool {
 	return err == nil && strings.TrimSpace(string(b)) == "1"
 }
 
+// rxPackets returns the interface's received-frame counter, or -1 if it cannot
+// be read.
+func rxPackets(iface string) int64 {
+	b, err := os.ReadFile("/sys/class/net/" + iface + "/statistics/rx_packets")
+	if err != nil {
+		return -1
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// describeDHCPSilence turns a received-frame count into a statement about which
+// layer is blocking, given DHCP got no reply.
+//
+// The distinction decides whether a different MAC could ever work: if the
+// switch is not forwarding to us at all, no MAC will get a lease and the fix is
+// with the network operator. If frames are arriving, L2 is fine and only the
+// DHCP server is ignoring this client. Reporting the observation beats
+// asserting a cause, which cannot be known from the client side.
+func (m *Manager) rxCount(iface string) int64 {
+	if m.rxPacketsFn == nil {
+		return rxPackets(iface)
+	}
+	return m.rxPacketsFn(iface)
+}
+
+func (m *Manager) describeDHCPSilence(rx int64) string {
+	if rx < 0 {
+		return ""
+	}
+	if rx == 0 {
+		return "\n\n  No frames were received on this interface at all, so the switch port\n" +
+			"  is not forwarding to us. That points at 802.1X port authentication or\n" +
+			"  switch port security rather than the DHCP server; no MAC address will\n" +
+			"  get a lease until the port admits this device."
+	}
+	return fmt.Sprintf("\n\n  %d frames were received, so the link reached the network and only the\n"+
+		"  DHCP server stayed silent. Typical causes are a MAC allowlist or address\n"+
+		"  reservation, an exhausted pool, or a VLAN with no DHCP server.", rx)
+}
+
 // ConnectToConfiguredNetwork connects to a network based on the provided configuration
 func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	// Detect interface if not configured
@@ -839,12 +889,21 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 
 			if config.Addr == "" {
 				m.logger.Info("Obtaining DHCP lease on wired interface", "interface", config.Interface)
+				// Sample the RX counter around the attempt: if nothing at all
+				// arrived while DHCP was running, the port never forwarded to
+				// us, which is a different problem from a silent DHCP server.
+				rxBefore := m.rxCount(config.Interface)
 				err := m.StartDHCP(config.Interface, config.Hostname)
 				if err != nil {
 					// Surface the failure instead of reporting a successful
 					// connection with no lease. The WiFi path already errors
 					// out on DHCP failure; wired should be consistent.
-					return fmt.Errorf("failed to obtain DHCP lease on %s: %w", config.Interface, err)
+					var rxDelta int64 = -1
+					if rxAfter := m.rxCount(config.Interface); rxBefore >= 0 && rxAfter >= rxBefore {
+						rxDelta = rxAfter - rxBefore
+					}
+					return fmt.Errorf("failed to obtain DHCP lease on %s: %w%s",
+						config.Interface, err, m.describeDHCPSilence(rxDelta))
 				}
 				m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 			}

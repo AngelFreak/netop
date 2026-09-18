@@ -1850,3 +1850,89 @@ func TestDisconnect(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to bring interface down")
 	})
 }
+
+// On DHCP failure the error must name the layer that is blocking, not assert a
+// cause. Which layer it is determines whether MAC randomization is workable at
+// all, so the distinction is the whole value of the diagnostic.
+func TestDiagnoseDHCPFailure(t *testing.T) {
+	t.Run("no inbound frames - switch is not forwarding", func(t *testing.T) {
+		m := &Manager{logger: &mockLogger{}}
+		got := m.describeDHCPSilence(0)
+		assert.Contains(t, got, "No frames were received")
+		assert.Contains(t, got, "802.1X")
+		assert.Contains(t, got, "port security")
+	})
+
+	t.Run("inbound frames seen - L2 alive, server ignoring us", func(t *testing.T) {
+		m := &Manager{logger: &mockLogger{}}
+		got := m.describeDHCPSilence(42)
+		assert.Contains(t, got, "42")
+		assert.Contains(t, got, "reached")
+		assert.NotContains(t, got, "802.1X",
+			"must not blame port auth when the port is demonstrably forwarding")
+	})
+}
+
+// The layer diagnostic must reach the real wired DHCP failure, not just exist
+// as a helper. A diagnostic only called from its own unit test is dead code.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureReportsBlockingLayer(t *testing.T) {
+	executor := newMockExecutor()
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		rxPacketsFn:  func(string) int64 { return 0 }, // port not forwarding
+	}
+
+	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
+	assert.Contains(t, err.Error(), "No frames were received",
+		"the blocking-layer diagnostic must reach the user-facing error")
+}
+
+// With frames arriving the diagnostic must blame the DHCP server, not the port.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureL2Alive(t *testing.T) {
+	executor := newMockExecutor()
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		// Counter advances across the attempt: the delta, not the absolute
+		// value, is what shows frames actually arrived while DHCP ran.
+		rxPacketsFn: func() func(string) int64 {
+			n := int64(1000)
+			return func(string) int64 { n += 128; return n }
+		}(),
+	}
+
+	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "128 frames were received")
+	assert.NotContains(t, err.Error(), "802.1X")
+}
+
+// An unreadable counter must add nothing rather than guess.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureNoCounterNoClaim(t *testing.T) {
+	executor := newMockExecutor()
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		rxPacketsFn:  func(string) int64 { return -1 }, // unreadable
+	}
+
+	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+
+	assert.Error(t, err)
+	assert.NotContains(t, err.Error(), "802.1X")
+	assert.NotContains(t, err.Error(), "frames were received")
+}
