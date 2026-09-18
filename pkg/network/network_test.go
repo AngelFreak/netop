@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -780,10 +781,32 @@ func TestGenerateRandomMAC(t *testing.T) {
 	assert.Regexp(t, `^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`, mac)
 }
 
+// A generated MAC must be locally administered (U/L bit set in the first
+// octet). Apple's real OUI ac:bc:32 has that bit clear, so emitting it
+// verbatim claims to be genuine Apple-assigned hardware rather than a spoofed
+// address. generateRandomMAC and expandMACTemplate already set the bit; this
+// generator must not be the odd one out.
 func TestGenerateMacBookProMAC(t *testing.T) {
 	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks()}
-	mac := manager.generateMacBookProMAC()
-	assert.Regexp(t, `^ac:bc:32:[0-9a-f]{2}(:[0-9a-f]{2}){2}$`, mac)
+
+	for i := 0; i < 32; i++ {
+		mac := manager.generateMacBookProMAC()
+		assert.Regexp(t, `^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`, mac)
+
+		first, err := strconv.ParseUint(mac[0:2], 16, 8)
+		assert.NoError(t, err)
+		assert.EqualValues(t, 0x02, first&0x02,
+			"first octet %#02x of %s must have the locally-administered bit set", first, mac)
+		assert.EqualValues(t, 0, first&0x01,
+			"first octet %#02x of %s must be unicast, not multicast", first, mac)
+	}
+}
+
+// The Apple-styled generator keeps the recognisable vendor shape while still
+// flagging itself as locally administered: ac:bc:32 -> ae:bc:32.
+func TestGenerateMacBookProMAC_KeepsAppleShapeWithLocalBit(t *testing.T) {
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks()}
+	assert.Regexp(t, `^ae:bc:32:[0-9a-f]{2}(:[0-9a-f]{2}){2}$`, manager.generateMacBookProMAC())
 }
 
 func TestExpandMACTemplate(t *testing.T) {

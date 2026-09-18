@@ -244,7 +244,7 @@ func (m *Manager) SetMAC(iface, mac string) error {
 	}
 
 	if mac == "default" {
-		// Use a default MAC (random MacBook Pro style)
+		// Use a default MAC (random Apple-styled, locally administered)
 		mac = m.generateMacBookProMAC()
 	}
 
@@ -579,15 +579,21 @@ func (m *Manager) generateRandomMAC() string {
 		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }
 
+// generateMacBookProMAC returns a random Apple-styled MAC.
+//
+// The prefix is ae:bc:32, not Apple's real ac:bc:32 OUI: 0xae is 0xac with the
+// locally-administered bit set. A globally-unique address claims to be genuine
+// vendor-assigned hardware, which can collide with a real NIC and misrepresents
+// a spoofed address as factory hardware. generateRandomMAC and
+// expandMACTemplate already set this bit; this generator matches them.
 func (m *Manager) generateMacBookProMAC() string {
-	// Random MacBook Pro MAC (Apple OUI: AC:BC:32)
 	mac := make([]byte, 3)
 	_, err := rand.Read(mac)
 	if err != nil {
 		m.logger.Warn("Failed to generate random MAC, using fallback", "error", err)
-		return "ac:bc:32:00:00:01"
+		return "ae:bc:32:00:00:01"
 	}
-	return fmt.Sprintf("ac:bc:32:%02x:%02x:%02x", mac[0], mac[1], mac[2])
+	return fmt.Sprintf("ae:bc:32:%02x:%02x:%02x", mac[0], mac[1], mac[2])
 }
 
 func (m *Manager) expandMACTemplate(template string) string {
