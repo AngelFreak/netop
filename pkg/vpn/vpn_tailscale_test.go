@@ -41,12 +41,23 @@ func TestConnectTailscale_MissingBinary(t *testing.T) {
 
 func TestConnectTailscale_Success(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := &mockSystemExecutor{
-		commands: map[string]string{
-			"ip route show default": "default via 192.168.1.1 dev eth0",
-			"tailscale up --auth-key=file:" + tmpDir + "/tailscale-authkey":           "",
-			"tailscale set --accept-dns=false --exit-node=us-1 --accept-routes=false": "",
-			"tailscale status --json": `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`,
+	upCmd := "tailscale up --auth-key=file:" + tmpDir + "/tailscale-authkey --accept-dns=false --exit-node= --accept-routes=false"
+	executor := &sequencingExecutor{
+		mockSystemExecutor: mockSystemExecutor{
+			commands: map[string]string{
+				"ip route show default": "default via 192.168.1.1 dev eth0",
+				upCmd:                   "",
+				"tailscale set --accept-dns=false --exit-node=us-1 --accept-routes=false": "",
+			},
+		},
+		callSequence: map[string][]struct {
+			output string
+			err    error
+		}{
+			"tailscale status --json": {
+				{output: `{"BackendState":"NeedsLogin"}`},
+				{output: `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`},
+			},
 		},
 	}
 	logger := &mockLogger{}
@@ -66,10 +77,80 @@ func TestConnectTailscale_Success(t *testing.T) {
 
 	// The auth key must be passed via file:, never as an argv token, so it
 	// isn't visible in `ps`. The key value must not appear in any command.
-	executor.assertCommandExecuted(t, "tailscale up --auth-key=file:"+tmpDir+"/tailscale-authkey")
+	// A flagged "up" must also restate the prefs net manages, or tailscale
+	// refuses it with "requires mentioning all non-default flags".
+	executor.assertCommandExecuted(t, upCmd)
 	executor.assertCommandExecuted(t, "tailscale set --accept-dns=false --exit-node=us-1 --accept-routes=false")
 	for _, cmd := range executor.executedCommands {
 		assert.NotContains(t, cmd, "tskey-auth-xxxxx", "auth key must never appear in a command argument")
+	}
+}
+
+// A profile that is already logged in gets a bare "up", which tailscale
+// treats as "just start" without comparing flags to the current prefs. The
+// auth key is not re-sent: passing any flag would trip that comparison
+// against the --accept-dns=false that net itself set on the previous connect.
+func TestConnectTailscale_LoggedInIgnoresAuthKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Stopped before "up", Running once verification polls.
+	seq := &sequencingExecutor{
+		mockSystemExecutor: mockSystemExecutor{
+			commands: map[string]string{
+				"ip route show default": "default via 192.168.1.1 dev eth0",
+				"tailscale up":          "",
+				"tailscale set --accept-dns=false --exit-node= --accept-routes=false": "",
+			},
+		},
+		callSequence: map[string][]struct {
+			output string
+			err    error
+		}{
+			"tailscale status --json": {
+				{output: `{"BackendState":"Stopped"}`},
+				{output: `{"BackendState":"Running"}`},
+			},
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"ts": {Type: "tailscale", AuthKey: "tskey-auth-xxxxx"},
+		},
+	}
+	manager := NewManagerWithDir(seq, logger, configMgr, tmpDir)
+
+	err := manager.Connect("ts")
+	assert.NoError(t, err)
+	seq.assertCommandExecuted(t, "tailscale up")
+	for _, cmd := range seq.executedCommands {
+		assert.NotContains(t, cmd, "--auth-key", "a logged-in profile must not be re-authenticated")
+	}
+}
+
+// Without an auth key, a logged-out profile needs an interactive browser
+// login. Running "up" would block on that until the timeout with the login
+// URL swallowed, so fail fast with the exact command the user should run.
+func TestConnectTailscale_NeedsLoginWithoutAuthKeyFailsFast(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":   "default via 192.168.1.1 dev eth0",
+			"tailscale status --json": `{"BackendState":"NeedsLogin"}`,
+		},
+	}
+	logger := &mockLogger{}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"ts": {Type: "tailscale", AcceptRoutes: true},
+		},
+	}
+	manager := NewManager(executor, logger, configMgr)
+
+	err := manager.Connect("ts")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "needs login")
+	assert.Contains(t, err.Error(), "sudo tailscale up --accept-dns=false --exit-node= --accept-routes=true")
+	for _, cmd := range executor.executedCommands {
+		assert.NotContains(t, cmd, "tailscale up", "up must not run when it would block on browser login")
 	}
 }
 
@@ -214,6 +295,10 @@ func TestConnectTailscale_ProfileSwitchFailureIsFatal(t *testing.T) {
 	err := manager.Connect("work-ts")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "profile")
+	// Names match exactly and an account can span several tailnets, so the
+	// hint must steer the user to the unambiguous columns.
+	assert.Contains(t, err.Error(), "case-sensitive")
+	assert.Contains(t, err.Error(), "ID or Tailnet")
 
 	// Connecting without the requested profile would silently use the wrong
 	// account, so "up" must not run after a failed switch.
@@ -226,7 +311,7 @@ func TestConnectTailscale_FailsWhenBackendNeverRuns(t *testing.T) {
 			"ip route show default": "default via 192.168.1.1 dev eth0",
 			"tailscale up":          "",
 			"tailscale set --accept-dns=false --exit-node= --accept-routes=false": "",
-			"tailscale status --json": `{"BackendState":"NeedsLogin"}`,
+			"tailscale status --json": `{"BackendState":"Stopped"}`,
 		},
 	}
 	logger := &mockLogger{}

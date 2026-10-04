@@ -647,6 +647,33 @@ func (m *Manager) removeFile(path string) {
 	}
 }
 
+// tailscalePrefFlags returns the prefs net manages for every Tailscale
+// connection, as flags accepted by both "tailscale up" and "tailscale set".
+func tailscalePrefFlags(exitNode string, acceptRoutes bool) []string {
+	return []string{
+		"--accept-dns=false",
+		"--exit-node=" + exitNode,
+		fmt.Sprintf("--accept-routes=%t", acceptRoutes),
+	}
+}
+
+// tailscaleBackendState returns the BackendState from "tailscale status
+// --json" (e.g. "Running", "Stopped", "NeedsLogin"). The command exits zero
+// in every backend state, so an error means the daemon is unreachable.
+func (m *Manager) tailscaleBackendState() (string, error) {
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "tailscale", "status", "--json")
+	if err != nil {
+		return "", fmt.Errorf("failed to read Tailscale status (is tailscaled running?): %w", err)
+	}
+	var st struct {
+		BackendState string `json:"BackendState"`
+	}
+	if err := json.Unmarshal([]byte(output), &st); err != nil {
+		return "", fmt.Errorf("failed to parse Tailscale status: %w", err)
+	}
+	return st.BackendState, nil
+}
+
 // tailscaleStatusRunning reports whether "tailscale status --json" output
 // shows the backend in the Running state.
 func tailscaleStatusRunning(output string) bool {
@@ -760,28 +787,40 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 		m.logger.Debug("Switching Tailscale profile", "profile", config.Profile)
 		_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "switch", config.Profile)
 		if err != nil && !isEmptyStderrError(err) {
-			return fmt.Errorf("failed to switch Tailscale profile %q: %w (check 'tailscale switch --list'; net runs as root, so the profile must be visible to root)", config.Profile, err)
+			return fmt.Errorf("failed to switch Tailscale profile %q: %w (names are case-sensitive; use the ID or Tailnet column from 'sudo tailscale switch --list', since one account can belong to several tailnets)", config.Profile, err)
 		}
 	}
 
-	// Bring the interface up first. When an authkey is provided we pass it
-	// here so the node can register; otherwise a bare "up" just ensures the
-	// daemon is running (it won't block if already authenticated).
-	//
-	// The key is passed via "file:<path>" (a 0600 file) rather than as an argv
-	// token so it isn't exposed through `ps` / process inspection.
+	// A logged-in profile gets a bare "up", which tailscale treats as "just
+	// start" without comparing flags to the current prefs. Any flagged "up"
+	// must restate every non-default pref — including the --accept-dns=false
+	// net sets below — or tailscale refuses it with "requires mentioning all
+	// non-default flags". So flags are only passed when a login is needed.
+	state, err := m.tailscaleBackendState()
+	if err != nil {
+		return err
+	}
+
+	// The exit node is cleared here and applied by "set" afterwards: "up"
+	// cannot resolve an exit node hostname before the netmap is loaded.
+	loginFlags := tailscalePrefFlags("", config.AcceptRoutes)
 	upArgs := []string{"up"}
-	if config.AuthKey != "" {
+	if state == "NeedsLogin" {
+		if config.AuthKey == "" {
+			return fmt.Errorf("Tailscale profile needs login; authenticate once in a browser with: sudo tailscale up %s (or set auth_key in the config)", strings.Join(loginFlags, " "))
+		}
+		// The key is passed via "file:<path>" (a 0600 file) rather than as an
+		// argv token so it isn't exposed through `ps` / process inspection.
 		keyPath, cleanup, err := m.writeSecretFile("tailscale-authkey", config.AuthKey)
 		if err != nil {
 			return fmt.Errorf("failed to stage Tailscale auth key: %w", err)
 		}
 		defer cleanup()
 		upArgs = append(upArgs, "--auth-key=file:"+keyPath)
+		upArgs = append(upArgs, loginFlags...)
 	}
 
-	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", upArgs...)
-	if err != nil {
+	if _, err := m.executor.ExecuteWithTimeout(30*time.Second, "tailscale", upArgs...); err != nil {
 		return fmt.Errorf("failed to connect Tailscale: %w", err)
 	}
 
@@ -792,12 +831,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	// omitted flag would silently keep a previous session's exit-node or
 	// accepted routes rather than clearing them. An empty --exit-node= clears
 	// any existing exit node.
-	setArgs := []string{
-		"set",
-		"--accept-dns=false",
-		"--exit-node=" + config.ExitNode,
-		fmt.Sprintf("--accept-routes=%t", config.AcceptRoutes),
-	}
+	setArgs := append([]string{"set"}, tailscalePrefFlags(config.ExitNode, config.AcceptRoutes)...)
 
 	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", setArgs...); err != nil {
 		return fmt.Errorf("failed to apply Tailscale settings: %w", err)
