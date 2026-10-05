@@ -117,6 +117,7 @@ type VPNConfig struct {
 	AuthKey       string `yaml:"auth_key" mapstructure:"auth_key"`             // Tailscale auth key
 	ExitNode      string `yaml:"exit_node" mapstructure:"exit_node"`           // Tailscale exit node
 	AcceptRoutes  bool   `yaml:"accept_routes" mapstructure:"accept_routes"`   // Tailscale accept routes
+	AcceptDNS     bool   `yaml:"accept_dns" mapstructure:"accept_dns"`         // Tailscale: let MagicDNS manage resolv.conf
 	SetupKey      string `yaml:"setup_key" mapstructure:"setup_key"`           // NetBird setup key
 	ManagementURL string `yaml:"management_url" mapstructure:"management_url"` // NetBird management URL
 	Profile       string `yaml:"profile" mapstructure:"profile"`               // Tailscale/NetBird profile for account switching
