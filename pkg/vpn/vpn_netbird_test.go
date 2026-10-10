@@ -1,11 +1,14 @@
 package vpn
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConnectNetBird_MissingBinary(t *testing.T) {
@@ -550,4 +553,113 @@ func TestListVPNs_MultiNetBirdUnreadableProfileStillReportsDaemon(t *testing.T) 
 		assert.True(t, v.Ambiguous,
 			"%q must be flagged ambiguous so the caller can surface the live daemon", v.Name)
 	}
+}
+
+type statusStep = struct {
+	output string
+	err    error
+}
+
+// newNetBirdLoginFixture scripts "netbird status --json" as the given
+// daemon states, in call order, and lets "netbird up" fail with upErr.
+func newNetBirdLoginFixture(t *testing.T, cfg *types.VPNConfig, upCmd string, upErr error, states ...string) (*Manager, *sequencingExecutor) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	steps := make([]statusStep, 0, len(states))
+	for _, st := range states {
+		steps = append(steps, statusStep{output: `{"daemonStatus":"` + st + `"}`})
+	}
+	seq := &sequencingExecutor{
+		mockSystemExecutor: mockSystemExecutor{
+			commands: map[string]string{
+				"ip route show default":          "default via 192.168.1.1 dev eth0",
+				"netbird profile select vesperx": "Profile switched successfully to: vesperx",
+				upCmd:                            "",
+			},
+			errors: map[string]error{},
+		},
+		callSequence: map[string][]struct {
+			output string
+			err    error
+		}{"netbird status --json": steps},
+	}
+	if upErr != nil {
+		seq.errors[upCmd] = upErr
+	}
+	configMgr := &mockConfigManager{vpnConfigs: map[string]*types.VPNConfig{"nb": cfg}}
+	manager := NewManagerWithDir(seq, &mockLogger{}, configMgr, tmpDir)
+	manager.verifyAttempts = 2
+	manager.verifyDelay = 0
+	return manager, seq
+}
+
+const loginCmd = "sudo netbird profile select vesperx && sudo netbird up"
+
+// An SSO profile whose session lapsed makes "netbird up" wait for a browser
+// login whose URL net cannot show; it looked hung, and a Ctrl-C then took
+// WiFi down. When Management has refused the peer, fail fast instead, with
+// the command that logs in.
+func TestConnectNetBird_NeedsLoginFailsFast(t *testing.T) {
+	for _, state := range []string{"NeedsLogin", "SessionExpired"} {
+		t.Run(state, func(t *testing.T) {
+			manager, seq := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", nil, state)
+
+			err := manager.Connect("nb")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), loginCmd)
+			seq.assertCommandNotExecuted(t, "netbird up --disable-dns")
+		})
+	}
+}
+
+// LoginFailed is left behind by an interrupted browser login, but equally by
+// an unreachable Management, so it must not block a connect that may work.
+func TestConnectNetBird_StaleLoginFailedStillTriesUp(t *testing.T) {
+	manager, seq := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", nil, "LoginFailed", "Connected")
+
+	require.NoError(t, manager.Connect("nb"))
+	seq.assertCommandExecuted(t, "netbird up --disable-dns")
+}
+
+// When "up" does fail and the daemon is waiting on a login, the error names
+// the command that logs in rather than only the timeout.
+func TestConnectNetBird_UpFailureNamesLoginCommand(t *testing.T) {
+	upErr := errors.New("command timed out after 30s")
+	manager, _ := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", upErr, "Idle", "LoginFailed")
+
+	err := manager.Connect("nb")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command timed out after 30s")
+	assert.Contains(t, err.Error(), loginCmd)
+}
+
+func TestConnectNetBird_UpFailureWithoutLoginStateKeepsError(t *testing.T) {
+	upErr := errors.New("daemon unreachable")
+	manager, _ := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", upErr, "Idle", "Idle")
+
+	err := manager.Connect("nb")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to connect NetBird: daemon unreachable")
+	assert.NotContains(t, err.Error(), "netbird profile select")
+}
+
+// A setup key logs in without a browser, so a login-required daemon is
+// exactly what "up --setup-key-file" is for: no fail-fast.
+func TestConnectNetBird_SetupKeySkipsLoginCheck(t *testing.T) {
+	cfg := &types.VPNConfig{Type: "netbird", Profile: "vesperx", SetupKey: "XXXXXXXX"}
+	manager, seq := newNetBirdLoginFixture(t, cfg, "unused", nil, "NeedsLogin", "Connected")
+
+	require.NoError(t, manager.Connect("nb"))
+	found := false
+	for _, cmd := range seq.executedCommands {
+		if strings.HasPrefix(cmd, "netbird up --setup-key-file ") {
+			found = true
+		}
+	}
+	assert.True(t, found, "up must run with the setup key: %v", seq.executedCommands)
+}
+
+func TestNetBirdLoginCommand(t *testing.T) {
+	assert.Equal(t, loginCmd, netBirdLoginCommand("vesperx"))
+	assert.Equal(t, "sudo netbird up", netBirdLoginCommand(""))
 }

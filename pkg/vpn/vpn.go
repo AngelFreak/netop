@@ -870,6 +870,16 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 		}
 	}
 
+	// An SSO-enrolled profile whose session lapsed makes "up" wait for a
+	// browser login whose URL net cannot show, so it looks hung. When
+	// Management has already refused the peer, fail fast with the command
+	// that logs in. A setup key logs in without a browser, so it skips this.
+	if config.SetupKey == "" {
+		if st := m.netBirdDaemonStatus(); st == "NeedsLogin" || st == "SessionExpired" {
+			return fmt.Errorf("NetBird needs a login (daemon status %s); SSO logins expire, 24h by default. Log in once in a browser with: %s (or set setup_key in the config)", st, netBirdLoginCommand(config.Profile))
+		}
+	}
+
 	// Profile is applied via "profile select" above, so it is intentionally
 	// omitted from "up" here.
 	args := []string{"up"}
@@ -893,6 +903,12 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 
 	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "netbird", args...)
 	if err != nil {
+		// LoginFailed also follows an unreachable Management, so it is only
+		// trusted here, to explain an "up" that already failed.
+		switch st := m.netBirdDaemonStatus(); st {
+		case "NeedsLogin", "SessionExpired", "LoginFailed":
+			return fmt.Errorf("failed to connect NetBird: %w (daemon status %s; if this profile logs in via SSO, its session may have expired. Log in once in a browser with: %s)", err, st, netBirdLoginCommand(config.Profile))
+		}
 		return fmt.Errorf("failed to connect NetBird: %w", err)
 	}
 
@@ -903,6 +919,31 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 
 	m.logger.Info("NetBird connected")
 	return nil
+}
+
+// netBirdDaemonStatus returns the daemon's status (e.g. "Connected",
+// "NeedsLogin"), or "" when it cannot be read.
+func (m *Manager) netBirdDaemonStatus() string {
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "netbird", "status", "--json")
+	if err != nil {
+		return ""
+	}
+	var st struct {
+		DaemonStatus string `json:"daemonStatus"`
+	}
+	if err := json.Unmarshal([]byte(output), &st); err != nil {
+		return ""
+	}
+	return st.DaemonStatus
+}
+
+// netBirdLoginCommand is the interactive login for a NetBird profile, run as
+// root since that is whose profiles net uses.
+func netBirdLoginCommand(profile string) string {
+	if profile == "" {
+		return "sudo netbird up"
+	}
+	return "sudo netbird profile select " + profile + " && sudo netbird up"
 }
 
 // openVPNDevice extracts the tunnel device name from an OpenVPN config.
