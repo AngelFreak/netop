@@ -40,6 +40,11 @@ type Manager struct {
 	// poll status until it reports connected. Overridable in tests.
 	verifyAttempts int
 	verifyDelay    time.Duration
+
+	// resolv.conf lock access for Tailscale accept_dns. Default to
+	// /etc/resolv.conf and system.SetImmutable; overridable in tests.
+	resolvConfPath string
+	setImmutable   func(path string, immutable bool) error
 }
 
 // vpnState holds the state information stored in the active-vpn file
@@ -70,6 +75,8 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		runtimeDir:     runtimeDir,
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
+		resolvConfPath: "/etc/resolv.conf",
+		setImmutable:   system.SetImmutable,
 	}
 }
 
@@ -649,9 +656,9 @@ func (m *Manager) removeFile(path string) {
 
 // tailscalePrefFlags returns the prefs net manages for every Tailscale
 // connection, as flags accepted by both "tailscale up" and "tailscale set".
-func tailscalePrefFlags(exitNode string, acceptRoutes bool) []string {
+func tailscalePrefFlags(exitNode string, acceptRoutes, acceptDNS bool) []string {
 	return []string{
-		"--accept-dns=false",
+		fmt.Sprintf("--accept-dns=%t", acceptDNS),
 		"--exit-node=" + exitNode,
 		fmt.Sprintf("--accept-routes=%t", acceptRoutes),
 	}
@@ -778,6 +785,14 @@ func (m *Manager) waitForVPNStatus(cli string, statusArgs []string, connected fu
 func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	m.logger.Info("Connecting to Tailscale")
 
+	// With accept_dns, tailscaled writes resolv.conf itself (pointing it at
+	// 100.100.100.100, keeping the current servers as upstream) and restores
+	// it on "down". net's immutable lock would make that write fail, so it
+	// is released first — before a profile switch can trigger the write.
+	if config.AcceptDNS {
+		m.unlockResolvConfForTailscale()
+	}
+
 	// Switch profile if specified (for multi-account support).
 	// "tailscale switch" may return a non-zero exit code even on success
 	// (e.g. empty stderr), so only a failure with a real message counts.
@@ -793,7 +808,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	// A logged-in profile gets a bare "up", which tailscale treats as "just
 	// start" without comparing flags to the current prefs. Any flagged "up"
-	// must restate every non-default pref — including the --accept-dns=false
+	// must restate every non-default pref — including the --accept-dns
 	// net sets below — or tailscale refuses it with "requires mentioning all
 	// non-default flags". So flags are only passed when a login is needed.
 	state, err := m.tailscaleBackendState()
@@ -803,7 +818,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	// The exit node is cleared here and applied by "set" afterwards: "up"
 	// cannot resolve an exit node hostname before the netmap is loaded.
-	loginFlags := tailscalePrefFlags("", config.AcceptRoutes)
+	loginFlags := tailscalePrefFlags("", config.AcceptRoutes, config.AcceptDNS)
 	upArgs := []string{"up"}
 	if state == "NeedsLogin" {
 		if config.AuthKey == "" {
@@ -831,7 +846,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	// omitted flag would silently keep a previous session's exit-node or
 	// accepted routes rather than clearing them. An empty --exit-node= clears
 	// any existing exit node.
-	setArgs := append([]string{"set"}, tailscalePrefFlags(config.ExitNode, config.AcceptRoutes)...)
+	setArgs := append([]string{"set"}, tailscalePrefFlags(config.ExitNode, config.AcceptRoutes, config.AcceptDNS)...)
 
 	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", setArgs...); err != nil {
 		return fmt.Errorf("failed to apply Tailscale settings: %w", err)
@@ -844,6 +859,22 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	m.logger.Info("Tailscale connected")
 	return nil
+}
+
+// unlockResolvConfForTailscale clears the immutable flag net puts on
+// resolv.conf so tailscaled can write it. A failure is logged, not returned:
+// the tunnel works without it, only tailnet names won't resolve.
+func (m *Manager) unlockResolvConfForTailscale() {
+	setImmutable, path := m.setImmutable, m.resolvConfPath
+	if setImmutable == nil { // zero-value Managers built in tests
+		setImmutable = system.SetImmutable
+	}
+	if path == "" {
+		path = "/etc/resolv.conf"
+	}
+	if err := setImmutable(path, false); err != nil {
+		m.logger.Warn("Failed to unlock resolv.conf for Tailscale DNS; tailnet names may not resolve", "path", path, "error", err)
+	}
 }
 
 // isEmptyStderrError returns true when the error is a command failure with

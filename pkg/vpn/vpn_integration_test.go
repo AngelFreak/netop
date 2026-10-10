@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/angelfreak/net/tests/integration/testutil"
 	"github.com/stretchr/testify/assert"
@@ -366,4 +367,27 @@ func (l *testLogger) Warn(msg string, args ...interface{}) {
 
 func (l *testLogger) Error(msg string, args ...interface{}) {
 	l.t.Logf("[ERROR] "+msg, args...)
+}
+
+// net locks resolv.conf with the immutable flag. With accept_dns, connecting
+// Tailscale must really clear that flag, or tailscaled's write of resolv.conf
+// fails with "operation not permitted" and tailnet names never resolve.
+func TestConnectTailscale_AcceptDNSClearsImmutableFlag_Integration(t *testing.T) {
+	testutil.SkipIfNotRoot(t)
+
+	resolv := filepath.Join(t.TempDir(), "resolv.conf")
+	require.NoError(t, os.WriteFile(resolv, []byte("nameserver 1.1.1.1\n"), 0644))
+	if err := system.SetImmutable(resolv, true); err != nil {
+		t.Skipf("filesystem does not support the immutable flag: %v", err)
+	}
+	t.Cleanup(func() { _ = system.SetImmutable(resolv, false) })
+	require.Error(t, os.WriteFile(resolv, []byte("x\n"), 0644), "precondition: a locked resolv.conf rejects writes")
+
+	setCmd := "tailscale set --accept-dns=true --exit-node= --accept-routes=false"
+	manager, _, _ := newTailscaleDNSFixture(t, &types.VPNConfig{Type: "tailscale", AcceptDNS: true}, setCmd)
+	manager.resolvConfPath = resolv
+	manager.setImmutable = system.SetImmutable
+
+	require.NoError(t, manager.Connect("ts"))
+	assert.NoError(t, os.WriteFile(resolv, []byte("nameserver 100.100.100.100\n"), 0644), "tailscaled must be able to write resolv.conf after connect")
 }

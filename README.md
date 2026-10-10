@@ -493,6 +493,7 @@ vpn:
     auth_key: tskey-auth-xxxxx  # Optional: omit if logged in via browser
     exit_node: us-east-1        # Optional: route traffic through exit node
     accept_routes: true         # Optional: accept subnet routes from admin
+    accept_dns: true            # Optional: resolve tailnet names (MagicDNS)
   personal-tailscale:
     type: tailscale
     profile: me@gmail.com       # Switch to personal account
@@ -511,7 +512,7 @@ vpn:
     profile: home                          # Switch to home account
 ```
 
-> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled). Multi-account support uses `tailscale switch` and `netbird profile select` under the hood. Profiles are per-OS-user and `net` runs as root, so create them for root (e.g. `sudo netbird profile add`) — a profile that can't be selected fails the connection rather than silently using the wrong account.
+> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is controlled by `net` and MagicDNS is disabled, unless a Tailscale VPN sets `accept_dns: true`: then `net` releases its lock on `/etc/resolv.conf` and lets Tailscale point it at `100.100.100.100` with your tailnet as the search domain. Your existing DNS servers stay in use for everything else, and Tailscale restores the file on disconnect. Multi-account support uses `tailscale switch` and `netbird profile select` under the hood. Profiles are per-OS-user and `net` runs as root, so create them for root (e.g. `sudo netbird profile add`) — a profile that can't be selected fails the connection rather than silently using the wrong account.
 
 </details>
 
