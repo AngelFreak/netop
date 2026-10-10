@@ -12,6 +12,7 @@ import (
 	fakenetlink "github.com/angelfreak/net/pkg/netlink/fake"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // testLogger implements types.Logger for testing
@@ -2228,4 +2229,52 @@ func TestApp_RunConnect_PlainSSIDUnlockGoesThroughNetworkManager(t *testing.T) {
 
 	_ = app.RunConnect("TestSSID", "password123")
 	assert.True(t, netMgr.unlockDNSCalled)
+}
+
+// signalDuringVPNManager models Ctrl-C while `net vpn` hangs (e.g. `netbird
+// up` waiting on an expired SSO login): it drains the process-wide registry,
+// exactly as the signal handler in main does, from inside the VPN call.
+type signalDuringVPNManager struct {
+	testVPNManager
+	pendingAtSignal int
+}
+
+func (v *signalDuringVPNManager) interrupt() {
+	v.pendingAtSignal = defaultCleanups.Len()
+	defaultCleanups.run(time.Second)
+}
+
+func (v *signalDuringVPNManager) Connect(name string) error {
+	v.interrupt()
+	return errors.New("interrupted")
+}
+
+func (v *signalDuringVPNManager) Disconnect(name string) error {
+	v.interrupt()
+	return errors.New("interrupted")
+}
+
+// `net vpn <name>` and `net vpn stop` never touch the WiFi link, so an
+// interrupt while they hang must leave WiFi, DHCP and resolv.conf alone.
+// Uses the production registry (App.cleanups nil → defaultCleanups, the one
+// main's signal handler drains), so a cleanup registered anywhere on the
+// RunVPN path would be caught.
+func TestApp_RunVPN_InterruptLeavesWiFiAlone(t *testing.T) {
+	for _, arg := range []string{"vesperx-net", "stop"} {
+		t.Run(arg, func(t *testing.T) {
+			require.Equal(t, 0, defaultCleanups.Len(), "precondition: no leftover cleanups")
+			app, _, _ := newTestApp()
+			wifi := &testWiFiManager{}
+			netMgr := &testNetworkManager{}
+			vpn := &signalDuringVPNManager{}
+			app.WiFiMgr, app.NetworkMgr, app.VPNMgr = wifi, netMgr, vpn
+
+			_ = app.RunVPN(arg)
+
+			assert.Equal(t, 0, vpn.pendingAtSignal, "net vpn must not register interrupt cleanups")
+			assert.False(t, wifi.disconnectCalled, "interrupting net vpn must not disconnect WiFi")
+			assert.Empty(t, netMgr.disconnected)
+			assert.False(t, netMgr.unlockDNSCalled)
+		})
+	}
 }
