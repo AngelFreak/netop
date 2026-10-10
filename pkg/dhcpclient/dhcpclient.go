@@ -57,6 +57,11 @@ const (
 	// UdhcpcScriptDir holds net's udhcpc event script. Not /run/net: /run
 	// is mounted noexec on many distros, and udhcpc execs the script.
 	UdhcpcScriptDir = "/var/lib/net"
+
+	// DhclientEnterHooksDir is where Debian's dhclient-script sources
+	// enter hooks from (via run-parts, so names must match [A-Za-z0-9_-]).
+	DhclientEnterHooksDir = "/etc/dhcp/dhclient-enter-hooks.d"
+	DhclientEnterHookName = "net-dns-owned"
 )
 
 // Manager implements the DHCPClientManager interface
@@ -66,6 +71,7 @@ type Manager struct {
 	dhcpTimeout time.Duration // Configurable overall DHCP timeout (0 = use defaults)
 	runtimeDir  string        // overridable for tests; defaults to types.RuntimeDir
 	scriptDir   string        // overridable for tests; defaults to UdhcpcScriptDir
+	hooksDir    string        // overridable for tests; defaults to DhclientEnterHooksDir
 }
 
 // NewManager creates a new DHCP client manager
@@ -384,6 +390,50 @@ esac
 exit 0
 `
 
+// installDhclientHook installs net's dhclient enter hook (see
+// DhclientEnterHook). It is skipped, with a warning, where it cannot work:
+// no Debian-style hooks dir (other dhclient-scripts), or one others can
+// write to. dhclient then behaves as before: renewals may rewrite
+// resolv.conf. net never creates the dir.
+func (m *Manager) installDhclientHook() {
+	dir := m.hooksDir
+	if dir == "" {
+		dir = DhclientEnterHooksDir
+	}
+	err := func() error {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return err
+		}
+		if info.Mode().Perm()&0022 != 0 {
+			return fmt.Errorf("%q is writable by group or others", dir)
+		}
+		path := filepath.Join(dir, DhclientEnterHookName)
+		if err := system.WriteSecureFile(path, DhclientEnterHook(types.DNSOwnedPath)); err != nil {
+			return err
+		}
+		return os.Chmod(path, 0644)
+	}()
+	if err != nil {
+		m.logger.Warn("dhclient enter hook not installed; lease renewals may overwrite resolv.conf", "error", err)
+	}
+}
+
+// DhclientEnterHook returns net's dhclient enter hook. dhclient-script
+// sources enter hooks after defining make_resolv_conf (the function that
+// rewrites resolv.conf on BOUND/RENEW) and before calling it; while
+// dnsOwned exists, i.e. while net owns DNS, the hook turns it into a no-op.
+// This is the same rule net's udhcpc script applies, and the mechanism
+// Debian's own resolved-enter hook uses. Sourced, so noexec does not matter.
+func DhclientEnterHook(dnsOwned string) string {
+	return fmt.Sprintf(`# dhclient enter hook installed by net. Do not edit: net rewrites it.
+# While net owns DNS, lease renewals leave resolv.conf alone. Inert otherwise.
+if [ -e %s ]; then
+    make_resolv_conf() { :; }
+fi
+`, shellQuote(dnsOwned))
+}
+
 // udhcpcPidFile returns the pidfile path for udhcpc on the given interface.
 func (m *Manager) udhcpcPidFile(iface string) string {
 	return m.runDir() + "/udhcpc." + iface + ".pid"
@@ -441,6 +491,8 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	// Release any existing clients first
 	m.Release(iface)
+
+	m.installDhclientHook()
 
 	// Build dhclient command with optional hostname via config file
 	// Use -1 (one attempt) to prevent dhclient from retrying indefinitely,
