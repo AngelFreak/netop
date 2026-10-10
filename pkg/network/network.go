@@ -46,7 +46,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		routeMgr:         netlink.NewRouteManager(),
 		addrMgr:          netlink.NewAddrManager(),
 		linkMgr:          netlink.NewLinkManager(),
-		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
+		dnsOwnershipPath: types.DNSOwnedPath,
 		resolvConfPath:   "/etc/resolv.conf",
 		setImmutable:     system.SetImmutable,
 	}
@@ -90,7 +90,7 @@ func (m *Manager) dnsOwnedPath() string {
 	if m.dnsOwnershipPath != "" {
 		return m.dnsOwnershipPath
 	}
-	return types.RuntimeDir + "/dns-owned"
+	return types.DNSOwnedPath
 }
 
 func (m *Manager) markDNSOwned() {

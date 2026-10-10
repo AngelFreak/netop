@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -52,6 +53,10 @@ const (
 	// RetryDelay is how long to wait between DHCP attempts. Mirrors
 	// NetworkManager's autoconnect-retry behavior.
 	RetryDelay = 2 * time.Second
+
+	// UdhcpcScriptDir holds net's udhcpc event script. Not /run/net: /run
+	// is mounted noexec on many distros, and udhcpc execs the script.
+	UdhcpcScriptDir = "/var/lib/net"
 )
 
 // Manager implements the DHCPClientManager interface
@@ -60,6 +65,7 @@ type Manager struct {
 	logger      types.Logger
 	dhcpTimeout time.Duration // Configurable overall DHCP timeout (0 = use defaults)
 	runtimeDir  string        // overridable for tests; defaults to types.RuntimeDir
+	scriptDir   string        // overridable for tests; defaults to UdhcpcScriptDir
 }
 
 // NewManager creates a new DHCP client manager
@@ -248,6 +254,136 @@ func (m *Manager) Renew(iface string, hostname string) error {
 	return m.Acquire(iface, hostname)
 }
 
+// prepareUdhcpcScript writes net's udhcpc event script and checks that it
+// can actually be executed, returning its path, or "" to let udhcpc use its
+// stock script. Falling back only costs the resolv.conf protection (renewals
+// may rewrite it); handing udhcpc a script it cannot exec would cost the
+// lease itself: the interface would get no address.
+func (m *Manager) prepareUdhcpcScript() string {
+	path, err := m.writeUdhcpcScript()
+	if err == nil {
+		err = m.probeUdhcpcScript(path)
+	}
+	if err != nil {
+		m.logger.Warn("Using udhcpc's stock script; lease renewals may overwrite resolv.conf", "error", err)
+		return ""
+	}
+	return path
+}
+
+func (m *Manager) udhcpcScriptDir() string {
+	if m.scriptDir != "" {
+		return m.scriptDir
+	}
+	return UdhcpcScriptDir
+}
+
+// writeUdhcpcScript writes net's udhcpc event script and returns its path.
+// udhcpc runs it as root, so a directory others can write to is refused.
+func (m *Manager) writeUdhcpcScript() (string, error) {
+	dir := m.udhcpcScriptDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("creating %q: %w", dir, err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode().Perm()&0022 != 0 {
+		return "", fmt.Errorf("%q is writable by group or others", dir)
+	}
+	path := filepath.Join(dir, "udhcpc.script")
+	if err := system.WriteSecureFile(path, UdhcpcScript("/etc/resolv.conf", types.DNSOwnedPath)); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(path, 0700); err != nil {
+		return "", fmt.Errorf("making %q executable: %w", path, err)
+	}
+	return path, nil
+}
+
+// probeUdhcpcScript execs the script the way udhcpc will, with an event it
+// ignores, so a noexec mount or a policy denial shows up before udhcpc
+// depends on it.
+func (m *Manager) probeUdhcpcScript(path string) error {
+	if _, err := m.executor.ExecuteWithTimeout(IPCheckTimeout, path, "probe"); err != nil {
+		return fmt.Errorf("cannot execute %q: %w", path, err)
+	}
+	return nil
+}
+
+// UdhcpcScript returns the event script udhcpc runs on bound/renew/deconfig.
+// It applies the lease the way Debian's stock /etc/udhcpc/default.script
+// does, except that it leaves resolv.conf alone while dnsOwned exists, i.e.
+// while net owns DNS. The stock script rewrote resolv.conf on every renewal
+// and only net's immutable lock stopped it; Tailscale accept_dns lifts that
+// lock, and the renewal then raced tailscaled for the file.
+func UdhcpcScript(resolvConf, dnsOwned string) string {
+	return fmt.Sprintf(udhcpcScriptTemplate, shellQuote(resolvConf), shellQuote(dnsOwned))
+}
+
+// shellQuote single-quotes s for /bin/sh.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+const udhcpcScriptTemplate = `#!/bin/sh
+# udhcpc event script written by net. Do not edit: net rewrites it.
+RESOLV_CONF=%s
+DNS_OWNED=%s
+
+log() {
+    logger -t "udhcpc[$PPID]" -p daemon.$1 "$interface: $2"
+}
+
+case $1 in
+    bound|renew)
+	busybox ifconfig $interface ${mtu:+mtu $mtu} \
+	    $ip netmask $subnet ${broadcast:+broadcast $broadcast}
+
+	crouter=$(busybox ip -4 route show dev $interface |
+	          busybox awk '$1 == "default" { print $3; }')
+	router="${router%%%% *}" # linux kernel supports only one (default) route
+	if [ ".$router" != ".$crouter" ]; then
+	    busybox ip -4 route flush exact 0.0.0.0/0 dev $interface
+	fi
+	if [ -n "$router" ]; then
+	    [ ".$subnet" = .255.255.255.255 ] \
+		    && onlink=onlink || onlink=
+	    busybox ip -4 route add default via $router dev $interface $onlink
+	fi
+
+	# net (or Tailscale, for accept_dns) owns DNS: leave resolv.conf alone.
+	if [ ! -e "$DNS_OWNED" ]; then
+	    [ -n "$domain" ] && R="domain $domain" || R=""
+	    for i in $dns; do
+		R="$R
+nameserver $i"
+	    done
+	    echo "$R" > "$RESOLV_CONF"
+	fi
+
+	log info "$1: IP=$ip/$subnet router=$router domain=\"$domain\" dns=\"$dns\" lease=$lease"
+	;;
+
+    deconfig)
+	busybox ip link set $interface up
+	busybox ip -4 addr flush dev $interface
+	busybox ip -4 route flush dev $interface
+	log notice "deconfigured"
+	;;
+
+    leasefail | nak)
+	log err "configuration failed: $1: $message"
+	;;
+
+    probe)
+	# net execs the script once to check it can run here.
+	;;
+esac
+exit 0
+`
+
 // udhcpcPidFile returns the pidfile path for udhcpc on the given interface.
 func (m *Manager) udhcpcPidFile(iface string) string {
 	return m.runDir() + "/udhcpc." + iface + ".pid"
@@ -274,12 +410,16 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 	// -t: number of DISCOVER retries (BusyBox default 3; we use 6)
 	// -T: seconds between retries (BusyBox default 3)
 	// -A: seconds to wait before re-trying after a full discover cycle
+	// -s: net's event script (see UdhcpcScript), when it can run here
 	// NOTE: no -q — udhcpc must stay running to renew the lease.
 	args := []string{
 		"-i", iface, "-n", "-p", m.udhcpcPidFile(iface), "-R", "-B",
 		"-t", fmt.Sprintf("%d", UdhcpcDiscoverRetries),
 		"-T", fmt.Sprintf("%d", UdhcpcDiscoverTimeout),
 		"-A", fmt.Sprintf("%d", UdhcpcTryAgain),
+	}
+	if script := m.prepareUdhcpcScript(); script != "" {
+		args = append(args, "-s", script)
 	}
 	if hostname != "" {
 		m.logger.Info("Sending hostname in DHCP request", "hostname", hostname)

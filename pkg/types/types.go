@@ -12,6 +12,11 @@ import (
 // Using /run/net/ instead of /tmp/ to avoid symlink attacks
 const RuntimeDir = "/run/net"
 
+// DNSOwnedPath marks that net owns /etc/resolv.conf. The network manager
+// maintains it; net's udhcpc script reads it to keep lease renewals from
+// rewriting resolv.conf.
+const DNSOwnedPath = RuntimeDir + "/dns-owned"
+
 // ErrNotFound marks lookups of a config entry (network, VPN, alias) that
 // does not exist. Wrap it with %w so callers can classify the failure.
 var ErrNotFound = errors.New("not found")
