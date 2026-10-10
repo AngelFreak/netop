@@ -38,9 +38,23 @@ type App struct {
 	// default; tests set 1ms.
 	PortalRetryDelay time.Duration
 
+	// cleanups holds interrupt-cleanup actions for mutating commands. Nil means
+	// the process-wide defaultCleanups the signal handler drains; tests inject
+	// a private registry to assert registration without touching the global.
+	cleanups *cleanupRegistry
+
 	// Output streams for testability
 	Stdout io.Writer // Standard output (default: os.Stdout)
 	Stderr io.Writer // Standard error (default: os.Stderr)
+}
+
+// cleanupRegistry returns the registry for interrupt cleanups, defaulting to
+// the process-wide one the signal handler drains.
+func (a *App) cleanupRegistry() *cleanupRegistry {
+	if a.cleanups != nil {
+		return a.cleanups
+	}
+	return defaultCleanups
 }
 
 // printf writes formatted output to stdout. Silent in JSON mode: stdout then
@@ -308,6 +322,24 @@ func (a *App) RunScan(showOpen bool) error {
 func (a *App) RunConnect(name, password string) error {
 	a.Logger.Debug("Connect command called", "name", name)
 
+	// Interrupt cleanups are registered only once this run is about to change
+	// a specific link, never during preflight: a Ctrl-C before that point must
+	// leave the user's existing connection and DNS alone. undo holds the
+	// deregister funcs; settled() drops them at establishment so an interrupt
+	// during the portal check or VPN bring-up keeps the connection (VPN-failure
+	// semantics), and the defer covers error returns.
+	var undo []func()
+	settled := func() {
+		for _, deregister := range undo {
+			deregister()
+		}
+		undo = nil
+	}
+	defer settled()
+	registerCleanup := func(name string, fn func()) {
+		undo = append(undo, a.cleanupRegistry().register(name, fn))
+	}
+
 	// Disconnect any active VPN before connecting to new network
 	// This prevents stale VPN routes/interfaces from interfering.
 	// Skip if --no-vpn is set — user wants to keep their VPN alive.
@@ -361,6 +393,11 @@ func (a *App) RunConnect(name, password string) error {
 		a.NetworkMgr.ClearDNS()
 
 		a.progress("Connecting to WiFi...\n")
+		// From here the WiFi link is being changed: an interrupt must undo it.
+		// WiFiMgr.Disconnect terminates wpa_supplicant + DHCP clients natively,
+		// flushes addrs/routes, brings the iface down, and removes the temp
+		// wpa config.
+		registerCleanup("abort-connect", func() { _ = a.WiFiMgr.Disconnect() })
 		err = a.WiFiMgr.Connect(name, password, "")
 		if err != nil {
 			a.Logger.Error("Failed to connect to WiFi", "error", err)
@@ -368,6 +405,13 @@ func (a *App) RunConnect(name, password string) error {
 			return err
 		}
 		connectedIface = a.WiFiMgr.GetInterface()
+
+		// LockDNS makes resolv.conf immutable — intentional persistent state on
+		// success. Register the unlock BEFORE locking so an interrupt during a
+		// later stage doesn't leave DNS permanently frozen. UnlockDNS also
+		// drops the ownership marker LockDNS sets, so an aborted connect leaves
+		// no claim that a later `net stop` would act on.
+		registerCleanup("unlock-resolv.conf", func() { _ = a.NetworkMgr.UnlockDNS() })
 
 		// Lock resolv.conf after DHCP writes DNS to prevent external tools
 		// (like netbird) from overwriting with their own DNS servers
@@ -381,7 +425,8 @@ func (a *App) RunConnect(name, password string) error {
 			password = networkConfig.PSK
 		}
 		a.Logger.Debug("Using network config", "configSSID", networkConfig.SSID)
-		if networkConfig.SSID != "" {
+		wired := networkConfig.SSID == ""
+		if !wired {
 			a.progress("Connecting to WiFi...\n")
 		} else {
 			// Switching to wired — disconnect WiFi first so its stale default
@@ -392,6 +437,23 @@ func (a *App) RunConnect(name, password string) error {
 			}
 			a.progress("Connecting to wired network...\n")
 		}
+		// ConnectToConfiguredNetwork is where this run starts changing the
+		// link (flush, up, DHCP) and where it locks DNS: SetDNS for custom
+		// servers, LockDNS after DHCP. Both cleanups go in before the call.
+		// The abort follows the link type. For wired it reads
+		// networkConfig.Interface at run time, which ConnectToConfiguredNetwork
+		// fills in by auto-detection before it touches anything; if that has
+		// not happened yet there is nothing to undo.
+		registerCleanup("abort-connect", func() {
+			if !wired {
+				_ = a.WiFiMgr.Disconnect()
+				return
+			}
+			if iface := networkConfig.Interface; iface != "" {
+				_ = a.NetworkMgr.Disconnect(iface)
+			}
+		})
+		registerCleanup("unlock-resolv.conf", func() { _ = a.NetworkMgr.UnlockDNS() })
 		err = a.NetworkMgr.ConnectToConfiguredNetwork(networkConfig, password, a.WiFiMgr)
 		if err != nil {
 			a.Logger.Error("Failed to connect to configured network", "error", err)
@@ -404,6 +466,11 @@ func (a *App) RunConnect(name, password string) error {
 
 	// Display connection information (includes "Connected!" message)
 	a.printConnectionInfo(connectedIface)
+
+	// The link is established: the connect is complete for cleanup purposes.
+	// Drop the cleanups now so an interrupt during the (read-only) portal
+	// check or the VPN attempt keeps the connection and its DNS lock.
+	settled()
 
 	// Resolve the VPN name once, before the portal check, so the hint, the
 	// offline-warning suppression, and the attempt can never disagree.
