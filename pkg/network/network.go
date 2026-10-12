@@ -761,6 +761,10 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		if err := m.writeFileDirect(m.resolvConf(), "# Waiting for DHCP\n"); err != nil {
 			m.logger.Warn("Failed to clear resolv.conf", "error", err)
 		}
+		// Hand DNS to the DHCP client: while the previous connection's
+		// ownership marker exists, net's DHCP hooks skip the lease's servers.
+		// LockDNS below takes ownership again once they are written.
+		m.clearDNSOwnership()
 	}
 
 	// Connect to WiFi if SSID is specified
