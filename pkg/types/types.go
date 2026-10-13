@@ -21,6 +21,7 @@ type Config struct {
 	Common   CommonConfig             `yaml:"common" mapstructure:"common"`
 	Ignored  IgnoredConfig            `yaml:"ignored" mapstructure:"ignored"`
 	VPN      map[string]VPNConfig     `yaml:"vpn" mapstructure:"vpn"`
+	Tunnel   map[string]TunnelConfig  `yaml:"tunnel,omitempty" mapstructure:"tunnel"`
 	Networks map[string]NetworkConfig `yaml:",inline" mapstructure:",inline"`
 }
 

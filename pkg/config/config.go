@@ -21,6 +21,15 @@ var (
 		"common":  true,
 		"ignored": true,
 		"vpn":     true,
+		"tunnel":  true,
+	}
+
+	// Valid fields for TunnelConfig
+	validTunnelFields = map[string]bool{
+		"host":     true,
+		"port":     true,
+		"identity": true,
+		"forward":  true,
 	}
 
 	// Valid fields for CommonConfig
@@ -260,6 +269,8 @@ func validateRawConfig(raw map[string]interface{}) ValidationErrors {
 				}
 				errors = append(errors, validateDaemonVPNProfiles(vpnMap)...)
 			}
+		case "tunnel":
+			errors = append(errors, validateTunnels(value)...)
 		default:
 			// It's either a network config or an alias (string value)
 			if netMap, ok := value.(map[string]interface{}); ok {
@@ -271,6 +282,78 @@ func validateRawConfig(raw map[string]interface{}) ValidationErrors {
 	}
 
 	return errors
+}
+
+// validateTunnels checks the tunnel: section on the raw map, before viper's
+// weak typing could coerce a wrong type into something that looks valid.
+// A null section is allowed and means no tunnels.
+func validateTunnels(value interface{}) []ValidationError {
+	if value == nil {
+		return nil
+	}
+	tunnels, ok := value.(map[string]interface{})
+	if !ok {
+		return []ValidationError{{Section: "tunnel", Field: "tunnel",
+			Message: "tunnel must be a mapping of tunnel names to settings"}}
+	}
+	var errs []ValidationError
+	for name, raw := range tunnels {
+		section := "tunnel." + name
+		tunnel, ok := raw.(map[string]interface{})
+		if !ok {
+			errs = append(errs, ValidationError{Section: section, Field: name,
+				Message: section + " must be a mapping with host and forward"})
+			continue
+		}
+		errs = append(errs, validateFields(section, tunnel, validTunnelFields)...)
+		errs = append(errs, validateTunnel(section, tunnel)...)
+	}
+	return errs
+}
+
+// validateTunnel checks the values of one tunnel entry.
+func validateTunnel(section string, tunnel map[string]interface{}) []ValidationError {
+	var errs []ValidationError
+	invalid := func(field, format string, args ...interface{}) {
+		errs = append(errs, ValidationError{Section: section, Field: field,
+			Message: section + "." + field + " " + fmt.Sprintf(format, args...)})
+	}
+
+	host, isString := tunnel["host"].(string)
+	if !isString {
+		invalid("host", "must be an ssh destination such as user@server")
+	} else if err := types.ValidateSSHHost(host); err != nil {
+		invalid("host", "is invalid: %v", err)
+	}
+
+	if port, exists := tunnel["port"]; exists && port != nil {
+		if n, isInt := port.(int); !isInt || n < 1 || n > 65535 {
+			invalid("port", "must be a number from 1 to 65535")
+		}
+	}
+
+	if identity, exists := tunnel["identity"]; exists && identity != nil {
+		if _, isString := identity.(string); !isString {
+			invalid("identity", "must be a path to a private key")
+		}
+	}
+
+	forwards, isList := tunnel["forward"].([]interface{})
+	if !isList || len(forwards) == 0 {
+		invalid("forward", "must be a list of ports to forward, e.g. [3000]")
+		return errs
+	}
+	for _, f := range forwards {
+		switch f.(type) {
+		case string, int:
+			if _, err := types.ParseForward(fmt.Sprint(f)); err != nil {
+				invalid("forward", "%v", err)
+			}
+		default:
+			invalid("forward", "entries must be PORT, LOCAL:PORT or LOCAL:HOST:PORT")
+		}
+	}
+	return errs
 }
 
 // daemonVPNTypes are VPN types backed by a single global daemon holding one
@@ -446,6 +529,7 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 			Common:   types.CommonConfig{},
 			Ignored:  types.IgnoredConfig{},
 			VPN:      make(map[string]types.VPNConfig),
+			Tunnel:   make(map[string]types.TunnelConfig),
 			Networks: make(map[string]types.NetworkConfig),
 		}
 		return m.config, nil
@@ -510,6 +594,7 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 			Common:   types.CommonConfig{},
 			Ignored:  types.IgnoredConfig{},
 			VPN:      make(map[string]types.VPNConfig),
+			Tunnel:   make(map[string]types.TunnelConfig),
 			Networks: make(map[string]types.NetworkConfig),
 		}
 		return m.config, nil
@@ -548,6 +633,9 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 	// Initialize maps if nil
 	if config.VPN == nil {
 		config.VPN = make(map[string]types.VPNConfig)
+	}
+	if config.Tunnel == nil {
+		config.Tunnel = make(map[string]types.TunnelConfig)
 	}
 	if config.Networks == nil {
 		config.Networks = make(map[string]types.NetworkConfig)
