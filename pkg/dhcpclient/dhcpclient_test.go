@@ -122,6 +122,7 @@ func TestNewManager(t *testing.T) {
 	executor := newMockExecutor()
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	assert.NotNil(t, manager)
 	assert.Equal(t, executor, manager.executor)
@@ -158,6 +159,7 @@ func TestAcquire_ValidatesInterfaceName(t *testing.T) {
 			executor.commands["ip addr show "+tt.iface] = "inet 192.168.1.50/24"
 			logger := &mockLogger{}
 			manager := NewManager(executor, logger)
+			manager.hooksDir = t.TempDir()
 
 			err := manager.Acquire(tt.iface, "")
 			if tt.expectErr {
@@ -200,6 +202,7 @@ func TestAcquire_ValidatesHostname(t *testing.T) {
 			executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 			logger := &mockLogger{}
 			manager := NewManager(executor, logger)
+			manager.hooksDir = t.TempDir()
 
 			err := manager.Acquire("wlan0", tt.hostname)
 			if tt.expectErr {
@@ -215,20 +218,24 @@ func TestAcquire_ValidatesHostname(t *testing.T) {
 }
 
 func TestAcquire_UsesUdhcpcWhenAvailable(t *testing.T) {
+	tmp := t.TempDir()
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10"] = ""
+	executor.commands["udhcpc -i wlan0 -n -p "+tmp+"/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -s "+tmp+"/lib/udhcpc.script"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
+	manager.runtimeDir = tmp
+	manager.scriptDir = tmp + "/lib"
 
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
-	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10")
+	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -p "+tmp+"/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -s "+tmp+"/lib/udhcpc.script")
 	// Note: pkill for dhclient is still called during Release() cleanup,
 	// but actual dhclient command (timeout 15 dhclient -v) is not executed
 	executor.assertCommandNotExecuted(t, "timeout 15 dhclient")
@@ -246,6 +253,7 @@ func TestAcquire_UsesDhclientAsFallback(t *testing.T) {
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
@@ -262,6 +270,7 @@ func TestAcquireDhclient_ExecutorDeadlineExceedsInnerTimeout(t *testing.T) {
 	executor.commands["timeout 60 dhclient -v -1 wlan0"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	manager := NewManager(executor, &mockLogger{})
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Acquire("wlan0", "")
 	assert.NoError(t, err)
@@ -272,16 +281,20 @@ func TestAcquireDhclient_ExecutorDeadlineExceedsInnerTimeout(t *testing.T) {
 }
 
 func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
+	tmp := t.TempDir()
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.commands["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -x hostname:myhost"] = ""
+	executor.commands["udhcpc -i wlan0 -n -p "+tmp+"/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -s "+tmp+"/lib/udhcpc.script -x hostname:myhost"] = ""
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
+	manager.runtimeDir = tmp
+	manager.scriptDir = tmp + "/lib"
 
 	err := manager.Acquire("wlan0", "myhost")
 	assert.NoError(t, err)
@@ -302,7 +315,9 @@ func TestAcquire_WithHostname_Dhclient(t *testing.T) {
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 	manager.runtimeDir = tmp
+	manager.scriptDir = tmp + "/lib"
 
 	err := manager.Acquire("wlan0", "myhost")
 	assert.NoError(t, err)
@@ -368,6 +383,7 @@ func TestAcquire_DhcpClientFails(t *testing.T) {
 	executor.errors["timeout 60 dhclient -v -1 wlan0"] = errors.New("dhclient: no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Acquire("wlan0", "")
 	assert.Error(t, err)
@@ -380,6 +396,7 @@ func TestRelease_ValidatesInterfaceName(t *testing.T) {
 	executor := newMockExecutor()
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Release("wlan0;rm -rf /")
 	assert.Error(t, err)
@@ -395,6 +412,7 @@ func TestRelease_KillsBothClients(t *testing.T) {
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Release("wlan0")
 	assert.NoError(t, err)
@@ -412,7 +430,9 @@ func TestRelease_CleansUpLeaseFiles(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*eth0"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 	manager.runtimeDir = tmp
+	manager.scriptDir = tmp + "/lib"
 
 	err := manager.Release("eth0")
 	assert.NoError(t, err)
@@ -436,7 +456,9 @@ func TestRelease_CleansUpInterfaceSpecificConfig(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 	manager.runtimeDir = tmp
+	manager.scriptDir = tmp + "/lib"
 
 	err := manager.Release("wlan0")
 	assert.NoError(t, err)
@@ -455,6 +477,7 @@ func TestRelease_LogsCleanupErrors(t *testing.T) {
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	// Should succeed (best-effort cleanup)
 	err := manager.Release("wlan0")
@@ -477,6 +500,7 @@ func TestRenew_DelegatesToAcquire(t *testing.T) {
 	executor.commands["ip addr show wlan0"] = "inet 192.168.1.50/24"
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Renew("wlan0", "")
 	assert.NoError(t, err)
@@ -546,6 +570,7 @@ func TestAcquire_DhclientConfigCreationFailure(t *testing.T) {
 	executor.commands["pkill -9 -f dhclient.*wlan0"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 	// Point the runtime dir at a non-existent directory so the native config
 	// write (WriteSecureFile) fails.
 	manager.runtimeDir = filepath.Join(t.TempDir(), "does-not-exist")
@@ -559,6 +584,7 @@ func TestAcquire_DhclientConfigCreationFailure(t *testing.T) {
 // Tests for cleanup on DHCP acquisition failure
 
 func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
+	tmp := t.TempDir()
 	executor := newMockExecutor()
 	executor.hasCommands["udhcpc"] = true
 	executor.commands["pkill -9 -f udhcpc.*wlan0"] = ""
@@ -566,9 +592,12 @@ func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
 	executor.commands["rm -f /var/lib/dhcp/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.leases"] = ""
 	executor.commands["rm -f /run/net/dhclient.wlan0.conf"] = ""
-	executor.errors["udhcpc -i wlan0 -n -p /run/net/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10"] = errors.New("no lease obtained")
+	executor.errors["udhcpc -i wlan0 -n -p "+tmp+"/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -s "+tmp+"/lib/udhcpc.script"] = errors.New("no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
+	manager.runtimeDir = tmp
+	manager.scriptDir = tmp + "/lib"
 
 	err := manager.Acquire("wlan0", "")
 	assert.Error(t, err)
@@ -598,6 +627,7 @@ func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
 	executor.errors["timeout 60 dhclient -v -1 wlan0"] = errors.New("no lease obtained")
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Acquire("wlan0", "")
 	assert.Error(t, err)
@@ -630,6 +660,7 @@ func TestRelease_UsesRegexpQuoteMeta(t *testing.T) {
 	executor.commands["rm -f /run/net/dhclient.wlan-0.conf"] = ""
 	logger := &mockLogger{}
 	manager := NewManager(executor, logger)
+	manager.hooksDir = t.TempDir()
 
 	err := manager.Release("wlan-0")
 	assert.NoError(t, err)

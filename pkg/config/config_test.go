@@ -874,6 +874,7 @@ func TestValidateConfig_TailscaleAndNetBirdFields(t *testing.T) {
 				"auth_key":      "tskey-auth-xxxxx",
 				"exit_node":     "us-east-1",
 				"accept_routes": true,
+				"accept_dns":    true,
 			},
 			"my-netbird": map[string]interface{}{
 				"type":           "netbird",
