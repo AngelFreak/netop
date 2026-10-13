@@ -857,24 +857,87 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 		return err
 	}
 
+	if config.AcceptDNS {
+		m.ensureTailscaleDNS()
+	}
+
 	m.logger.Info("Tailscale connected")
 	return nil
 }
+
+// tailscaleDNSAttempts bounds the wait for tailscaled to rewrite resolv.conf
+// after its accept-dns pref is flipped.
+const tailscaleDNSAttempts = 5
+
+// ensureTailscaleDNS makes sure tailscaled has taken over resolv.conf.
+//
+// A tailscaled that was already running when net held resolv.conf locked
+// (e.g. it auto-started at boot before `net <network>` locked the file) has
+// failed its DNS write and does not retry. Its prefs already match what net
+// asks for, so "up" and "set" change nothing and the unlock alone never
+// reaches it. Flipping accept-dns off and on is a real pref change, which
+// makes tailscaled apply its DNS config again. Failure is a warning, not an
+// error: the tunnel works, only tailnet names won't resolve.
+func (m *Manager) ensureTailscaleDNS() {
+	if m.resolvConfUsesTailscale() {
+		return
+	}
+	m.logger.Debug("Tailscale has not taken over resolv.conf; re-applying its DNS settings")
+	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "set", "--accept-dns=false"); err != nil {
+		m.logger.Warn("Failed to re-apply Tailscale DNS; tailnet names may not resolve", "error", err)
+		return
+	}
+	if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "set", "--accept-dns=true"); err != nil {
+		m.logger.Warn("Failed to turn Tailscale DNS back on; it is now off. Reconnect the VPN to retry", "error", err)
+		return
+	}
+	for i := 0; i < tailscaleDNSAttempts; i++ {
+		if m.resolvConfUsesTailscale() {
+			return
+		}
+		time.Sleep(m.verifyDelay)
+	}
+	m.logger.Warn("Tailscale did not take over DNS; tailnet names may not resolve. See the health check in 'tailscale status'", "path", m.resolvConfFile())
+}
+
+// resolvConfUsesTailscale reports whether resolv.conf points at Tailscale's
+// MagicDNS resolver.
+func (m *Manager) resolvConfUsesTailscale() bool {
+	content, err := os.ReadFile(m.resolvConfFile())
+	if err != nil {
+		return false
+	}
+	for _, ip := range system.ParseDNSFromResolvConf(string(content)) {
+		if ip.Equal(tailscaleDNSIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// tailscaleDNSIP is the MagicDNS resolver tailscaled writes to resolv.conf.
+var tailscaleDNSIP = net.ParseIP("100.100.100.100")
 
 // unlockResolvConfForTailscale clears the immutable flag net puts on
 // resolv.conf so tailscaled can write it. A failure is logged, not returned:
 // the tunnel works without it, only tailnet names won't resolve.
 func (m *Manager) unlockResolvConfForTailscale() {
-	setImmutable, path := m.setImmutable, m.resolvConfPath
+	setImmutable, path := m.setImmutable, m.resolvConfFile()
 	if setImmutable == nil { // zero-value Managers built in tests
 		setImmutable = system.SetImmutable
-	}
-	if path == "" {
-		path = "/etc/resolv.conf"
 	}
 	if err := setImmutable(path, false); err != nil {
 		m.logger.Warn("Failed to unlock resolv.conf for Tailscale DNS; tailnet names may not resolve", "path", path, "error", err)
 	}
+}
+
+// resolvConfFile returns the resolv.conf path, defaulting for zero-value
+// Managers built in tests.
+func (m *Manager) resolvConfFile() string {
+	if m.resolvConfPath == "" {
+		return "/etc/resolv.conf"
+	}
+	return m.resolvConfPath
 }
 
 // isEmptyStderrError returns true when the error is a command failure with

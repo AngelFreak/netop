@@ -391,3 +391,25 @@ func TestConnectTailscale_AcceptDNSClearsImmutableFlag_Integration(t *testing.T)
 	require.NoError(t, manager.Connect("ts"))
 	assert.NoError(t, os.WriteFile(resolv, []byte("nameserver 100.100.100.100\n"), 0644), "tailscaled must be able to write resolv.conf after connect")
 }
+
+// The 2026-10-13 failure on a real immutable flag: tailscaled was already
+// running and had given up writing a resolv.conf net held locked. Connect
+// must unlock the file and make tailscaled write it again; the simulated
+// tailscaled write fails the test if the file is still locked.
+func TestConnectTailscale_AcceptDNSRecoversLockedResolvConf_Integration(t *testing.T) {
+	testutil.SkipIfNotRoot(t)
+
+	manager, _, logger := newGaveUpFixture(t, true)
+	if err := system.SetImmutable(manager.resolvConfPath, true); err != nil {
+		t.Skipf("filesystem does not support the immutable flag: %v", err)
+	}
+	t.Cleanup(func() { _ = system.SetImmutable(manager.resolvConfPath, false) })
+	manager.setImmutable = system.SetImmutable
+
+	require.NoError(t, manager.Connect("ts"))
+
+	content, err := os.ReadFile(manager.resolvConfPath)
+	require.NoError(t, err)
+	assert.Equal(t, quad100ResolvConf, string(content))
+	assert.Empty(t, logger.warns)
+}
