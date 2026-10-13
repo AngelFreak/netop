@@ -35,6 +35,19 @@ func (f Forward) SSHArg() string {
 	return fmt.Sprintf("127.0.0.1:%d:%s:%d", f.LocalPort, host, f.RemotePort)
 }
 
+// Spec renders the forward in the shorthand ParseForward reads, in its
+// shortest form: "3000", "13000:3000" or "5432:db.internal:5432".
+func (f Forward) Spec() string {
+	switch {
+	case !f.Pinned && f.RemoteHost == "127.0.0.1" && f.LocalPort == f.RemotePort:
+		return strconv.Itoa(f.RemotePort)
+	case f.RemoteHost == "127.0.0.1":
+		return fmt.Sprintf("%d:%d", f.LocalPort, f.RemotePort)
+	default:
+		return fmt.Sprintf("%d:%s", f.LocalPort, net.JoinHostPort(f.RemoteHost, strconv.Itoa(f.RemotePort)))
+	}
+}
+
 // String renders the forward for people.
 func (f Forward) String() string {
 	return fmt.Sprintf("localhost:%d → %s", f.LocalPort, net.JoinHostPort(f.RemoteHost, strconv.Itoa(f.RemotePort)))

@@ -277,3 +277,21 @@ func TestE2E_ListWithoutDirIsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, list)
 }
+
+// Asking for a specific local port must give that port, even when a tunnel
+// to the same remote port is already up on another one.
+func TestE2E_PinnedPortGetsOwnTunnel(t *testing.T) {
+	m, _ := e2eManager(t)
+	remote := remoteService(t)
+	first := types.Forward{LocalPort: closedPort(t), RemoteHost: "127.0.0.1", RemotePort: remote}
+	_, err := m.Start(spec("testhost", first))
+	require.NoError(t, err)
+
+	second := toRemote(t, remote)
+	_, err = m.Start(spec("testhost", second))
+	require.NoError(t, err)
+
+	body, err := get(second.LocalPort)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", body)
+}

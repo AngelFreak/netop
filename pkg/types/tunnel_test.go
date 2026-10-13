@@ -67,3 +67,11 @@ func TestValidateSSHHost_Rejects(t *testing.T) {
 		assert.Error(t, ValidateSSHHost(host), "%q", host)
 	}
 }
+
+func TestForward_SpecRoundTrips(t *testing.T) {
+	for _, spec := range []string{"3000", "13000:3000", "5432:db.internal:5432", "5432:[::1]:5432"} {
+		f, err := ParseForward(spec)
+		require.NoError(t, err)
+		assert.Equal(t, spec, f.Spec())
+	}
+}

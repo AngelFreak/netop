@@ -76,8 +76,23 @@ func TestTunnelID_LongNamesStayDistinct(t *testing.T) {
 }
 
 func TestAdHocName(t *testing.T) {
-	forwards := []types.Forward{{LocalPort: 3000, RemotePort: 3000}, {LocalPort: 5432, RemotePort: 5432}}
+	forwards := []types.Forward{
+		{LocalPort: 3000, RemoteHost: "127.0.0.1", RemotePort: 3000},
+		{LocalPort: 5432, RemoteHost: "127.0.0.1", RemotePort: 5432},
+	}
 	assert.Equal(t, "user@box:3000,5432", AdHocName("user@box", forwards))
+}
+
+// A chosen local port is part of the name, so `net tunnel box 5000:3000`
+// is a different tunnel from `net tunnel box 3000`, not a no-op returning it.
+func TestAdHocName_IncludesPinnedLocalPort(t *testing.T) {
+	forwards := []types.Forward{{LocalPort: 5000, RemoteHost: "127.0.0.1", RemotePort: 3000, Pinned: true}}
+	assert.Equal(t, "box:5000:3000", AdHocName("box", forwards))
+}
+
+func TestAdHocName_IncludesRemoteHost(t *testing.T) {
+	forwards := []types.Forward{{LocalPort: 5432, RemoteHost: "db.internal", RemotePort: 5432, Pinned: true}}
+	assert.Equal(t, "box:5432:db.internal:5432", AdHocName("box", forwards))
 }
 
 func TestSSHArgs(t *testing.T) {

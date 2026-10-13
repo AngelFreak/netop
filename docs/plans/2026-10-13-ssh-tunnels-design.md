@@ -69,8 +69,11 @@ Stop with: net tunnel stop 3000
 
 A forward that moved off a busy port gets ` (3000 was in use)` after it.
 
-Ad-hoc tunnels are named `<host>:<remote ports joined by ,>`. Starting a
-tunnel that is already up is a no-op that reports it as up.
+Ad-hoc tunnels are named after the host and the forwards as typed, e.g.
+`user@box:3000,5432` or `box:5000:3000`. A chosen local port is part of the
+name, so `net tunnel box 5000:3000` is its own tunnel and never returns an
+existing `box:3000` tunnel on another port. Re-running the same command is a
+no-op that reports the tunnel as up.
 
 ## Config
 

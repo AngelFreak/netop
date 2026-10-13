@@ -100,14 +100,15 @@ func (s state) matches(target string) bool {
 	return slices.ContainsFunc(s.Forwards, func(f types.Forward) bool { return f.LocalPort == port })
 }
 
-// AdHocName names an ad-hoc tunnel after its host and remote ports, e.g.
-// "user@box:3000,5432".
+// AdHocName names an ad-hoc tunnel after its host and forwards as typed,
+// e.g. "user@box:3000,5432" or "box:5000:3000". A chosen local port is part
+// of the name, so it is a different tunnel from one that let net pick.
 func AdHocName(host string, forwards []types.Forward) string {
-	ports := make([]string, len(forwards))
+	specs := make([]string, len(forwards))
 	for i, f := range forwards {
-		ports[i] = strconv.Itoa(f.RemotePort)
+		specs[i] = f.Spec()
 	}
-	return host + ":" + strings.Join(ports, ",")
+	return host + ":" + strings.Join(specs, ",")
 }
 
 // Start brings a tunnel up. See types.TunnelManager.
