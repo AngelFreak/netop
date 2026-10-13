@@ -49,7 +49,7 @@ func getNetworkNames() []string {
 		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' && strings.Contains(line, ":") {
 			key := strings.TrimSpace(strings.Split(line, ":")[0])
 			// Skip special sections
-			if key != "common" && key != "ignored" && key != "vpn" {
+			if key != "common" && key != "ignored" && key != "vpn" && key != "tunnel" {
 				allKeys[key] = true
 			}
 		}

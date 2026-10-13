@@ -33,6 +33,7 @@ var aiCommandNotes = map[string]string{
 	"hotspot": "CHANGES THE NETWORK. WiFi access point; needs hostapd and dnsmasq installed.",
 	"share":   "CHANGES THE NETWORK. Shares the uplink over ethernet (DHCP + NAT). Check the sharing field of `net share status`: clients can hold a lease with no route out.",
 	"genkey":  "Read-only. Prints a fresh WireGuard keypair; writes nothing.",
+	"tunnel":  "Opens SSH port forwards on localhost as the calling user; routes and DNS are untouched. `net tunnel` lists (--json), `net tunnel <host> <port>...` or `net tunnel <name>` starts, `net tunnel stop [name|port]` stops. ssh runs in BatchMode: it never prompts, so the host key must already be trusted and auth must use a key or agent.",
 	"ai":      "Read-only. This guide.",
 }
 
@@ -45,6 +46,7 @@ var jsonCapableCommands = map[string]bool{
 	"scan":   true,
 	"show":   true,
 	"vpn":    true,
+	"tunnel": true,
 	"genkey": true,
 	"ai":     true,
 }
@@ -73,7 +75,8 @@ sharing, driven by one binary and one YAML config.
 4. Error codes in the envelope: failed, not_found, usage, privilege.
 5. Network changes need CAP_NET_ADMIN. Without it net re-runs itself under
    sudo, which will block on a password prompt in a non-interactive session.
-   Read-only commands (status, list, show, portal, ai) never escalate.
+   Read-only commands (status, list, show, portal, ai) never escalate, and
+   neither does tunnel, which runs as the calling user.
 6. Logs and warnings go to stderr; stdout carries only the envelope.
    --debug adds detail on stderr without disturbing it.
 

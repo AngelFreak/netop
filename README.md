@@ -47,6 +47,7 @@ Manage WiFi connections, VPNs (WireGuard/OpenVPN/Tailscale/NetBird), DNS, MAC ad
 - **Configuration Inheritance** - Common settings applied to all networks
 - **YAML Configuration** - Simple, readable configuration format
 - **Network Profiles** - Save and manage multiple network configurations
+- **SSH Tunnels** - Forward local ports over SSH, ad hoc or from config, with no root needed
 
 [↑ Back to Top](#-net)
 
@@ -280,6 +281,31 @@ sudo net vpn
 </details>
 
 <details>
+<summary><b>🚇 SSH Tunnel Commands</b></summary>
+
+```bash
+# Forward localhost:3000 to port 3000 on a remote machine
+net tunnel user@100.72.140.241 3000
+
+# Pick the local port, or reach a host behind the SSH server
+net tunnel user@server 13000:3000 5432:db.internal:5432
+
+# Start a tunnel from the config
+net tunnel app
+
+# List tunnels (configured and running)
+net tunnel
+
+# Stop by local port or name, or stop all
+net tunnel stop 3000
+net tunnel stop
+```
+
+Tunnels run as you, with your SSH keys and `~/.ssh/config`, so no `sudo` is needed. Ports bind to localhost only. If a local port is busy, `net` moves it to port+10000 (3000 → 13000), then to any free port, and prints which one it used; a local port you chose yourself is never moved. ssh runs without prompting, so the host key must already be trusted (run `ssh <host>` once) and login must use a key or ssh-agent. A tunnel that drops shows as `down`; run the same command again to bring it back.
+
+</details>
+
+<details>
 <summary><b>🌐 DNS Commands</b></summary>
 
 ```bash
@@ -354,6 +380,10 @@ sudo net stop
 | `share status` | Show sharing state and DHCP leases |
 | `share stop` | Stop sharing |
 | `show <name>` | Show network config |
+| `tunnel` | List SSH tunnels |
+| `tunnel <host> <port>...` | Start an ad-hoc SSH tunnel |
+| `tunnel <name>` | Start a configured SSH tunnel |
+| `tunnel stop [name\|port]` | Stop one SSH tunnel, or all |
 
 ### 🚩 Global Flags
 
@@ -512,6 +542,25 @@ vpn:
 ```
 
 > **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is always controlled by `net` (MagicDNS is disabled). Multi-account support uses `tailscale switch` and `netbird profile select` under the hood. Profiles are per-OS-user and `net` runs as root, so create them for root (e.g. `sudo netbird profile add`) — a profile that can't be selected fails the connection rather than silently using the wrong account.
+
+</details>
+
+<details>
+<summary><b>SSH Tunnel Settings</b></summary>
+
+```yaml
+tunnel:
+  app:
+    host: user@100.72.140.241      # Anything ssh accepts: user@host, ~/.ssh/config alias, IP
+    forward:
+      - 13000:3000                 # localhost:13000 → port 3000 on the host
+      - 5432:db.internal:5432      # localhost:5432 → db.internal:5432 via the host
+      - 8080                       # localhost:8080 → port 8080 on the host
+    port: 22                       # Optional: ssh port
+    identity: ~/.ssh/id_ed25519    # Optional: private key
+```
+
+Start with `net tunnel app`. Tunnel state lives in `$XDG_RUNTIME_DIR/net/tunnels` (or `/run/user/<uid>/net/tunnels`), not `/run/net`, because tunnels belong to you rather than root.
 
 </details>
 

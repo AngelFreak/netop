@@ -16,7 +16,8 @@ sharing, driven by one binary and one YAML config.
 4. Error codes in the envelope: failed, not_found, usage, privilege.
 5. Network changes need CAP_NET_ADMIN. Without it net re-runs itself under
    sudo, which will block on a password prompt in a non-interactive session.
-   Read-only commands (status, list, show, portal, ai) never escalate.
+   Read-only commands (status, list, show, portal, ai) never escalate, and
+   neither does tunnel, which runs as the calling user.
 6. Logs and warnings go to stderr; stdout carries only the envelope.
    --debug adds detail on stderr without disturbing it.
 
@@ -69,6 +70,9 @@ net status
 net stop [no --json yet: refuses with exit 64]
     Disconnect everything (network, VPN, hotspot, DHCP) or specific interfaces
     CHANGES THE NETWORK. Disconnects interfaces and clears DNS that net owns.
+net tunnel
+    SSH port forwards: list, start or stop
+    Opens SSH port forwards on localhost as the calling user; routes and DNS are untouched. `net tunnel` lists (--json), `net tunnel <host> <port>...` or `net tunnel <name>` starts, `net tunnel stop [name|port]` stops. ssh runs in BatchMode: it never prompts, so the host key must already be trusted and auth must use a key or agent.
 net vpn
     List VPNs, connect, or disconnect
     CHANGES THE NETWORK. `net vpn` lists, `net vpn <name>` connects, `net vpn stop` disconnects all.
