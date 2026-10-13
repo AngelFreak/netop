@@ -62,9 +62,12 @@ passed after `--`, so it can never be read as an ssh option.
 
 ```
 $ net tunnel 100.72.140.241 3000
-Tunnel 100.72.140.241:3000 up: localhost:3000 → 127.0.0.1:3000 via 100.72.140.241
+✓ Tunnel 100.72.140.241:3000 up via 100.72.140.241
+  localhost:3000 → 127.0.0.1:3000
 Stop with: net tunnel stop 3000
 ```
+
+A forward that moved off a busy port gets ` (3000 was in use)` after it.
 
 Ad-hoc tunnels are named `<host>:<remote ports joined by ,>`. Starting a
 tunnel that is already up is a no-op that reports it as up.
