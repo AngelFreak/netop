@@ -69,6 +69,12 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dir string) 
 	}
 }
 
+// UseSSHConfig makes ssh read path instead of the user's ssh config (ssh
+// -F). Tests use it to point ssh at their own server.
+func (m *Manager) UseSSHConfig(path string) {
+	m.sshConfig = path
+}
+
 // state is what net remembers about a tunnel between invocations.
 type state struct {
 	Name     string          `json:"name"`

@@ -11,23 +11,24 @@ import (
 	"time"
 
 	"github.com/angelfreak/net/pkg/system"
+	"github.com/angelfreak/net/pkg/tunnel/testsshd"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// These tests drive the real ssh client against testSSHD through Manager:
+// These tests drive the real ssh client against testsshd through Manager:
 // every ssh flag, the control socket and the log parsing are exercised for
 // real. They need no root and no sshd, only the ssh binary.
 
-// e2eManager returns a Manager whose ssh uses testSSHD's config. Every
+// e2eManager returns a Manager whose ssh uses testsshd's config. Every
 // tunnel it starts is stopped when the test ends, so no ssh outlives it.
-func e2eManager(t *testing.T) (*Manager, *testSSHD) {
+func e2eManager(t *testing.T) (*Manager, *testsshd.Server) {
 	t.Helper()
-	d := startTestSSHD(t)
+	d := testsshd.Start(t)
 	dir := filepath.Join(shortTempDir(t), "net", "tunnels")
 	m := NewManager(system.NewExecutor(nopLogger{}, false), nopLogger{}, dir)
-	m.sshConfig = d.ConfigPath
+	m.UseSSHConfig(d.ConfigPath)
 	t.Cleanup(func() { _, _ = m.Stop("") })
 	return m, d
 }

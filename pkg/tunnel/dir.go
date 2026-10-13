@@ -4,14 +4,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 )
 
-// DefaultDir returns the tunnel state directory for the current user.
-// Tunnels belong to the user who runs ssh, not to root, so this never uses
-// /run/net.
+// DefaultDir returns the tunnel state directory. Tunnels belong to the user
+// who runs ssh, not to root, so this never uses /run/net: under sudo it is
+// the calling user's directory, and the same one net uses after dropping to
+// that user.
 func DefaultDir() string {
-	return dirFor(os.Geteuid(), os.Getenv("XDG_RUNTIME_DIR"), isDir)
+	uid, viaSudo := OwnerUID()
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if viaSudo {
+		xdg = "" // sudo's environment, not the user's
+	}
+	return dirFor(uid, xdg, isDir)
+}
+
+// OwnerUID is the user whose tunnels net manages: the sudo caller when net
+// runs as root under sudo, otherwise the current user.
+func OwnerUID() (uid int, viaSudo bool) {
+	if os.Geteuid() == 0 {
+		if id, err := strconv.Atoi(os.Getenv("SUDO_UID")); err == nil && id > 0 {
+			return id, true
+		}
+	}
+	return os.Geteuid(), false
 }
 
 // dirFor picks the state directory: the user's runtime dir when known, else

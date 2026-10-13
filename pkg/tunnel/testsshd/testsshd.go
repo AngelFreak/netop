@@ -1,4 +1,7 @@
-package tunnel
+// Package testsshd provides an in-process SSH server for tests. It serves
+// only port forwards ("direct-tcpip" channels), so tests can drive the real
+// ssh client end to end without an sshd installed.
+package testsshd
 
 import (
 	"crypto/ed25519"
@@ -19,17 +22,17 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// testSSHD is an in-process SSH server that only serves port forwards
-// ("direct-tcpip" channels), so tests can drive the real ssh client end to
-// end without an sshd installed. Its ssh_config makes the host alias
-// "testhost" point at it with a trusted host key and a working client key.
-type testSSHD struct {
+// Server is a running test SSH server. Its ssh_config defines host aliases:
+// "testhost" (trusted host key, accepted client key), "unknownhost" (host
+// key not trusted) and "badkeyhost" (client key the server refuses).
+type Server struct {
 	Port       int
 	ConfigPath string // pass to ssh with -F
-	dir        string
 }
 
-func startTestSSHD(t *testing.T) *testSSHD {
+// Start runs a server until the test ends. It skips the test when the ssh
+// client is not installed.
+func Start(t testing.TB) *Server {
 	t.Helper()
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skip("ssh client not installed")
@@ -120,7 +123,7 @@ Host badkeyhost
 `, port, keyPath, knownHosts, port, keyPath, port, strangerKeyPath, knownHosts)
 	require.NoError(t, os.WriteFile(configPath, []byte(sshConfig), 0600))
 
-	return &testSSHD{Port: port, ConfigPath: configPath, dir: dir}
+	return &Server{Port: port, ConfigPath: configPath}
 }
 
 // serveSSHConn handles one client: global requests (keepalives) get a reply,

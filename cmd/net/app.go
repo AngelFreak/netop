@@ -26,12 +26,16 @@ type App struct {
 	DHCPMgr    types.DHCPManager    // DHCP server management
 	PortalDet  types.PortalDetector // Captive portal / connectivity probing
 	RouteMgr   types.RouteManager   // Route inspection for multi-home signaling (nil-safe)
+	TunnelMgr  types.TunnelManager  // SSH port-forward tunnels (nil-safe in status)
 
 	// Runtime configuration
 	Interface string // Primary network interface to use
 	NoVPN     bool   // When true, skip automatic VPN connection
 	Debug     bool   // Enable debug output
 	JSON      bool   // Emit one JSON envelope on stdout instead of text (see output.go)
+	// TunnelSudo is set when `net tunnel` dropped from sudo to the calling
+	// user. sudo strips SSH_AUTH_SOCK, so a refused login gets a hint.
+	TunnelSudo bool
 
 	// PortalRetryDelay is the settle delay before the one connect-time retry
 	// when the first portal probe reports offline. Zero means the 500ms
@@ -920,6 +924,14 @@ func (a *App) gatherStatus() statusResult {
 		nat := a.DHCPMgr.NATStatus()
 		st.DHCPServer.Sharing = &nat
 	}
+
+	if a.TunnelMgr != nil {
+		if tunnels, err := a.TunnelMgr.List(); err != nil {
+			a.Logger.Debug("Failed to list tunnels", "error", err)
+		} else {
+			st.Tunnels = tunnelEntries(tunnels)
+		}
+	}
 	return st
 }
 
@@ -1037,6 +1049,16 @@ func (a *App) renderStatus(st statusResult) {
 		a.printf("Sharing:   %s\n", sharingLabel(*st.DHCPServer.Sharing))
 	} else {
 		a.println("(not running)")
+	}
+
+	// Only when tunnels exist, so status output is unchanged for everyone
+	// who does not use them.
+	if len(st.Tunnels) > 0 {
+		a.println("\nTunnels")
+		a.println("-------")
+		for _, e := range st.Tunnels {
+			a.println(tunnelLine(e))
+		}
 	}
 }
 

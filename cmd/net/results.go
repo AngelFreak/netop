@@ -79,6 +79,8 @@ type statusResult struct {
 	Hotspot      *types.HotspotStatus `json:"hotspot"`
 	HotspotError string               `json:"hotspot_error,omitempty"`
 	DHCPServer   dhcpServerResult     `json:"dhcp_server"`
+	// Tunnels lists tracked SSH tunnels; absent when there are none.
+	Tunnels []tunnelEntry `json:"tunnels,omitempty"`
 
 	// macKnown distinguishes "MAC lookup failed" (line omitted in text)
 	// from an empty address; JSON just omits the field.
@@ -168,4 +170,41 @@ func nonNil(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+// Tunnel states. "stopped" is a configured tunnel that is not running;
+// "down" is one net started whose ssh has since exited.
+const (
+	tunnelUp      = "up"
+	tunnelDown    = "down"
+	tunnelStopped = "stopped"
+)
+
+type tunnelEntry struct {
+	Name     string          `json:"name"`
+	Host     string          `json:"host"`
+	State    string          `json:"state"`
+	AdHoc    bool            `json:"ad_hoc"`
+	Forwards []types.Forward `json:"forwards"`
+}
+
+type tunnelListResult struct {
+	Tunnels []tunnelEntry `json:"tunnels"`
+}
+
+// tunnelEntries converts tracked tunnels for output.
+func tunnelEntries(tunnels []types.TunnelStatus) []tunnelEntry {
+	entries := make([]tunnelEntry, 0, len(tunnels))
+	for _, t := range tunnels {
+		state := tunnelDown
+		if t.Up {
+			state = tunnelUp
+		}
+		forwards := t.Forwards
+		if forwards == nil {
+			forwards = []types.Forward{}
+		}
+		entries = append(entries, tunnelEntry{Name: t.Name, Host: t.Host, State: state, AdHoc: t.AdHoc, Forwards: forwards})
+	}
+	return entries
 }
