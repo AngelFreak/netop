@@ -132,7 +132,6 @@ type TunnelStatus struct {
 	Forwards []Forward `json:"forwards"`
 	Up       bool      `json:"up"`
 	AdHoc    bool      `json:"ad_hoc"`
-	PID      int       `json:"pid,omitempty"`
 	// Warnings are problems found after a successful start, such as nothing
 	// listening on a forward's remote port.
 	Warnings []string `json:"warnings,omitempty"`
