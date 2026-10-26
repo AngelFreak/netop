@@ -495,6 +495,11 @@ type LinkManager interface {
 	ListByType(linkType string) ([]string, error)
 	// GetMAC returns the hardware (MAC) address of iface as a string.
 	GetMAC(iface string) (string, error)
+	// GetPermanentMAC returns the factory/permanent hardware address of iface.
+	// The kernel reports this only when it differs from the current address,
+	// so an empty string with a nil error means "currently on the permanent
+	// MAC" rather than "unknown".
+	GetPermanentMAC(iface string) (string, error)
 	// SetMAC sets the hardware (MAC) address of iface. The interface must be
 	// down; callers are responsible for down/up sequencing.
 	SetMAC(iface, mac string) error

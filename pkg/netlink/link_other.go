@@ -32,5 +32,8 @@ func (m *LinkManager) ListByType(linkType string) ([]string, error) { return nil
 // GetMAC always returns ErrUnsupported on non-Linux platforms.
 func (m *LinkManager) GetMAC(iface string) (string, error) { return "", ErrUnsupported }
 
+// GetPermanentMAC always returns ErrUnsupported on non-Linux platforms.
+func (m *LinkManager) GetPermanentMAC(iface string) (string, error) { return "", ErrUnsupported }
+
 // SetMAC always returns ErrUnsupported on non-Linux platforms.
 func (m *LinkManager) SetMAC(iface, mac string) error { return ErrUnsupported }

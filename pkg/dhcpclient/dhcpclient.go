@@ -139,24 +139,33 @@ func (m *Manager) Acquire(iface string, hostname string) error {
 	// (faster on already-associated links). dhclient remains the historical
 	// fallback when udhcpc is unavailable.
 	var attempt func() error
+	var window time.Duration
 	switch {
 	case isWiredInterface(iface) && hasDhclient:
 		m.logger.Debug("Using dhclient for DHCP on wired interface", "interface", iface)
 		attempt = func() error { return m.acquireDhclient(iface, hostname) }
+		window = m.getDhclientTimeout()
 	case hasUdhcpc:
 		m.logger.Debug("Using udhcpc for DHCP", "interface", iface)
 		attempt = func() error { return m.acquireUdhcpc(iface, hostname) }
+		window = m.getUdhcpcTimeout()
 	case hasDhclient:
 		m.logger.Debug("Using dhclient for DHCP", "interface", iface)
 		attempt = func() error { return m.acquireDhclient(iface, hostname) }
+		window = m.getDhclientTimeout()
 	default:
 		return fmt.Errorf("no DHCP client found: install udhcpc (recommended) or dhclient")
 	}
 
+	// State the blocking window up front. Without it a wired failure is two
+	// silent 60s stalls, which reads as a hang rather than as discovery.
+	m.logger.Info(fmt.Sprintf("Requesting DHCP lease (attempt 1 of 2, up to %s)", window),
+		"interface", iface)
 	if err := attempt(); err == nil {
 		return nil
 	} else {
-		m.logger.Warn("DHCP attempt failed, retrying once", "interface", iface, "error", err)
+		m.logger.Warn(fmt.Sprintf("DHCP attempt 1 failed, retrying (attempt 2 of 2, up to %s)", window),
+			"interface", iface, "error", err)
 		time.Sleep(RetryDelay)
 		if retryErr := attempt(); retryErr != nil {
 			return retryErr

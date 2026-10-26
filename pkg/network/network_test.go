@@ -559,27 +559,43 @@ func TestSetMAC(t *testing.T) {
 		assert.NotContains(t, mac, "??", "template wildcards should be expanded")
 	})
 
-	t.Run("permanent mac - uses ethtool to get factory MAC", func(t *testing.T) {
+	t.Run("permanent mac - applies the factory MAC from netlink", func(t *testing.T) {
 		executor := newStrictMockExecutor()
-		// ethtool -P returns the permanent/factory MAC address
-		executor.commands["ethtool -P wlan0"] = "Permanent address: 00:11:22:33:44:55"
 		logger := &mockLogger{}
 		links := newFakeLinks()
+		links.PermMACs = map[string]string{"wlan0": "00:11:22:33:44:55"}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "permanent")
 		assert.NoError(t, err)
 
-		// Verify ethtool was called and the permanent MAC was used.
+		// Netlink is the source of truth; no external binary is needed.
+		assert.Contains(t, links.SetMACCalls, fake.MACCall{Iface: "wlan0", MAC: "00:11:22:33:44:55"})
+		assert.NotContains(t, executor.executedCmds, "ethtool -P wlan0")
+	})
+
+	t.Run("permanent mac - falls back to ethtool when netlink errors", func(t *testing.T) {
+		executor := newStrictMockExecutor()
+		executor.commands["ethtool -P wlan0"] = "Permanent address: 00:11:22:33:44:55"
+		logger := &mockLogger{}
+		links := newFakeLinks()
+		links.GetPermMACErr = assert.AnError
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger}
+
+		err := manager.SetMAC("wlan0", "permanent")
+		assert.NoError(t, err)
+
 		executor.assertCommandExecuted(t, "ethtool -P wlan0")
 		assert.Contains(t, links.SetMACCalls, fake.MACCall{Iface: "wlan0", MAC: "00:11:22:33:44:55"})
 	})
 
-	t.Run("permanent mac - fails when ethtool unavailable", func(t *testing.T) {
+	t.Run("permanent mac - fails when neither netlink nor ethtool can report it", func(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.errors["ethtool -P wlan0"] = assert.AnError
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		links := newFakeLinks()
+		links.GetPermMACErr = assert.AnError
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "permanent")
 		assert.Error(t, err)
@@ -590,7 +606,9 @@ func TestSetMAC(t *testing.T) {
 		executor := newStrictMockExecutor()
 		executor.commands["ethtool -P wlan0"] = "Invalid output"
 		logger := &mockLogger{}
-		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: logger}
+		links := newFakeLinks()
+		links.GetPermMACErr = assert.AnError // force the ethtool fallback
+		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links, executor: executor, logger: logger}
 
 		err := manager.SetMAC("wlan0", "permanent")
 		assert.Error(t, err)
@@ -1826,4 +1844,100 @@ func TestDisconnect(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to bring interface down")
 	})
+}
+
+// A wired DHCP failure on an interface using a randomized MAC must explain
+// that the randomized MAC is the likely cause and name the permanent MAC, so
+// the user can act. Networks that authorize by MAC silently drop DISCOVERs
+// from an unknown MAC, which otherwise surfaces only as raw dhclient stderr.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureDiagnosesRandomizedMAC(t *testing.T) {
+	executor := newMockExecutor()
+	links := newFakeLinks()
+	links.PermMACs = map[string]string{"eth0": "ec:9a:0c:1b:2b:81"}
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links,
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		currentMACFn: func(string) string { return "ac:bc:32:0c:bd:b9" },
+	}
+
+	// mac: default -> randomized Apple-OUI MAC, as `common: mac: default` yields.
+	config := &types.NetworkConfig{Interface: "eth0", MAC: "default"}
+
+	err := manager.ConnectToConfiguredNetwork(config, "", nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
+	assert.Contains(t, err.Error(), "randomized MAC",
+		"error must name the randomized MAC as the likely cause")
+	assert.Contains(t, err.Error(), "ec:9a:0c:1b:2b:81",
+		"error must surface the permanent MAC so the user can compare")
+	assert.Contains(t, err.Error(), "mac: permanent",
+		"error must name the concrete config fix")
+}
+
+// The MAC diagnostic must not fire when the interface is already using its
+// permanent MAC — there the randomized-MAC advice would be actively wrong.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureNoMACAdviceWhenPermanent(t *testing.T) {
+	executor := newMockExecutor()
+	permLinks := newFakeLinks()
+	permLinks.PermMACs = map[string]string{"eth0": "ec:9a:0c:1b:2b:81"}
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: permLinks,
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		currentMACFn: func(string) string { return "ec:9a:0c:1b:2b:81" },
+	}
+
+	config := &types.NetworkConfig{Interface: "eth0", MAC: "permanent"}
+
+	err := manager.ConnectToConfiguredNetwork(config, "", nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
+	assert.NotContains(t, err.Error(), "randomized MAC",
+		"must not blame MAC randomization when the permanent MAC is in use")
+}
+
+// `mac: permanent` must work without ethtool installed. The netlink permanent
+// address is the primary source; ethtool is only a fallback, and it is absent
+// on minimal systems (Alpine, embedded) that netop explicitly targets.
+func TestSetMAC_PermanentUsesNetlinkWithoutEthtool(t *testing.T) {
+	executor := newMockExecutor()
+	executor.errors["ethtool -P eth0"] = fmt.Errorf(`exec: "ethtool": executable file not found in $PATH`)
+	links := newFakeLinks()
+	links.PermMACs = map[string]string{"eth0": "ec:9a:0c:1b:2b:81"}
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links,
+		executor: executor, logger: &mockLogger{},
+	}
+
+	err := manager.SetMAC("eth0", "permanent")
+
+	assert.NoError(t, err, "must not require ethtool to restore the permanent MAC")
+	if assert.Len(t, links.SetMACCalls, 1) {
+		assert.Equal(t, "ec:9a:0c:1b:2b:81", links.SetMACCalls[0].MAC)
+	}
+}
+
+// When the kernel reports no distinct permanent address the interface is
+// already on its factory MAC, so `mac: permanent` is a no-op, not an error.
+func TestSetMAC_PermanentNoOpWhenAlreadyFactory(t *testing.T) {
+	executor := newMockExecutor()
+	executor.errors["ethtool -P eth0"] = fmt.Errorf(`exec: "ethtool": executable file not found in $PATH`)
+	links := newFakeLinks() // no PermMACs entry -> kernel reports nothing
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: links,
+		executor: executor, logger: &mockLogger{},
+		currentMACFn: func(string) string { return "ec:9a:0c:1b:2b:81" },
+	}
+
+	err := manager.SetMAC("eth0", "permanent")
+
+	assert.NoError(t, err)
+	assert.Empty(t, links.SetMACCalls, "must not churn the MAC when already on the factory address")
 }

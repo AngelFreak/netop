@@ -675,3 +675,23 @@ func TestTimeoutConstants(t *testing.T) {
 	assert.Equal(t, 6, UdhcpcDiscoverRetries)
 	assert.Equal(t, 3, UdhcpcDiscoverTimeout)
 }
+
+// A DHCP attempt must announce the window it is about to block for, and the
+// retry must say how long remains. A silent 2x60s wall-clock stall on wired
+// is indistinguishable from a hang.
+func TestAcquire_AnnouncesAttemptWindow(t *testing.T) {
+	executor := newMockExecutor()
+	executor.hasCommands["dhclient"] = true
+	executor.errors["timeout 60 dhclient -v -1 eth0"] = errors.New("exit status 124")
+	logger := &mockLogger{}
+	m := &Manager{executor: executor, logger: logger}
+
+	err := m.Acquire("eth0", "")
+	assert.Error(t, err)
+
+	all := strings.Join(append(append([]string{}, logger.infoMsgs...), logger.warnMsgs...), "\n")
+	assert.Contains(t, all, "up to 1m0s",
+		"must state the per-attempt window so a long wait is not mistaken for a hang")
+	assert.Contains(t, all, "attempt 2 of 2",
+		"retry must say which attempt is running")
+}
