@@ -939,7 +939,7 @@ func (a *App) renderStatus(st statusResult) {
 		case st.MACPolicy == "random":
 			macInfo += " (random)"
 		case st.MACPolicy == "default":
-			macInfo += " (randomized Apple OUI)"
+			macInfo += " (randomized, Apple-styled)"
 		case st.MACPolicy != "":
 			macInfo += " (randomized from " + st.MACPolicy + ")"
 		}

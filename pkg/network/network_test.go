@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -780,10 +781,32 @@ func TestGenerateRandomMAC(t *testing.T) {
 	assert.Regexp(t, `^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`, mac)
 }
 
+// A generated MAC must be locally administered (U/L bit set in the first
+// octet). Apple's real OUI ac:bc:32 has that bit clear, so emitting it
+// verbatim claims to be genuine Apple-assigned hardware rather than a spoofed
+// address. generateRandomMAC and expandMACTemplate already set the bit; this
+// generator must not be the odd one out.
 func TestGenerateMacBookProMAC(t *testing.T) {
 	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks()}
-	mac := manager.generateMacBookProMAC()
-	assert.Regexp(t, `^ac:bc:32:[0-9a-f]{2}(:[0-9a-f]{2}){2}$`, mac)
+
+	for i := 0; i < 32; i++ {
+		mac := manager.generateMacBookProMAC()
+		assert.Regexp(t, `^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`, mac)
+
+		first, err := strconv.ParseUint(mac[0:2], 16, 8)
+		assert.NoError(t, err)
+		assert.EqualValues(t, 0x02, first&0x02,
+			"first octet %#02x of %s must have the locally-administered bit set", first, mac)
+		assert.EqualValues(t, 0, first&0x01,
+			"first octet %#02x of %s must be unicast, not multicast", first, mac)
+	}
+}
+
+// The Apple-styled generator keeps the recognisable vendor shape while still
+// flagging itself as locally administered: ac:bc:32 -> ae:bc:32.
+func TestGenerateMacBookProMAC_KeepsAppleShapeWithLocalBit(t *testing.T) {
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks()}
+	assert.Regexp(t, `^ae:bc:32:[0-9a-f]{2}(:[0-9a-f]{2}){2}$`, manager.generateMacBookProMAC())
 }
 
 func TestExpandMACTemplate(t *testing.T) {
@@ -1826,4 +1849,90 @@ func TestDisconnect(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to bring interface down")
 	})
+}
+
+// On DHCP failure the error must name the layer that is blocking, not assert a
+// cause. Which layer it is determines whether MAC randomization is workable at
+// all, so the distinction is the whole value of the diagnostic.
+func TestDiagnoseDHCPFailure(t *testing.T) {
+	t.Run("no inbound frames - switch is not forwarding", func(t *testing.T) {
+		m := &Manager{logger: &mockLogger{}}
+		got := m.describeDHCPSilence(0)
+		assert.Contains(t, got, "No frames were received")
+		assert.Contains(t, got, "802.1X")
+		assert.Contains(t, got, "port security")
+	})
+
+	t.Run("inbound frames seen - L2 alive, server ignoring us", func(t *testing.T) {
+		m := &Manager{logger: &mockLogger{}}
+		got := m.describeDHCPSilence(42)
+		assert.Contains(t, got, "42")
+		assert.Contains(t, got, "reached")
+		assert.NotContains(t, got, "802.1X",
+			"must not blame port auth when the port is demonstrably forwarding")
+	})
+}
+
+// The layer diagnostic must reach the real wired DHCP failure, not just exist
+// as a helper. A diagnostic only called from its own unit test is dead code.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureReportsBlockingLayer(t *testing.T) {
+	executor := newMockExecutor()
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		rxPacketsFn:  func(string) int64 { return 0 }, // port not forwarding
+	}
+
+	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
+	assert.Contains(t, err.Error(), "No frames were received",
+		"the blocking-layer diagnostic must reach the user-facing error")
+}
+
+// With frames arriving the diagnostic must blame the DHCP server, not the port.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureL2Alive(t *testing.T) {
+	executor := newMockExecutor()
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		// Counter advances across the attempt: the delta, not the absolute
+		// value, is what shows frames actually arrived while DHCP ran.
+		rxPacketsFn: func() func(string) int64 {
+			n := int64(1000)
+			return func(string) int64 { n += 128; return n }
+		}(),
+	}
+
+	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "128 frames were received")
+	assert.NotContains(t, err.Error(), "802.1X")
+}
+
+// An unreadable counter must add nothing rather than guess.
+func TestConnectToConfiguredNetwork_WiredDHCPFailureNoCounterNoClaim(t *testing.T) {
+	executor := newMockExecutor()
+	manager := &Manager{
+		routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(),
+		executor:     executor,
+		logger:       &mockLogger{},
+		dhcpClient:   &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed: exit status 124")},
+		setImmutable: (&immutableRecorder{}).set,
+		rxPacketsFn:  func(string) int64 { return -1 }, // unreadable
+	}
+
+	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+
+	assert.Error(t, err)
+	assert.NotContains(t, err.Error(), "802.1X")
+	assert.NotContains(t, err.Error(), "frames were received")
 }

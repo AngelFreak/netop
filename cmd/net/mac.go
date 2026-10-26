@@ -18,7 +18,7 @@ Examples:
   net mac                         Random MAC
   net mac random                  Random MAC (explicit)
   net mac AA:BB:CC:DD:EE:FF       Set specific MAC
-  net mac default                 Randomize with Apple OUI prefix`,
+  net mac default                 Randomize with Apple-styled prefix`,
 	Run: func(cmd *cobra.Command, args []string) {
 		rejectJSON("mac")
 		mac := ""
