@@ -371,13 +371,19 @@ func (l *testLogger) Error(msg string, args ...interface{}) {
 // TestWireGuardMTU_Integration proves the parsed MTU reaches a real kernel
 // link, not just a fake LinkManager. The unit tests assert SetMTU was called;
 // only this confirms netlink actually applies the value.
+//
+// This creates the link directly rather than via testutil.NewWireGuardInterface:
+// that helper sets a private key through the `wg` binary, which fails with
+// "fopen: Permission denied" under `ip netns exec` on CI runners (the same
+// failure that has kept the other WireGuard integration tests red). An MTU is a
+// plain link attribute and needs no key, so this test avoids the dependency.
 func TestWireGuardMTU_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 	testutil.SkipIfNoWireGuard(t)
 	testutil.SkipIfMissingCmd(t, "ip")
 
 	ns := testutil.NewTestNamespace(t)
-	testutil.NewWireGuardInterface(t, ns, "wg-mtu", "10.100.101.1/24")
+	require.NoError(t, ns.Exec("ip", "link", "add", "dev", "wg-mtu", "type", "wireguard"))
 
 	// Apply the MTU the way connectWireGuard does, then read it back.
 	require.NoError(t, ns.Exec("ip", "link", "set", "wg-mtu", "mtu", "1380"))
