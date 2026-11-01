@@ -206,6 +206,10 @@ func (n *testNetworkManager) SetDNS(servers []string) error {
 	return n.setDNSErr
 }
 
+func (n *testNetworkManager) GetDNS() ([]string, error) {
+	return nil, nil
+}
+
 func (n *testNetworkManager) ClearDNS() error {
 	return nil
 }

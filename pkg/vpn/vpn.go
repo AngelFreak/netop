@@ -31,7 +31,9 @@ type Manager struct {
 	addrMgr       types.AddrManager           // netlink-backed interface address access (WireGuard iface IP)
 	linkMgr       types.LinkManager           // netlink-backed link access (WireGuard iface create/delete/enumerate)
 	wgConfig      types.WireGuardConfigurator // wgctrl-backed WireGuard config; nil until first use / injected in tests
+	networkMgr    types.NetworkManager        // resolv.conf access for VPN-provided DNS; nil disables DNS handling
 	endpointRoute string                      // Stores the VPN endpoint IP for cleanup on disconnect
+	originalDNS   string                      // Comma-separated pre-VPN nameservers, restored on disconnect
 	runtimeDir    string                      // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex                  // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 
@@ -43,7 +45,7 @@ type Manager struct {
 }
 
 // vpnState holds the state information stored in the active-vpn file
-// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
+// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute|originalDNS
 type vpnState struct {
 	Name              string
 	Interface         string
@@ -51,6 +53,10 @@ type vpnState struct {
 	OriginalGateway   string
 	OriginalInterface string
 	EndpointRoute     string
+	// OriginalDNS holds the comma-separated nameservers that were in
+	// resolv.conf before a VPN-provided DNS replaced them, so disconnect can
+	// put them back. Empty when the VPN did not set DNS.
+	OriginalDNS string
 }
 
 // NewManager creates a new VPN manager with the default runtime directory
@@ -112,6 +118,7 @@ func (m *Manager) Connect(name string) error {
 		// original route before saving new state, mirroring Disconnect — else
 		// the old /32 endpoint route leaks permanently.
 		m.removeEndpointRoute(existingState)
+		m.restoreDNS(existingState)
 		m.restoreDefaultRouteFromState(existingState)
 		m.clearActiveVPN()
 	}
@@ -129,6 +136,9 @@ func (m *Manager) Connect(name string) error {
 	// Reset the endpoint route tracker; connectWireGuard sets it when it
 	// adds a protective route to the VPN endpoint.
 	m.endpointRoute = ""
+	// Reset the DNS snapshot; connectWireGuard sets it when the config
+	// provides its own nameservers.
+	m.originalDNS = ""
 
 	var connectErr error
 	var vpnIface string
@@ -173,6 +183,7 @@ func (m *Manager) Connect(name string) error {
 		OriginalGateway:   origGW,
 		OriginalInterface: origIface,
 		EndpointRoute:     m.endpointRoute,
+		OriginalDNS:       m.originalDNS,
 	}
 	if err := m.setActiveVPNState(state); err != nil {
 		m.logger.Debug("Failed to record active VPN state", "error", err)
@@ -222,6 +233,10 @@ func (m *Manager) Disconnect(name string) error {
 
 	// Remove the VPN endpoint route if we added one.
 	m.removeEndpointRoute(state)
+
+	// Put back the nameservers the VPN replaced, so disconnecting does not
+	// leave the system pointing at a resolver inside the dead tunnel.
+	m.restoreDNS(state)
 
 	// Restore default route via the physical interface using saved original route
 	m.restoreDefaultRouteFromState(state)
@@ -1001,6 +1016,14 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		return fmt.Errorf("WireGuard configuration unavailable: %w", err)
 	}
 
+	// Parse the wg-quick [Interface] settings the kernel device does not take
+	// (MTU, DNS) before creating anything, so an invalid value fails before we
+	// touch the link rather than halfway through setup.
+	settings, err := wgconfig.ParseSettings(config.Config)
+	if err != nil {
+		return fmt.Errorf("invalid WireGuard config: %w", err)
+	}
+
 	// Create WireGuard interface — if it already exists, delete and recreate
 	// to ensure clean state (no stale routes/config from previous connection)
 	err = m.linkMgr.AddWireGuard(iface)
@@ -1027,6 +1050,18 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 			// Clean up interface on failure
 			m.linkMgr.Delete(iface)
 			return fmt.Errorf("failed to set WireGuard IP: %w", err)
+		}
+	}
+
+	// Apply the config's MTU while the link is still down, so it never carries
+	// traffic at the wrong MTU. Tunnels over paths with reduced MTU need this
+	// to avoid fragmentation stalls.
+	if settings.MTU > 0 {
+		m.logger.Debug("Setting WireGuard MTU", "interface", iface, "mtu", settings.MTU)
+		if err := m.linkMgr.SetMTU(iface, settings.MTU); err != nil {
+			// Clean up interface on failure
+			m.linkMgr.Delete(iface)
+			return fmt.Errorf("failed to set WireGuard MTU %d: %w", settings.MTU, err)
 		}
 	}
 
@@ -1077,8 +1112,49 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		}
 	}
 
+	// Apply the config's DNS last: the resolver usually lives inside the
+	// tunnel, so it is only reachable once routes are in place. A DNS failure
+	// is not fatal — the tunnel itself is up and usable.
+	m.applyVPNDNS(settings.DNS)
+
 	m.logger.Info("WireGuard VPN connection established", "interface", iface)
 	return nil
+}
+
+// applyVPNDNS writes VPN-provided nameservers to resolv.conf, recording the
+// previous ones in m.originalDNS so Disconnect can restore them. Non-address
+// entries (wg-quick allows search domains in DNS=) are left to the network
+// manager, which skips them. A nil networkMgr or empty list is a no-op, so a
+// config without DNS behaves exactly as before.
+func (m *Manager) applyVPNDNS(servers []string) {
+	if len(servers) == 0 || m.networkMgr == nil {
+		return
+	}
+	// Snapshot the current nameservers first so disconnect can restore them.
+	if prior, err := m.networkMgr.GetDNS(); err != nil {
+		m.logger.Debug("Could not read current DNS; will not restore on disconnect", "error", err)
+	} else {
+		m.originalDNS = strings.Join(prior, ",")
+	}
+	m.logger.Info("Applying VPN-provided DNS", "servers", servers)
+	if err := m.networkMgr.SetDNS(servers); err != nil {
+		// Non-fatal: the tunnel is up, only name resolution is affected.
+		m.logger.Warn("Failed to apply VPN DNS", "servers", servers, "error", err)
+		m.originalDNS = ""
+	}
+}
+
+// restoreDNS puts back the nameservers that were in place before a VPN
+// replaced them. No-op when the VPN never set DNS.
+func (m *Manager) restoreDNS(state *vpnState) {
+	if state == nil || state.OriginalDNS == "" || m.networkMgr == nil {
+		return
+	}
+	servers := strings.Split(state.OriginalDNS, ",")
+	m.logger.Debug("Restoring pre-VPN DNS", "servers", servers)
+	if err := m.networkMgr.SetDNS(servers); err != nil {
+		m.logger.Warn("Failed to restore pre-VPN DNS", "servers", servers, "error", err)
+	}
 }
 
 // extractEndpoint extracts the endpoint IP from a WireGuard config
@@ -1170,10 +1246,11 @@ func (m *Manager) setActiveVPNState(state vpnState) error {
 		// Non-fatal: status will fall back to interface detection
 		return err
 	}
-	// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
-	content := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+	// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute|originalDNS
+	content := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s",
 		state.Name, state.Interface, state.Type,
-		state.OriginalGateway, state.OriginalInterface, state.EndpointRoute)
+		state.OriginalGateway, state.OriginalInterface, state.EndpointRoute,
+		state.OriginalDNS)
 	// Use 0600 for consistency with other runtime files (e.g., wg.conf, openvpn.conf)
 	return os.WriteFile(activeVPNFile, []byte(content), 0600)
 }
@@ -1206,6 +1283,11 @@ func (m *Manager) getActiveVPNState() *vpnState {
 	}
 	if len(parts) >= 6 {
 		state.EndpointRoute = parts[5]
+	}
+	// Written by newer versions only; a 6-field file from before this field
+	// existed still loads with an empty OriginalDNS.
+	if len(parts) >= 7 {
+		state.OriginalDNS = parts[6]
 	}
 	return state
 }

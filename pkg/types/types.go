@@ -322,6 +322,8 @@ type VPNManager interface {
 // NetworkManager handles network configuration
 type NetworkManager interface {
 	SetDNS(servers []string) error
+	// GetDNS returns the nameservers currently in resolv.conf, in file order.
+	GetDNS() ([]string, error)
 	ClearDNS() error
 	// ClearDNSIfOwned clears DNS only if netop set it. Returns (cleared, err).
 	ClearDNSIfOwned() (bool, error)
@@ -498,6 +500,8 @@ type LinkManager interface {
 	// SetMAC sets the hardware (MAC) address of iface. The interface must be
 	// down; callers are responsible for down/up sequencing.
 	SetMAC(iface, mac string) error
+	// SetMTU sets the MTU of iface.
+	SetMTU(iface string, mtu int) error
 }
 
 // FirewallManager configures the IPv4 NAT/forwarding rules that let clients on

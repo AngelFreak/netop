@@ -240,9 +240,29 @@ AllowedIPs = 0.0.0.0/0
 	assert.Empty(t, s.DNS)
 }
 
-// ParseSettings must reject the same malformed input parseConfig rejects, so a
-// bad config fails once, consistently, rather than half-applying.
-func TestParseSettings_PropagatesParseErrors(t *testing.T) {
-	_, err := ParseSettings("[Interface]\nNotAKey = x\n")
-	assert.Error(t, err)
+// ParseSettings only validates the keys it consumes. Device-config validation
+// belongs to wg.Configure; re-doing it here would reject the same config twice
+// with different wording, and would break partial configs that the kernel path
+// accepts. An unknown key is therefore ignored, but a bad MTU still fails.
+func TestParseSettings_IgnoresKeysItDoesNotConsume(t *testing.T) {
+	s, err := ParseSettings("[Interface]\nNotAKey = x\nMTU = 1380\n")
+	require.NoError(t, err)
+	assert.Equal(t, 1380, s.MTU)
+}
+
+// A config fragment with no [Interface] section must yield no settings rather
+// than an error — some callers pass partial configs.
+func TestParseSettings_PartialConfigIsNotAnError(t *testing.T) {
+	s, err := ParseSettings("[Peer]\nEndpoint = localhost:51820\n")
+	require.NoError(t, err)
+	assert.Zero(t, s.MTU)
+	assert.Empty(t, s.DNS)
+}
+
+// MTU and DNS outside [Interface] must not be picked up.
+func TestParseSettings_PeerSectionKeysIgnored(t *testing.T) {
+	s, err := ParseSettings("[Peer]\nMTU = 1200\nDNS = 9.9.9.9\n")
+	require.NoError(t, err)
+	assert.Zero(t, s.MTU)
+	assert.Empty(t, s.DNS)
 }

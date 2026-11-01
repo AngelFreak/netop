@@ -32,7 +32,7 @@ changing what reaches the kernel device.
 - MTU 0 (unset) → SetMTU never called (byte-identical to baseline)
 - SetMTU failure → interface cleaned up, error returned (matches sibling paths)
 - netlink integration test (root/netns): real wg link reports 1380
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: Apply VPN DNS, restore on disconnect
 **Goal**: WireGuard DNS reaches resolv.conf and is undone on disconnect.

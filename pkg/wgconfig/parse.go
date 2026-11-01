@@ -34,13 +34,44 @@ type Settings struct {
 	DNS []string // resolv.conf nameservers, in config order; nil when unspecified
 }
 
-// ParseSettings parses a WireGuard INI configuration and returns only the
-// wg-quick interface settings netop applies outside the kernel device. It
-// validates the whole config, so a malformed config fails here too rather than
-// half-applying.
+// ParseSettings extracts the wg-quick [Interface] settings netop applies
+// outside the kernel device (MTU, DNS). It deliberately does NOT validate the
+// rest of the config: wg.Configure already rejects a bad device config, and
+// duplicating that here would reject the same config twice with different
+// wording. Only the keys it consumes are validated, so an invalid MTU is still
+// a hard error.
 func ParseSettings(config string) (Settings, error) {
-	_, set, err := parse(config)
-	return set, err
+	var set Settings
+	inInterface := false
+	for _, raw := range strings.Split(config, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			name := strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			inInterface = name == "interface"
+			continue
+		}
+		if !inInterface {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "mtu":
+			mtu, err := parseMTU(strings.TrimSpace(value))
+			if err != nil {
+				return Settings{}, err
+			}
+			set.MTU = mtu
+		case "dns":
+			set.DNS = append(set.DNS, parseDNS(strings.TrimSpace(value))...)
+		}
+	}
+	return set, nil
 }
 
 // parse walks the INI config once, producing both the kernel device config and
