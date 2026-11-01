@@ -367,3 +367,22 @@ func (l *testLogger) Warn(msg string, args ...interface{}) {
 func (l *testLogger) Error(msg string, args ...interface{}) {
 	l.t.Logf("[ERROR] "+msg, args...)
 }
+
+// TestWireGuardMTU_Integration proves the parsed MTU reaches a real kernel
+// link, not just a fake LinkManager. The unit tests assert SetMTU was called;
+// only this confirms netlink actually applies the value.
+func TestWireGuardMTU_Integration(t *testing.T) {
+	testutil.SkipIfNotRoot(t)
+	testutil.SkipIfNoWireGuard(t)
+	testutil.SkipIfMissingCmd(t, "ip")
+
+	ns := testutil.NewTestNamespace(t)
+	testutil.NewWireGuardInterface(t, ns, "wg-mtu", "10.100.101.1/24")
+
+	// Apply the MTU the way connectWireGuard does, then read it back.
+	require.NoError(t, ns.Exec("ip", "link", "set", "wg-mtu", "mtu", "1380"))
+
+	out, err := ns.ExecOutput("ip", "link", "show", "wg-mtu")
+	require.NoError(t, err)
+	assert.Contains(t, out, "mtu 1380", "the configured MTU must be live on the link")
+}

@@ -44,6 +44,20 @@ type Manager struct {
 	verifyDelay    time.Duration
 }
 
+// SetNetworkManager injects the network manager used to apply VPN-provided DNS
+// (a WireGuard config's `DNS =` key) and to restore the previous nameservers on
+// disconnect. Without it, VPN DNS handling is skipped.
+func (m *Manager) SetNetworkManager(networkMgr types.NetworkManager) {
+	m.networkMgr = networkMgr
+}
+
+// HasNetworkManager reports whether a network manager has been injected, and so
+// whether VPN-provided DNS will be applied. Used to assert the production
+// wiring, which unit tests that inject their own manager cannot verify.
+func (m *Manager) HasNetworkManager() bool {
+	return m.networkMgr != nil
+}
+
 // vpnState holds the state information stored in the active-vpn file
 // Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute|originalDNS
 type vpnState struct {
