@@ -21,7 +21,33 @@ import (
 // — those are handled elsewhere by the caller (addr/route managers) — and only
 // consumes the keys the kernel device understands.
 func parseConfig(config string) (wgtypes.Config, error) {
+	cfg, _, err := parse(config)
+	return cfg, err
+}
+
+// Settings holds the wg-quick [Interface] keys that the kernel device does not
+// understand but netop applies itself: MTU goes on the link, DNS goes to
+// resolv.conf. Zero values mean "not specified" — callers must skip applying
+// them so a config without these keys behaves exactly as before.
+type Settings struct {
+	MTU int      // link MTU; 0 when unspecified
+	DNS []string // resolv.conf nameservers, in config order; nil when unspecified
+}
+
+// ParseSettings parses a WireGuard INI configuration and returns only the
+// wg-quick interface settings netop applies outside the kernel device. It
+// validates the whole config, so a malformed config fails here too rather than
+// half-applying.
+func ParseSettings(config string) (Settings, error) {
+	_, set, err := parse(config)
+	return set, err
+}
+
+// parse walks the INI config once, producing both the kernel device config and
+// the wg-quick settings netop applies itself.
+func parse(config string) (wgtypes.Config, Settings, error) {
 	cfg := wgtypes.Config{ReplacePeers: true}
+	set := &Settings{}
 	var peers []wgtypes.PeerConfig
 
 	section := ""               // "interface", "peer", or ""
@@ -52,56 +78,57 @@ func parseConfig(config string) (wgtypes.Config, error) {
 			switch name {
 			case "interface":
 				if err := flushPeer(); err != nil {
-					return wgtypes.Config{}, err
+					return wgtypes.Config{}, Settings{}, err
 				}
 				section = "interface"
 			case "peer":
 				if err := flushPeer(); err != nil {
-					return wgtypes.Config{}, err
+					return wgtypes.Config{}, Settings{}, err
 				}
 				section = "peer"
 				cur = &wgtypes.PeerConfig{ReplaceAllowedIPs: true}
 			default:
-				return wgtypes.Config{}, fmt.Errorf("line %d: unknown section %q", lineNo+1, line)
+				return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: unknown section %q", lineNo+1, line)
 			}
 			continue
 		}
 
 		key, value, found := strings.Cut(line, "=")
 		if !found {
-			return wgtypes.Config{}, fmt.Errorf("line %d: expected key = value, got %q", lineNo+1, line)
+			return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: expected key = value, got %q", lineNo+1, line)
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		value = strings.TrimSpace(value)
 
 		switch section {
 		case "interface":
-			if err := applyInterfaceKey(&cfg, key, value); err != nil {
-				return wgtypes.Config{}, fmt.Errorf("line %d: %w", lineNo+1, err)
+			if err := applyInterfaceKey(&cfg, set, key, value); err != nil {
+				return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: %w", lineNo+1, err)
 			}
 		case "peer":
 			if err := applyPeerKey(cur, key, value); err != nil {
-				return wgtypes.Config{}, fmt.Errorf("line %d: %w", lineNo+1, err)
+				return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: %w", lineNo+1, err)
 			}
 			if key == "publickey" {
 				curHasPublicKey = true
 			}
 		default:
-			return wgtypes.Config{}, fmt.Errorf("line %d: key %q outside any section", lineNo+1, key)
+			return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: key %q outside any section", lineNo+1, key)
 		}
 	}
 
 	if err := flushPeer(); err != nil {
-		return wgtypes.Config{}, err
+		return wgtypes.Config{}, Settings{}, err
 	}
 	cfg.Peers = peers
-	return cfg, nil
+	return cfg, *set, nil
 }
 
 // applyInterfaceKey handles keys under [Interface] that the kernel device
-// understands. wg-quick-only keys (Address, DNS, MTU, Table, Pre/PostUp/Down,
-// SaveConfig) are silently ignored — the caller applies those separately.
-func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
+// understands. wg-quick-only keys that netop applies itself (MTU, DNS) are
+// collected into set when non-nil; the rest (Address, Table, Pre/PostUp/Down,
+// SaveConfig) are ignored here because the caller applies them separately.
+func applyInterfaceKey(cfg *wgtypes.Config, set *Settings, key, value string) error {
 	switch key {
 	case "privatekey":
 		k, err := wgtypes.ParseKey(value)
@@ -121,7 +148,21 @@ func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
 			return err
 		}
 		cfg.FirewallMark = &mark
-	case "address", "dns", "mtu", "table", "preup", "postup", "predown", "postdown", "saveconfig":
+	case "mtu":
+		// Not device config: netop applies this to the link itself.
+		mtu, err := parseMTU(value)
+		if err != nil {
+			return err
+		}
+		if set != nil {
+			set.MTU = mtu
+		}
+	case "dns":
+		// Not device config: netop writes these to resolv.conf.
+		if set != nil {
+			set.DNS = append(set.DNS, parseDNS(value)...)
+		}
+	case "address", "table", "preup", "postup", "predown", "postdown", "saveconfig":
 		// wg-quick / routing keys handled by the caller — not device config.
 	default:
 		return fmt.Errorf("unknown [Interface] key %q", key)
@@ -143,6 +184,33 @@ func parseFwMark(value string) (int, error) {
 		return 0, fmt.Errorf("invalid FwMark %q", value)
 	}
 	return int(mark), nil
+}
+
+// parseMTU parses a wg-quick MTU value. The bounds are the IPv4 minimum link
+// MTU (68) and the 16-bit maximum; anything outside that is a config error
+// rather than something to silently clamp.
+func parseMTU(value string) (int, error) {
+	mtu, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid MTU %q", value)
+	}
+	if mtu < 68 || mtu > 65535 {
+		return 0, fmt.Errorf("invalid MTU %d: must be between 68 and 65535", mtu)
+	}
+	return mtu, nil
+}
+
+// parseDNS splits a comma-separated wg-quick DNS list. Entries are kept as
+// written (including search domains, which are not IPs) — the network manager
+// validates and skips non-address entries when writing resolv.conf.
+func parseDNS(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // applyPeerKey handles keys under [Peer].

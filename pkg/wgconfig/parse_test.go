@@ -174,3 +174,75 @@ func TestParseConfig_EndpointFormats(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+// --- wg-quick interface settings (MTU / DNS) ---
+
+func TestParseSettings_MTUAndDNS(t *testing.T) {
+	s, err := ParseSettings(`
+[Interface]
+PrivateKey = ` + zeroKey + `
+MTU = 1380
+DNS = 10.77.0.1, orisonnet
+
+[Peer]
+PublicKey = ` + zeroKey + `
+Endpoint = 192.0.2.1:51820
+AllowedIPs = 10.77.0.0/24
+`)
+	require.NoError(t, err)
+	assert.Equal(t, 1380, s.MTU)
+	assert.Equal(t, []string{"10.77.0.1", "orisonnet"}, s.DNS)
+}
+
+func TestParseSettings_AbsentKeysAreZero(t *testing.T) {
+	s, err := ParseSettings(`
+[Interface]
+PrivateKey = ` + zeroKey + `
+
+[Peer]
+PublicKey = ` + zeroKey + `
+AllowedIPs = 0.0.0.0/0
+`)
+	require.NoError(t, err)
+	assert.Zero(t, s.MTU, "absent MTU must stay zero so callers skip applying it")
+	assert.Empty(t, s.DNS, "absent DNS must stay empty so callers skip applying it")
+}
+
+func TestParseSettings_InvalidMTU(t *testing.T) {
+	for _, tc := range []string{"abc", "0", "-1", "67", "70000", ""} {
+		_, err := ParseSettings("[Interface]\nMTU = " + tc + "\n")
+		assert.Error(t, err, "MTU %q must be rejected", tc)
+	}
+}
+
+func TestParseSettings_ValidMTUBounds(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want int
+	}{{"68", 68}, {"1280", 1280}, {"1380", 1380}, {"65535", 65535}} {
+		s, err := ParseSettings("[Interface]\nMTU = " + tc.in + "\n")
+		require.NoError(t, err, "MTU %q must be accepted", tc.in)
+		assert.Equal(t, tc.want, s.MTU)
+	}
+}
+
+func TestParseSettings_DNSIgnoresPeerSection(t *testing.T) {
+	// DNS/MTU are [Interface]-only; a stray key under [Peer] must not leak in.
+	s, err := ParseSettings(`
+[Interface]
+PrivateKey = ` + zeroKey + `
+
+[Peer]
+PublicKey = ` + zeroKey + `
+AllowedIPs = 0.0.0.0/0
+`)
+	require.NoError(t, err)
+	assert.Empty(t, s.DNS)
+}
+
+// ParseSettings must reject the same malformed input parseConfig rejects, so a
+// bad config fails once, consistently, rather than half-applying.
+func TestParseSettings_PropagatesParseErrors(t *testing.T) {
+	_, err := ParseSettings("[Interface]\nNotAKey = x\n")
+	assert.Error(t, err)
+}
