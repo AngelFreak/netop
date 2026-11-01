@@ -230,6 +230,29 @@ func (m *Manager) resolvConfHasNameserver() bool {
 	return false
 }
 
+// GetDNS returns the nameservers currently configured in resolv.conf, in file
+// order. A missing or nameserver-less file is not an error: it yields an empty
+// list, which callers treat as "nothing to restore".
+func (m *Manager) GetDNS() ([]string, error) {
+	output, err := os.ReadFile(m.resolvConf())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading %s: %w", m.resolvConf(), err)
+	}
+	var servers []string
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "nameserver "); ok {
+			if server := strings.TrimSpace(rest); server != "" {
+				servers = append(servers, server)
+			}
+		}
+	}
+	return servers, nil
+}
+
 // SetMAC sets the MAC address for an interface
 func (m *Manager) SetMAC(iface, mac string) error {
 	m.logger.Debug("SetMAC using interface", "interface", iface, "mac", mac)

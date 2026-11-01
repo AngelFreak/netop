@@ -275,8 +275,12 @@ func initializeManagers() {
 		wifiManager.SetAssociationTimeout(config.Common.Timeouts.GetAssociationTimeout())
 	}
 	wifiMgr = wifiManager
-	vpnMgr = vpn.NewManager(sysExecutor, logger, cfgManager)
 	netMgr = network.NewManager(sysExecutor, logger, dhcpClientMgr)
+	vpnManager := vpn.NewManager(sysExecutor, logger, cfgManager)
+	// A WireGuard config's `DNS =` key is applied through the network manager,
+	// and the pre-VPN nameservers are restored through it on disconnect.
+	vpnManager.SetNetworkManager(netMgr)
+	vpnMgr = vpnManager
 	hotspotMgr = hotspot.NewHotspotManager(sysExecutor, logger)
 	dhcpMgr = dhcp.NewDHCPManager(sysExecutor, logger)
 }

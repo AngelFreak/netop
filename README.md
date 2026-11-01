@@ -181,6 +181,8 @@ vpn:
     config: |
       [Interface]
       PrivateKey = YOUR_PRIVATE_KEY
+      MTU = 1380        # Optional: applied to the interface
+      DNS = 10.0.0.1    # Optional: written to resolv.conf, restored on disconnect
 
       [Peer]
       PublicKey = SERVER_PUBLIC_KEY
@@ -482,7 +484,25 @@ vpn:
     config: |              # WireGuard/OpenVPN config
       [Interface]
       PrivateKey = ...
+      MTU = 1380           # Optional: applied to the interface
+      DNS = 10.0.0.1       # Optional: written to resolv.conf
 ```
+
+**WireGuard `[Interface]` keys.** The config is applied directly through the
+kernel's WireGuard API, so only the keys below are honoured:
+
+| Key | Honoured | Notes |
+|-----|----------|-------|
+| `PrivateKey`, `ListenPort`, `FwMark` | yes | Passed to the kernel device |
+| `MTU` | yes | Applied to the interface (valid range 68–65535) |
+| `DNS` | yes | Written to `resolv.conf`; previous servers restored on disconnect. Non-address entries (search domains) are skipped |
+| `Address` | ignored | Use the `address:` key instead |
+| `Table`, `PreUp`, `PostUp`, `PreDown`, `PostDown`, `SaveConfig` | ignored | `wg-quick` script hooks; netop manages routing itself |
+
+> **Split tunnels:** `gateway: true` moves the default route onto the tunnel. Pair
+> it with `AllowedIPs = 0.0.0.0/0`. If `AllowedIPs` lists only specific subnets,
+> set `gateway: false` — otherwise all traffic is sent to a tunnel that has no
+> peer for it, which blackholes everything outside those subnets.
 
 **Tailscale:**
 ```yaml
