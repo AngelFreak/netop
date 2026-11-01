@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"os"
 	"testing"
 
 	"github.com/angelfreak/net/pkg/netlink/fake"
@@ -157,3 +158,168 @@ func (f *fakeNetworkManager) Disconnect(iface string) error { return nil }
 func (f *fakeNetworkManager) DisconnectAll() []string       { return nil }
 
 var _ types.NetworkManager = (*fakeNetworkManager)(nil)
+
+// --- VPN-provided DNS ---
+
+func TestConnectWireGuard_AppliesDNS(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"1.1.1.1"}}
+	m := newWGTestManager(t, newFakeLinks(), netMgr)
+
+	require.NoError(t, m.connectWireGuard(&types.VPNConfig{
+		Config: skovenConfig, Interface: "wg0",
+	}, "192.168.1.1", "eth0"))
+
+	require.Len(t, netMgr.SetCalls, 1, "DNS from the config block must reach resolv.conf")
+	assert.Equal(t, []string{"10.77.0.1", "orisonnet"}, netMgr.SetCalls[0])
+}
+
+// The pre-VPN resolver must be captured so disconnect can restore it.
+func TestConnectWireGuard_RecordsPriorDNS(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"1.1.1.1", "8.8.8.8"}}
+	m := newWGTestManager(t, newFakeLinks(), netMgr)
+
+	require.NoError(t, m.connectWireGuard(&types.VPNConfig{
+		Config: skovenConfig, Interface: "wg0",
+	}, "192.168.1.1", "eth0"))
+
+	assert.Equal(t, "1.1.1.1,8.8.8.8", m.originalDNS)
+}
+
+// A config without DNS must behave byte-identically to before: no SetDNS call.
+func TestConnectWireGuard_NoDNSKeyIsNoOp(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"1.1.1.1"}}
+	m := newWGTestManager(t, newFakeLinks(), netMgr)
+
+	require.NoError(t, m.connectWireGuard(&types.VPNConfig{
+		Config:    "[Interface]\nPrivateKey = " + wgKey + "\n\n[Peer]\nPublicKey = " + wgKey + "\nAllowedIPs = 0.0.0.0/0\n",
+		Interface: "wg0",
+	}, "192.168.1.1", "eth0"))
+
+	assert.Empty(t, netMgr.SetCalls, "no DNS key must mean no DNS call")
+	assert.Empty(t, m.originalDNS)
+}
+
+// DNS is a convenience, not the tunnel: a failure must not fail the connect.
+func TestConnectWireGuard_DNSFailureIsNonFatal(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"1.1.1.1"}, SetDNSErr: assert.AnError}
+	links := newFakeLinks()
+	m := newWGTestManager(t, links, netMgr)
+
+	err := m.connectWireGuard(&types.VPNConfig{
+		Config: skovenConfig, Interface: "wg0",
+	}, "192.168.1.1", "eth0")
+
+	require.NoError(t, err, "a DNS failure must leave the tunnel up")
+	assert.Empty(t, links.Deleted, "the interface must survive a DNS failure")
+	assert.Empty(t, m.originalDNS, "a failed apply must not claim DNS to restore")
+}
+
+// With no NetworkManager injected, DNS handling is skipped rather than panicking.
+func TestConnectWireGuard_NilNetworkManagerSkipsDNS(t *testing.T) {
+	m := newWGTestManager(t, newFakeLinks(), nil)
+	m.networkMgr = nil
+
+	require.NoError(t, m.connectWireGuard(&types.VPNConfig{
+		Config: skovenConfig, Interface: "wg0",
+	}, "192.168.1.1", "eth0"))
+}
+
+func TestRestoreDNS_PutsBackPriorServers(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"10.77.0.1"}}
+	m := newWGTestManager(t, newFakeLinks(), netMgr)
+
+	m.restoreDNS(&vpnState{OriginalDNS: "1.1.1.1,8.8.8.8"})
+
+	require.Len(t, netMgr.SetCalls, 1)
+	assert.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, netMgr.SetCalls[0])
+}
+
+// When the VPN never set DNS there is nothing to restore; resolv.conf must be
+// left strictly alone so `net stop` doesn't clobber the network's own DNS.
+func TestRestoreDNS_NoOpWhenVPNDidNotSetDNS(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"1.1.1.1"}}
+	m := newWGTestManager(t, newFakeLinks(), netMgr)
+
+	m.restoreDNS(&vpnState{OriginalDNS: ""})
+	m.restoreDNS(nil)
+
+	assert.Empty(t, netMgr.SetCalls)
+}
+
+// --- state file round-trip ---
+
+func TestVPNState_DNSRoundTrip(t *testing.T) {
+	m := newWGTestManager(t, newFakeLinks(), &fakeNetworkManager{})
+
+	require.NoError(t, m.setActiveVPNState(vpnState{
+		Name: "skoven", Interface: "wg0", Type: "wireguard",
+		OriginalGateway: "192.168.1.1", OriginalInterface: "eth0",
+		EndpointRoute: "192.0.2.1", OriginalDNS: "1.1.1.1,8.8.8.8",
+	}))
+
+	got := m.getActiveVPNState()
+	require.NotNil(t, got)
+	assert.Equal(t, "1.1.1.1,8.8.8.8", got.OriginalDNS)
+	assert.Equal(t, "192.0.2.1", got.EndpointRoute)
+}
+
+// A state file written before OriginalDNS existed (6 fields) must still load.
+func TestVPNState_BackwardCompatibleWithSixFields(t *testing.T) {
+	m := newWGTestManager(t, newFakeLinks(), &fakeNetworkManager{})
+	require.NoError(t, os.WriteFile(m.activeVPNFilePath(),
+		[]byte("skoven|wg0|wireguard|192.168.1.1|eth0|192.0.2.1"), 0600))
+
+	got := m.getActiveVPNState()
+	require.NotNil(t, got)
+	assert.Equal(t, "skoven", got.Name)
+	assert.Equal(t, "192.0.2.1", got.EndpointRoute)
+	assert.Empty(t, got.OriginalDNS, "absent field must read as empty, not garbage")
+}
+
+// Disconnect must restore DNS through the real Disconnect path, reading the
+// state file the way a separate process would. A direct restoreDNS test cannot
+// catch the helper being left unwired.
+func TestDisconnect_RestoresDNSFromStateFile(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"10.77.0.1"}}
+	m := NewManagerWithDir(&mockSystemExecutor{commands: map[string]string{}},
+		&mockLogger{}, &mockConfigManager{}, t.TempDir())
+	m.routeMgr = newFakeRoutes()
+	m.addrMgr = newFakeAddrs()
+	m.linkMgr = newFakeLinks()
+	m.networkMgr = netMgr
+
+	// State as written by a previous process's Connect.
+	require.NoError(t, m.setActiveVPNState(vpnState{
+		Name: "skoven", Interface: "wg0", Type: "wireguard",
+		OriginalGateway: "192.168.1.1", OriginalInterface: "eth0",
+		OriginalDNS: "1.1.1.1",
+	}))
+
+	require.NoError(t, m.Disconnect(""))
+
+	require.Len(t, netMgr.SetCalls, 1, "Disconnect must restore the pre-VPN DNS")
+	assert.Equal(t, []string{"1.1.1.1"}, netMgr.SetCalls[0])
+}
+
+// Switching VPNs must restore the old VPN's DNS before the new one applies its
+// own, so the pre-VPN resolver is never lost across a switch.
+func TestConnect_SwitchRestoresPreviousVPNDNS(t *testing.T) {
+	netMgr := &fakeNetworkManager{current: []string{"10.77.0.1"}}
+	m := NewManagerWithDir(&mockSystemExecutor{commands: map[string]string{}},
+		&mockLogger{}, &mockConfigManager{}, t.TempDir())
+	m.routeMgr = newFakeRoutes()
+	m.addrMgr = newFakeAddrs()
+	m.linkMgr = newFakeLinks()
+	m.networkMgr = netMgr
+
+	require.NoError(t, m.setActiveVPNState(vpnState{
+		Name: "skoven", Interface: "wg0", Type: "wireguard",
+		OriginalDNS: "1.1.1.1",
+	}))
+
+	// Connecting a different VPN tears down the old one first.
+	_ = m.Connect("other")
+
+	require.NotEmpty(t, netMgr.SetCalls, "a VPN switch must restore the prior DNS")
+	assert.Equal(t, []string{"1.1.1.1"}, netMgr.SetCalls[0])
+}

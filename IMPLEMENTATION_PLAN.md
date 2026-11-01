@@ -45,7 +45,7 @@ disconnect → the network's prior DNS is back.
 - prior DNS persisted in the state file and reapplied on disconnect
 - state file with 6 fields (pre-upgrade) still loads (backward compat)
 - DNS failure is non-fatal: tunnel stays up, warning logged
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 4: Wire through the real CLI path and document
 **Goal**: Prove it works on the production path, not just in unit tests.
