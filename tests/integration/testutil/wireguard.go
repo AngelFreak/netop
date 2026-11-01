@@ -78,15 +78,8 @@ func (wg *WireGuardInterface) create() error {
 		return fmt.Errorf("failed to create interface: %v", err)
 	}
 
-	// Write the private key to a temp file for `wg set private-key`.
-	//
-	// The file must live under /tmp, not the default temp dir: on CI runners
-	// TMPDIR points inside the workspace (e.g. /home/runner/work/_temp), and
-	// `ip netns exec` runs under an AppArmor profile that denies reading there,
-	// so wg fails with "fopen: Permission denied". /tmp is readable in that
-	// context. Passing the key on the command line is not an option — wg only
-	// accepts a file path, and argv would leak the key to other processes.
-	keyFile, err := os.CreateTemp("/tmp", "wg-key-*")
+	// Write private key to temp file
+	keyFile, err := os.CreateTemp("", "wg-key-*")
 	if err != nil {
 		return fmt.Errorf("failed to create key file: %v", err)
 	}
@@ -97,12 +90,6 @@ func (wg *WireGuardInterface) create() error {
 		return fmt.Errorf("failed to write private key: %v", err)
 	}
 	keyFile.Close()
-	// CreateTemp makes the file 0600 owned by the test user; the namespaced wg
-	// may run as a different uid, so widen it. This is an ephemeral key
-	// generated per test, immediately removed by the deferred cleanup above.
-	if err := os.Chmod(keyFile.Name(), 0644); err != nil {
-		return fmt.Errorf("failed to chmod private key file: %v", err)
-	}
 
 	// Set the private key
 	if wg.ns != nil {
