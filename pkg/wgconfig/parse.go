@@ -21,8 +21,7 @@ import (
 // — those are handled elsewhere by the caller (addr/route managers) — and only
 // consumes the keys the kernel device understands.
 func parseConfig(config string) (wgtypes.Config, error) {
-	cfg, _, err := parse(config)
-	return cfg, err
+	return parse(config)
 }
 
 // Settings holds the wg-quick [Interface] keys that the kernel device does not
@@ -74,11 +73,9 @@ func ParseSettings(config string) (Settings, error) {
 	return set, nil
 }
 
-// parse walks the INI config once, producing both the kernel device config and
-// the wg-quick settings netop applies itself.
-func parse(config string) (wgtypes.Config, Settings, error) {
+// parse walks the INI config, producing the kernel device config.
+func parse(config string) (wgtypes.Config, error) {
 	cfg := wgtypes.Config{ReplacePeers: true}
-	set := &Settings{}
 	var peers []wgtypes.PeerConfig
 
 	section := ""               // "interface", "peer", or ""
@@ -109,57 +106,57 @@ func parse(config string) (wgtypes.Config, Settings, error) {
 			switch name {
 			case "interface":
 				if err := flushPeer(); err != nil {
-					return wgtypes.Config{}, Settings{}, err
+					return wgtypes.Config{}, err
 				}
 				section = "interface"
 			case "peer":
 				if err := flushPeer(); err != nil {
-					return wgtypes.Config{}, Settings{}, err
+					return wgtypes.Config{}, err
 				}
 				section = "peer"
 				cur = &wgtypes.PeerConfig{ReplaceAllowedIPs: true}
 			default:
-				return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: unknown section %q", lineNo+1, line)
+				return wgtypes.Config{}, fmt.Errorf("line %d: unknown section %q", lineNo+1, line)
 			}
 			continue
 		}
 
 		key, value, found := strings.Cut(line, "=")
 		if !found {
-			return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: expected key = value, got %q", lineNo+1, line)
+			return wgtypes.Config{}, fmt.Errorf("line %d: expected key = value, got %q", lineNo+1, line)
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		value = strings.TrimSpace(value)
 
 		switch section {
 		case "interface":
-			if err := applyInterfaceKey(&cfg, set, key, value); err != nil {
-				return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: %w", lineNo+1, err)
+			if err := applyInterfaceKey(&cfg, key, value); err != nil {
+				return wgtypes.Config{}, fmt.Errorf("line %d: %w", lineNo+1, err)
 			}
 		case "peer":
 			if err := applyPeerKey(cur, key, value); err != nil {
-				return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: %w", lineNo+1, err)
+				return wgtypes.Config{}, fmt.Errorf("line %d: %w", lineNo+1, err)
 			}
 			if key == "publickey" {
 				curHasPublicKey = true
 			}
 		default:
-			return wgtypes.Config{}, Settings{}, fmt.Errorf("line %d: key %q outside any section", lineNo+1, key)
+			return wgtypes.Config{}, fmt.Errorf("line %d: key %q outside any section", lineNo+1, key)
 		}
 	}
 
 	if err := flushPeer(); err != nil {
-		return wgtypes.Config{}, Settings{}, err
+		return wgtypes.Config{}, err
 	}
 	cfg.Peers = peers
-	return cfg, *set, nil
+	return cfg, nil
 }
 
 // applyInterfaceKey handles keys under [Interface] that the kernel device
-// understands. wg-quick-only keys that netop applies itself (MTU, DNS) are
-// collected into set when non-nil; the rest (Address, Table, Pre/PostUp/Down,
-// SaveConfig) are ignored here because the caller applies them separately.
-func applyInterfaceKey(cfg *wgtypes.Config, set *Settings, key, value string) error {
+// understands. wg-quick keys are not device config: MTU and DNS are applied by
+// the caller from ParseSettings (MTU is still validated here so a bad value is
+// rejected on the strict path too), and the rest are ignored outright.
+func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
 	switch key {
 	case "privatekey":
 		k, err := wgtypes.ParseKey(value)
@@ -180,20 +177,11 @@ func applyInterfaceKey(cfg *wgtypes.Config, set *Settings, key, value string) er
 		}
 		cfg.FirewallMark = &mark
 	case "mtu":
-		// Not device config: netop applies this to the link itself.
-		mtu, err := parseMTU(value)
-		if err != nil {
+		// Applied to the link by the caller, not the device; validate only.
+		if _, err := parseMTU(value); err != nil {
 			return err
 		}
-		if set != nil {
-			set.MTU = mtu
-		}
-	case "dns":
-		// Not device config: netop writes these to resolv.conf.
-		if set != nil {
-			set.DNS = append(set.DNS, parseDNS(value)...)
-		}
-	case "address", "table", "preup", "postup", "predown", "postdown", "saveconfig":
+	case "dns", "address", "table", "preup", "postup", "predown", "postdown", "saveconfig":
 		// wg-quick / routing keys handled by the caller — not device config.
 	default:
 		return fmt.Errorf("unknown [Interface] key %q", key)
