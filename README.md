@@ -527,12 +527,13 @@ vpn:
     profile: work                          # Optional: NetBird profile (multi-account)
     setup_key: XXXXXXXX                    # Optional: omit if already logged in
     management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
+    accept_dns: true                       # Optional: resolve .netbird.cloud peer names
   home-netbird:
     type: netbird
     profile: home                          # Switch to home account
 ```
 
-> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. DNS is controlled by `net` and MagicDNS is disabled, unless a Tailscale VPN sets `accept_dns: true`: then `net` releases its lock on `/etc/resolv.conf` and lets Tailscale point it at `100.100.100.100` with your tailnet as the search domain. Your existing DNS servers stay in use for everything else, and Tailscale restores the file on disconnect. Multi-account support uses `tailscale switch` and `netbird profile select` under the hood. Profiles are per-OS-user and `net` runs as root, so create them for root (e.g. `sudo netbird profile add`) — a profile that can't be selected fails the connection rather than silently using the wrong account.
+> **Note:** Tailscale and NetBird require their daemon/service to be running (`tailscaled` / `netbird service`). `net` calls their CLI to connect/disconnect — it does not manage the daemon. By default DNS is controlled by `net` and the VPN's own resolver is disabled. Set `accept_dns: true` on a Tailscale or NetBird VPN to let it own DNS instead: `net` releases its lock on `/etc/resolv.conf` so the VPN can install its resolver, which is what makes internal names (`*.ts.net` via MagicDNS, `*.netbird.cloud` peer names) resolve. Your existing DNS servers stay in use for everything else, and the VPN restores the file on disconnect. Without `accept_dns`, a self-managing VPN cannot write `resolv.conf` and its internal names will not resolve. Multi-account support uses `tailscale switch` and `netbird profile select` under the hood. Profiles are per-OS-user and `net` runs as root, so create them for root (e.g. `sudo netbird profile add`) — a profile that can't be selected fails the connection rather than silently using the wrong account.
 
 </details>
 

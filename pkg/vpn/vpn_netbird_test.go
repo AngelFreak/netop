@@ -663,3 +663,91 @@ func TestNetBirdLoginCommand(t *testing.T) {
 	assert.Equal(t, loginCmd, netBirdLoginCommand("vesperx"))
 	assert.Equal(t, "sudo netbird up", netBirdLoginCommand(""))
 }
+
+// --- accept_dns: let NetBird own resolv.conf ---
+
+// netop passed --disable-dns unconditionally, so NetBird's resolver was never
+// installed and .netbird.cloud names never resolved. With accept_dns the flag
+// must be omitted so NetBird manages DNS itself.
+func TestConnectNetBird_AcceptDNSOmitsDisableDNS(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			"netbird up":            "",
+			"netbird status --json": `{"daemonStatus":"Connected"}`,
+		},
+	}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird", AcceptDNS: true},
+		},
+	}
+	manager := NewManagerWithDir(executor, &mockLogger{}, configMgr, t.TempDir())
+	manager.routeMgr = newFakeRoutes()
+	manager.linkMgr = newFakeLinks()
+
+	require.NoError(t, manager.Connect("nb"))
+
+	joined := strings.Join(executor.executedCommands, " | ")
+	assert.NotContains(t, joined, "--disable-dns",
+		"accept_dns must let NetBird manage DNS, so --disable-dns must not be passed")
+}
+
+// Without accept_dns the previous behaviour is unchanged: netop owns DNS.
+func TestConnectNetBird_WithoutAcceptDNSKeepsDisableDNS(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":    "default via 192.168.1.1 dev eth0",
+			"netbird up --disable-dns": "",
+			"netbird status --json":    `{"daemonStatus":"Connected"}`,
+		},
+	}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManagerWithDir(executor, &mockLogger{}, configMgr, t.TempDir())
+	manager.routeMgr = newFakeRoutes()
+	manager.linkMgr = newFakeLinks()
+
+	require.NoError(t, manager.Connect("nb"))
+
+	joined := strings.Join(executor.executedCommands, " | ")
+	assert.Contains(t, joined, "--disable-dns",
+		"without accept_dns netop keeps owning DNS (unchanged behaviour)")
+}
+
+// NetBird cannot write resolv.conf while netop's immutable flag is set, so the
+// lock must be released before `netbird up` — the same requirement Tailscale has.
+func TestConnectNetBird_AcceptDNSUnlocksResolvConf(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			"netbird up":            "",
+			"netbird status --json": `{"daemonStatus":"Connected"}`,
+		},
+	}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird", AcceptDNS: true},
+		},
+	}
+	manager := NewManagerWithDir(executor, &mockLogger{}, configMgr, t.TempDir())
+	manager.routeMgr = newFakeRoutes()
+	manager.linkMgr = newFakeLinks()
+
+	var unlocked []string
+	manager.resolvConfPath = "/tmp/test-resolv.conf"
+	manager.setImmutable = func(path string, on bool) error {
+		if !on {
+			unlocked = append(unlocked, path)
+		}
+		return nil
+	}
+
+	require.NoError(t, manager.Connect("nb"))
+
+	assert.Contains(t, unlocked, "/tmp/test-resolv.conf",
+		"accept_dns must clear the immutable flag so NetBird can write resolv.conf")
+}

@@ -819,7 +819,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	// it on "down". net's immutable lock would make that write fail, so it
 	// is released first — before a profile switch can trigger the write.
 	if config.AcceptDNS {
-		m.unlockResolvConfForTailscale()
+		m.unlockResolvConfForVPNDNS("Tailscale")
 	}
 
 	// Switch profile if specified (for multi-account support).
@@ -893,7 +893,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 // unlockResolvConfForTailscale clears the immutable flag net puts on
 // resolv.conf so tailscaled can write it. A failure is logged, not returned:
 // the tunnel works without it, only tailnet names won't resolve.
-func (m *Manager) unlockResolvConfForTailscale() {
+func (m *Manager) unlockResolvConfForVPNDNS(vpnName string) {
 	setImmutable, path := m.setImmutable, m.resolvConfPath
 	if setImmutable == nil { // zero-value Managers built in tests
 		setImmutable = system.SetImmutable
@@ -902,7 +902,7 @@ func (m *Manager) unlockResolvConfForTailscale() {
 		path = "/etc/resolv.conf"
 	}
 	if err := setImmutable(path, false); err != nil {
-		m.logger.Warn("Failed to unlock resolv.conf for Tailscale DNS; tailnet names may not resolve", "path", path, "error", err)
+		m.logger.Warn("Failed to unlock resolv.conf for VPN DNS; internal names may not resolve", "vpn", vpnName, "path", path, "error", err)
 	}
 }
 
@@ -958,8 +958,15 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 		args = append(args, "--management-url", config.ManagementURL)
 	}
 
-	// Always disable DNS (netop manages resolv.conf)
-	args = append(args, "--disable-dns")
+	// With accept_dns, NetBird runs its own resolver (for .netbird.cloud peer
+	// names) and writes resolv.conf itself, so --disable-dns must be omitted
+	// and net's immutable lock released first — otherwise NetBird's write
+	// fails and peer names never resolve. Without it, net owns DNS as before.
+	if config.AcceptDNS {
+		m.unlockResolvConfForVPNDNS("NetBird")
+	} else {
+		args = append(args, "--disable-dns")
+	}
 
 	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "netbird", args...)
 	if err != nil {
