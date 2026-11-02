@@ -54,6 +54,7 @@ var (
 		"auth_key":       true, // Tailscale pre-auth key
 		"exit_node":      true, // Tailscale exit node
 		"accept_routes":  true, // Tailscale accept routes
+		"accept_dns":     true, // Tailscale MagicDNS manages resolv.conf
 		"setup_key":      true, // NetBird setup key
 		"management_url": true, // NetBird management URL
 		"profile":        true, // Tailscale/NetBird profile for account switching

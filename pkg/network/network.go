@@ -46,7 +46,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		routeMgr:         netlink.NewRouteManager(),
 		addrMgr:          netlink.NewAddrManager(),
 		linkMgr:          netlink.NewLinkManager(),
-		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
+		dnsOwnershipPath: types.DNSOwnedPath,
 		resolvConfPath:   "/etc/resolv.conf",
 		setImmutable:     system.SetImmutable,
 	}
@@ -90,7 +90,7 @@ func (m *Manager) dnsOwnedPath() string {
 	if m.dnsOwnershipPath != "" {
 		return m.dnsOwnershipPath
 	}
-	return types.RuntimeDir + "/dns-owned"
+	return types.DNSOwnedPath
 }
 
 func (m *Manager) markDNSOwned() {
@@ -206,6 +206,13 @@ func (m *Manager) LockDNS() {
 		m.logger.Warn("Failed to lock resolv.conf", "error", err)
 	}
 	m.markDNSOwned()
+}
+
+// UnlockDNS undoes LockDNS: the immutable flag comes off and the ownership
+// marker is removed, so an aborted connect leaves no claim on resolv.conf.
+func (m *Manager) UnlockDNS() error {
+	m.clearDNSOwnership()
+	return m.unlockResolvConf()
 }
 
 // unlockResolvConf removes the immutable flag from /etc/resolv.conf natively
@@ -784,6 +791,10 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		if err := m.writeFileDirect(m.resolvConf(), "# Waiting for DHCP\n"); err != nil {
 			m.logger.Warn("Failed to clear resolv.conf", "error", err)
 		}
+		// Hand DNS to the DHCP client: while the previous connection's
+		// ownership marker exists, net's DHCP hooks skip the lease's servers.
+		// LockDNS below takes ownership again once they are written.
+		m.clearDNSOwnership()
 	}
 
 	// Connect to WiFi if SSID is specified

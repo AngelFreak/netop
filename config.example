@@ -107,6 +107,8 @@ vpn:
     type: netbird
     setup_key: XXXXXXXX            # Optional: omit if already logged in
     management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
+    accept_dns: true               # Optional: let NetBird own DNS so
+                                   # .netbird.cloud peer names resolve
 
 office:
   vpn: myvpn
