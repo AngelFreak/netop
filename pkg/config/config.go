@@ -257,6 +257,18 @@ func validateRawConfig(raw map[string]interface{}) ValidationErrors {
 					if vpnConfig, ok := vpnValue.(map[string]interface{}); ok {
 						errs := validateFields(fmt.Sprintf("vpn.%s", vpnName), vpnConfig, validVPNFields)
 						errors = append(errors, errs...)
+						continue
+					}
+					// A bare `name:` is a stub (defaults apply), but a scalar
+					// or list is almost always a VPN field indented one level
+					// out, which YAML reads as an entry name. Claim it here:
+					// viper's decoder would otherwise report it as
+					// "'vpn[accept_dns]' expected a map, got 'bool'".
+					if vpnValue != nil {
+						errors = append(errors, ValidationError{
+							Section: fmt.Sprintf("vpn.%s", vpnName), Field: vpnName,
+							Message: fmt.Sprintf("vpn entry '%s' must be a mapping - check indentation: a VPN's fields are indented under its name", vpnName),
+						})
 					}
 				}
 				errors = append(errors, validateDaemonVPNProfiles(vpnMap)...)
