@@ -27,7 +27,6 @@ jobs:
             hostapd \
             dnsmasq \
             iw \
-            wireless-tools \
             wireguard-tools \
             iproute2
 

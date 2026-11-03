@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -58,6 +59,23 @@ func (ns *TestNamespace) cleanup() {
 func (ns *TestNamespace) Exec(name string, args ...string) error {
 	cmdArgs := append([]string{"netns", "exec", ns.Name, name}, args...)
 	cmd := exec.Command("ip", cmdArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("command %q in namespace %s failed: %v\noutput: %s",
+			name, ns.Name, err, string(output))
+	}
+	return nil
+}
+
+// ExecStdin runs a command inside the network namespace, feeding stdin to it.
+//
+// This exists for `wg set ... private-key /dev/stdin`: passing the key through
+// stdin avoids a temp file that the command would have to open itself, which
+// is a permission failure waiting to happen across the sudo/netns boundary.
+func (ns *TestNamespace) ExecStdin(stdin string, name string, args ...string) error {
+	cmdArgs := append([]string{"netns", "exec", ns.Name, name}, args...)
+	cmd := exec.Command("ip", cmdArgs...)
+	cmd.Stdin = strings.NewReader(stdin)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("command %q in namespace %s failed: %v\noutput: %s",
