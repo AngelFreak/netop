@@ -265,8 +265,9 @@ func validateRawConfig(raw map[string]interface{}) ValidationErrors {
 					// viper's decoder would otherwise report it as
 					// "'vpn[accept_dns]' expected a map, got 'bool'".
 					if vpnValue != nil {
+						// Message is used verbatim by Error(), so Section
+						// and Field would never be rendered here.
 						errors = append(errors, ValidationError{
-							Section: fmt.Sprintf("vpn.%s", vpnName), Field: vpnName,
 							Message: fmt.Sprintf("vpn entry '%s' must be a mapping - check indentation: a VPN's fields are indented under its name", vpnName),
 						})
 					}
