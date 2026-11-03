@@ -27,7 +27,12 @@ import (
 func runRealDhclient(t *testing.T, owned bool) (resolv, addr string) {
 	t.Helper()
 	testutil.SkipIfNotRoot(t)
-	testutil.RequireCommands(t, "dhclient", "dnsmasq", "ip")
+	// Skip, not fail: dhclient is one of two supported clients (udhcpc is the
+	// other) and is absent from some runner images, which is a missing
+	// capability rather than a defect in the code under test.
+	for _, cmd := range []string{"dhclient", "dnsmasq", "ip"} {
+		testutil.SkipIfMissingCmd(t, cmd)
+	}
 
 	ns := testutil.NewTestNamespace(t)
 	require.NoError(t, ns.AddVethPair("ntdh0", "ntdc0"))
