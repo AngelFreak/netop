@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -144,6 +145,13 @@ func (m *Manager) Connect(name string) error {
 		m.clearActiveVPN()
 	}
 
+	// Also stop VPNs net has no record of (e.g. daemons that reconnected at
+	// boot). Bringing a second overlay up beside them leaves two tunnels
+	// fighting over routes and DNS.
+	if _, err := m.stopUntrackedVPNs(); err != nil {
+		return fmt.Errorf("cannot stop running VPNs before connecting '%s': %w", name, err)
+	}
+
 	// Load VPN config from ConfigManager
 	config, err := m.configMgr.GetVPNConfig(name)
 	if err != nil {
@@ -239,8 +247,8 @@ func (m *Manager) Disconnect(name string) error {
 		// State file exists but no type — legacy format
 		m.logger.Debug("Legacy VPN state, using legacy disconnect")
 		m.disconnectLegacy()
-	} else {
-		// No state file at all — no VPN was connected via net
+	} else if name != "" {
+		// No state file at all — the named VPN was not connected via net
 		m.logger.Debug("No active VPN to disconnect")
 		return fmt.Errorf("no active VPN connection")
 	}
@@ -252,20 +260,91 @@ func (m *Manager) Disconnect(name string) error {
 		return disconnectErr
 	}
 
-	// Remove the VPN endpoint route if we added one.
-	m.removeEndpointRoute(state)
+	if state != nil {
+		// Remove the VPN endpoint route if we added one.
+		m.removeEndpointRoute(state)
 
-	// Put back the nameservers the VPN replaced, so disconnecting does not
-	// leave the system pointing at a resolver inside the dead tunnel.
-	m.restoreDNS(state)
+		// Put back the nameservers the VPN replaced, so disconnecting does not
+		// leave the system pointing at a resolver inside the dead tunnel.
+		m.restoreDNS(state)
 
-	// Restore default route via the physical interface using saved original route
-	m.restoreDefaultRouteFromState(state)
+		// Restore default route via the physical interface using saved original route
+		m.restoreDefaultRouteFromState(state)
 
-	// Clear the active VPN state file
-	m.clearActiveVPN()
+		// Clear the active VPN state file
+		m.clearActiveVPN()
+	}
 
+	// A named disconnect targets that one VPN; only "stop all" sweeps.
+	if name != "" {
+		return nil
+	}
+	stopped, err := m.stopUntrackedVPNs()
+	if err != nil {
+		return err
+	}
+	if state == nil && len(stopped) == 0 {
+		m.logger.Debug("No active VPN to disconnect")
+		return fmt.Errorf("no active VPN connection")
+	}
 	return nil
+}
+
+// stopUntrackedVPNs brings down every VPN still running that net has no
+// record of. The state file lives in /run, which is wiped at boot, while the
+// Tailscale and NetBird daemons reconnect on their own — so after a reboot
+// "stop all" cannot rely on the state file. It returns what it stopped; a
+// VPN that fails to stop is an error, since leaving it up beside a new one
+// is exactly what this guards against.
+func (m *Manager) stopUntrackedVPNs() ([]string, error) {
+	var stopped []string
+	var errs []error
+	record := func(what string, err error) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop %s: %w", what, err))
+			return
+		}
+		m.logger.Info("Stopped VPN not tracked by net", "vpn", what)
+		stopped = append(stopped, what)
+	}
+
+	if m.executor.HasCommand("tailscale") {
+		// Starting counts: the daemon is already installing routes.
+		if st, err := m.tailscaleBackendState(); err == nil && (st == "Running" || st == "Starting") {
+			_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down")
+			record("Tailscale", err)
+		}
+	}
+
+	if m.executor.HasCommand("netbird") {
+		// Connecting counts: with Management unreachable the daemon stays
+		// there, but its interface and routes are already up.
+		if st := m.netBirdDaemonStatus(); st == "Connected" || st == "Connecting" {
+			_, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down")
+			record("NetBird", err)
+		}
+	}
+
+	if out, err := m.executor.ExecuteWithTimeout(2*time.Second, "pgrep", "-f", openVPNProcessPattern); err == nil && strings.TrimSpace(out) != "" {
+		m.killProcess(openVPNProcessPattern)
+		record("OpenVPN", nil)
+	}
+
+	// Listed after NetBird is down. Its kernel interface (wt*) is
+	// WireGuard-typed but owned by the NetBird daemon, so it is never deleted
+	// here — that would wedge the daemon.
+	wgIfaces, err := m.linkMgr.ListByType("wireguard")
+	if err != nil {
+		m.logger.Debug("Failed to list WireGuard interfaces", "error", err)
+	}
+	for _, iface := range wgIfaces {
+		if strings.HasPrefix(iface, "wt") {
+			continue
+		}
+		record("WireGuard "+iface, m.linkMgr.Delete(iface))
+	}
+
+	return stopped, errors.Join(errs...)
 }
 
 // disconnectTracked disconnects using tracked state (process isolation)
@@ -461,6 +540,12 @@ func isVPNInterface(iface string) bool {
 		strings.HasPrefix(iface, "tailscale") || strings.HasPrefix(iface, "wt") ||
 		strings.HasPrefix(iface, "utun")
 }
+
+// openVPNProcessPattern matches an openvpn daemon by the command it runs, not
+// any command line that merely mentions "openvpn" (an editor on a .conf file,
+// or the shell that invoked net). [^ ]* rather than \S keeps it POSIX ERE, as
+// BusyBox pgrep uses musl's regex.
+const openVPNProcessPattern = `^([^ ]*/)?openvpn( |$)`
 
 // killProcess kills processes matching a pattern, with SIGKILL fallback if graceful shutdown fails
 func (m *Manager) killProcess(pattern string) {
