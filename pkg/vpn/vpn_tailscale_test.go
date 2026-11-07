@@ -55,6 +55,7 @@ func TestConnectTailscale_Success(t *testing.T) {
 			err    error
 		}{
 			"tailscale status --json": {
+				{output: `{"BackendState":"NeedsLogin"}`}, // stop-all sweep: not running
 				{output: `{"BackendState":"NeedsLogin"}`},
 				{output: `{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.1"]}}`},
 			},
@@ -106,6 +107,7 @@ func TestConnectTailscale_LoggedInIgnoresAuthKey(t *testing.T) {
 			err    error
 		}{
 			"tailscale status --json": {
+				{output: `{"BackendState":"Stopped"}`}, // stop-all sweep: not running
 				{output: `{"BackendState":"Stopped"}`},
 				{output: `{"BackendState":"Running"}`},
 			},

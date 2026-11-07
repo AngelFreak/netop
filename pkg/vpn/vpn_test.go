@@ -78,6 +78,11 @@ func (m *mockSystemExecutor) Execute(cmd string, args ...string) (string, error)
 		return output, nil
 	}
 	m.mu.Unlock()
+	// Unscripted process probes find nothing, as on a host with no VPN
+	// running; "mock output" would read as a live process.
+	if cmd == "pgrep" {
+		return "", fmt.Errorf("exit status 1")
+	}
 	return "mock output", nil
 }
 
