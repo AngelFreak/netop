@@ -21,7 +21,7 @@ const (
 	nbIdle    = `{"daemonStatus":"Idle"}`
 )
 
-var openVPNProbe = "pgrep -f " + openVPNProcessPattern
+const openVPNProbe = "pgrep -f " + openVPNProcessPattern
 
 // idleExecutor reports every VPN type as down; tests override the one that is
 // live. Unscripted commands in mockSystemExecutor return "mock output", which
