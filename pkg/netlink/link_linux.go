@@ -122,6 +122,18 @@ func (m *LinkManager) SetMAC(iface, mac string) error {
 	return nil
 }
 
+// SetMTU sets the MTU of iface.
+func (m *LinkManager) SetMTU(iface string, mtu int) error {
+	link, err := vnl.LinkByName(iface)
+	if err != nil {
+		return fmt.Errorf("resolving interface %q: %w", iface, err)
+	}
+	if err := vnl.LinkSetMTU(link, mtu); err != nil {
+		return fmt.Errorf("setting MTU %d on %q: %w", mtu, iface, err)
+	}
+	return nil
+}
+
 // parseMAC parses and validates a MAC address string.
 func parseMAC(mac string) (net.HardwareAddr, error) {
 	hwAddr, err := net.ParseMAC(mac)

@@ -21,6 +21,60 @@ import (
 // — those are handled elsewhere by the caller (addr/route managers) — and only
 // consumes the keys the kernel device understands.
 func parseConfig(config string) (wgtypes.Config, error) {
+	return parse(config)
+}
+
+// Settings holds the wg-quick [Interface] keys that the kernel device does not
+// understand but netop applies itself: MTU goes on the link, DNS goes to
+// resolv.conf. Zero values mean "not specified" — callers must skip applying
+// them so a config without these keys behaves exactly as before.
+type Settings struct {
+	MTU int      // link MTU; 0 when unspecified
+	DNS []string // resolv.conf nameservers, in config order; nil when unspecified
+}
+
+// ParseSettings extracts the wg-quick [Interface] settings netop applies
+// outside the kernel device (MTU, DNS). It deliberately does NOT validate the
+// rest of the config: wg.Configure already rejects a bad device config, and
+// duplicating that here would reject the same config twice with different
+// wording. Only the keys it consumes are validated, so an invalid MTU is still
+// a hard error.
+func ParseSettings(config string) (Settings, error) {
+	var set Settings
+	inInterface := false
+	for _, raw := range strings.Split(config, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			name := strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			inInterface = name == "interface"
+			continue
+		}
+		if !inInterface {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "mtu":
+			mtu, err := parseMTU(strings.TrimSpace(value))
+			if err != nil {
+				return Settings{}, err
+			}
+			set.MTU = mtu
+		case "dns":
+			set.DNS = append(set.DNS, parseDNS(strings.TrimSpace(value))...)
+		}
+	}
+	return set, nil
+}
+
+// parse walks the INI config, producing the kernel device config.
+func parse(config string) (wgtypes.Config, error) {
 	cfg := wgtypes.Config{ReplacePeers: true}
 	var peers []wgtypes.PeerConfig
 
@@ -99,8 +153,9 @@ func parseConfig(config string) (wgtypes.Config, error) {
 }
 
 // applyInterfaceKey handles keys under [Interface] that the kernel device
-// understands. wg-quick-only keys (Address, DNS, MTU, Table, Pre/PostUp/Down,
-// SaveConfig) are silently ignored — the caller applies those separately.
+// understands. wg-quick keys are not device config: MTU and DNS are applied by
+// the caller from ParseSettings (MTU is still validated here so a bad value is
+// rejected on the strict path too), and the rest are ignored outright.
 func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
 	switch key {
 	case "privatekey":
@@ -121,7 +176,12 @@ func applyInterfaceKey(cfg *wgtypes.Config, key, value string) error {
 			return err
 		}
 		cfg.FirewallMark = &mark
-	case "address", "dns", "mtu", "table", "preup", "postup", "predown", "postdown", "saveconfig":
+	case "mtu":
+		// Applied to the link by the caller, not the device; validate only.
+		if _, err := parseMTU(value); err != nil {
+			return err
+		}
+	case "dns", "address", "table", "preup", "postup", "predown", "postdown", "saveconfig":
 		// wg-quick / routing keys handled by the caller — not device config.
 	default:
 		return fmt.Errorf("unknown [Interface] key %q", key)
@@ -143,6 +203,33 @@ func parseFwMark(value string) (int, error) {
 		return 0, fmt.Errorf("invalid FwMark %q", value)
 	}
 	return int(mark), nil
+}
+
+// parseMTU parses a wg-quick MTU value. The bounds are the IPv4 minimum link
+// MTU (68) and the 16-bit maximum; anything outside that is a config error
+// rather than something to silently clamp.
+func parseMTU(value string) (int, error) {
+	mtu, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid MTU %q", value)
+	}
+	if mtu < 68 || mtu > 65535 {
+		return 0, fmt.Errorf("invalid MTU %d: must be between 68 and 65535", mtu)
+	}
+	return mtu, nil
+}
+
+// parseDNS splits a comma-separated wg-quick DNS list. Entries are kept as
+// written (including search domains, which are not IPs) — the network manager
+// validates and skips non-address entries when writing resolv.conf.
+func parseDNS(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // applyPeerKey handles keys under [Peer].

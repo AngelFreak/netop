@@ -122,7 +122,7 @@ type VPNConfig struct {
 	AuthKey       string `yaml:"auth_key" mapstructure:"auth_key"`             // Tailscale auth key
 	ExitNode      string `yaml:"exit_node" mapstructure:"exit_node"`           // Tailscale exit node
 	AcceptRoutes  bool   `yaml:"accept_routes" mapstructure:"accept_routes"`   // Tailscale accept routes
-	AcceptDNS     bool   `yaml:"accept_dns" mapstructure:"accept_dns"`         // Tailscale: let MagicDNS manage resolv.conf
+	AcceptDNS     bool   `yaml:"accept_dns" mapstructure:"accept_dns"`         // Tailscale/NetBird: let the VPN manage resolv.conf
 	SetupKey      string `yaml:"setup_key" mapstructure:"setup_key"`           // NetBird setup key
 	ManagementURL string `yaml:"management_url" mapstructure:"management_url"` // NetBird management URL
 	Profile       string `yaml:"profile" mapstructure:"profile"`               // Tailscale/NetBird profile for account switching
@@ -328,10 +328,16 @@ type VPNManager interface {
 // NetworkManager handles network configuration
 type NetworkManager interface {
 	SetDNS(servers []string) error
+	// GetDNS returns the nameservers currently in resolv.conf, in file order.
+	GetDNS() ([]string, error)
 	ClearDNS() error
 	// ClearDNSIfOwned clears DNS only if netop set it. Returns (cleared, err).
 	ClearDNSIfOwned() (bool, error)
 	LockDNS()
+	// UnlockDNS is the inverse of LockDNS: it clears the immutable flag on
+	// /etc/resolv.conf and drops netop's ownership marker. Used when a connect
+	// is aborted so a later `net stop` does not believe netop still owns DNS.
+	UnlockDNS() error
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
 	SetIP(iface, addr, gateway string, metric int) error
@@ -504,6 +510,19 @@ type LinkManager interface {
 	// SetMAC sets the hardware (MAC) address of iface. The interface must be
 	// down; callers are responsible for down/up sequencing.
 	SetMAC(iface, mac string) error
+	// SetMTU sets the MTU of iface.
+	SetMTU(iface string, mtu int) error
+}
+
+// RuleManager manages IPv4 policy-routing rules (`ip rule`) via netlink. Write
+// operations require CAP_NET_ADMIN. Implementations must return a clear error
+// (never panic) when netlink is restricted.
+type RuleManager interface {
+	// AddLookupMain adds the rule `to <dst> lookup main priority <priority>`,
+	// where dst is an IPv4 CIDR. An identical existing rule is not an error.
+	AddLookupMain(dst string, priority int) error
+	// DelRules removes every IPv4 rule at priority. Having none is not an error.
+	DelRules(priority int) error
 }
 
 // FirewallManager configures the IPv4 NAT/forwarding rules that let clients on

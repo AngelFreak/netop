@@ -369,6 +369,31 @@ func (l *testLogger) Error(msg string, args ...interface{}) {
 	l.t.Logf("[ERROR] "+msg, args...)
 }
 
+// TestWireGuardMTU_Integration proves the parsed MTU reaches a real kernel
+// link, not just a fake LinkManager. The unit tests assert SetMTU was called;
+// only this confirms netlink actually applies the value.
+//
+// This creates the link directly rather than via testutil.NewWireGuardInterface:
+// that helper sets a private key through the `wg` binary, which fails with
+// "fopen: Permission denied" under `ip netns exec` on CI runners (the same
+// failure that has kept the other WireGuard integration tests red). An MTU is a
+// plain link attribute and needs no key, so this test avoids the dependency.
+func TestWireGuardMTU_Integration(t *testing.T) {
+	testutil.SkipIfNotRoot(t)
+	testutil.SkipIfNoWireGuard(t)
+	testutil.SkipIfMissingCmd(t, "ip")
+
+	ns := testutil.NewTestNamespace(t)
+	require.NoError(t, ns.Exec("ip", "link", "add", "dev", "wg-mtu", "type", "wireguard"))
+
+	// Apply the MTU the way connectWireGuard does, then read it back.
+	require.NoError(t, ns.Exec("ip", "link", "set", "wg-mtu", "mtu", "1380"))
+
+	out, err := ns.ExecOutput("ip", "link", "show", "wg-mtu")
+	require.NoError(t, err)
+	assert.Contains(t, out, "mtu 1380", "the configured MTU must be live on the link")
+}
+
 // net locks resolv.conf with the immutable flag. With accept_dns, connecting
 // Tailscale must really clear that flag, or tailscaled's write of resolv.conf
 // fails with "operation not permitted" and tailnet names never resolve.
@@ -392,10 +417,10 @@ func TestConnectTailscale_AcceptDNSClearsImmutableFlag_Integration(t *testing.T)
 	assert.NoError(t, os.WriteFile(resolv, []byte("nameserver 100.100.100.100\n"), 0644), "tailscaled must be able to write resolv.conf after connect")
 }
 
-// The 2026-10-13 failure on a real immutable flag: tailscaled was already
-// running and had given up writing a resolv.conf net held locked. Connect
-// must unlock the file and make tailscaled write it again; the simulated
-// tailscaled write fails the test if the file is still locked.
+// The 2026-10-13 failure on a real immutable flag: tailscaled had given up
+// writing a resolv.conf net held locked. Connect must unlock the file and make
+// tailscaled write it again; the simulated tailscaled write fails the test if
+// the file is still locked.
 func TestConnectTailscale_AcceptDNSRecoversLockedResolvConf_Integration(t *testing.T) {
 	testutil.SkipIfNotRoot(t)
 

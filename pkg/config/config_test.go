@@ -1247,3 +1247,47 @@ func TestValidate_BlankProfileTreatedAsMissing(t *testing.T) {
 	}
 	assert.True(t, found, "blank profile must count as missing")
 }
+
+// TestVPNEntryMustBeMapping covers the indentation slip that writes a VPN
+// field one level out, e.g. `accept_dns: true` at the same indent as the VPN
+// names rather than inside one. YAML then reads it as a VPN entry whose value
+// is a bool. Validation only inspected field names of entries that were
+// already maps, so this slipped through to viper and surfaced as
+// "'vpn[accept_dns]' expected a map, got 'bool'" — a decoder message that
+// names no file, no line and no remedy. The config layer must own it.
+// loadConfigFromYAML is loadPortalConfig under a name that describes what it
+// does, for tests outside the portal group. Same helper, no behaviour of its
+// own; the original name is kept for its existing callers.
+func loadConfigFromYAML(t *testing.T, content string) (*types.Config, error) {
+	t.Helper()
+	return loadPortalConfig(t, content)
+}
+
+func TestVPNEntryMustBeMapping(t *testing.T) {
+	for _, tc := range []struct{ name, entry string }{
+		{"bool from a misindented field", "  accept_dns: true"},
+		{"string", "  broken: wireguard"},
+		{"int", "  broken: 1"},
+		{"list", "  broken: [a, b]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadConfigFromYAML(t, "\nvpn:\n  work:\n    type: netbird\n"+tc.entry+"\n")
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "must be a mapping",
+				"a non-mapping VPN entry needs the config layer's message")
+			assert.Contains(t, err.Error(), "indentation",
+				"the message must point at the actual cause")
+		})
+	}
+}
+
+// A null VPN entry is a stub, not a mistake — `work:` with nothing under it
+// yields exists=true, value=nil. Guards against a naive type check that
+// rejects nil alongside scalars, the same trap common.portal already has a
+// test for.
+func TestVPNEntryNullAllowed(t *testing.T) {
+	errs := validateRawConfig(map[string]interface{}{
+		"vpn": map[string]interface{}{"work": nil},
+	})
+	assert.Empty(t, errs, "a null VPN entry is a stub, not a mapping violation")
+}

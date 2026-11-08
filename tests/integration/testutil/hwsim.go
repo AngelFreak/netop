@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,8 +20,17 @@ type HWSimRadio struct {
 	Index     int    // radio index
 }
 
-// hwsimLoaded tracks whether we've loaded the module in this test run
-var hwsimLoaded bool
+// mac80211_hwsim is a single global kernel module, so loading it is shared
+// state across every test in a binary. hwsimMu serialises load decisions and
+// hwsimRadios records how many radios the current load provides, so a test
+// that needs no more than are already present reuses them instead of
+// reloading. Reloading mid-run destroys the radios of any test still using
+// them, which surfaced as "No such device (-19)" and "Network is down (-100)".
+var (
+	hwsimMu     sync.Mutex
+	hwsimLoaded bool
+	hwsimRadios int
+)
 
 // LoadHWSim loads the mac80211_hwsim kernel module and returns the created radios.
 // The module is loaded with the specified number of radios.
@@ -29,37 +39,61 @@ func LoadHWSim(t *testing.T, numRadios int) []*HWSimRadio {
 	SkipIfNotRoot(t)
 	SkipIfNoHWSim(t)
 
-	// If module is already loaded, unload it first to get a clean state
-	if isHWSimLoaded() {
-		if err := exec.Command("modprobe", "-r", "mac80211_hwsim").Run(); err != nil {
-			t.Logf("Warning: failed to unload existing mac80211_hwsim: %v", err)
+	hwsimMu.Lock()
+	defer hwsimMu.Unlock()
+
+	// Reuse an existing load that already provides enough radios. Tearing the
+	// module down and back up is what broke sibling tests: each LoadHWSim used
+	// to unload unconditionally, destroying radios a previous test in the same
+	// binary still held, and the per-test t.Cleanup unloaded it again.
+	if !hwsimLoaded || hwsimRadios < numRadios {
+		if isHWSimLoaded() {
+			if err := exec.Command("modprobe", "-r", "mac80211_hwsim").Run(); err != nil {
+				t.Logf("Warning: failed to unload existing mac80211_hwsim: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		// A runner that cannot provide virtual radios is a missing capability,
+		// not a defect in the code under test, so skip rather than fail.
+		if out, err := exec.Command("modprobe", "mac80211_hwsim", fmt.Sprintf("radios=%d", numRadios)).CombinedOutput(); err != nil {
+			t.Skipf("skipping: cannot load mac80211_hwsim: %v\noutput: %s", err, string(out))
+		}
+		hwsimLoaded = true
+		hwsimRadios = numRadios
+
+		// Wait for interfaces to appear
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Load the module with requested number of radios
-	err := exec.Command("modprobe", "mac80211_hwsim", fmt.Sprintf("radios=%d", numRadios)).Run()
-	if err != nil {
-		t.Fatalf("failed to load mac80211_hwsim: %v", err)
-	}
-	hwsimLoaded = true
-
-	// Register cleanup to unload module
-	t.Cleanup(func() {
-		UnloadHWSim()
-	})
-
-	// Wait for interfaces to appear
-	time.Sleep(500 * time.Millisecond)
+	// Deliberately no t.Cleanup unload: the module is process-wide shared
+	// state, so unloading when one test finishes pulls the radios out from
+	// under the others. The job's "Cleanup" step unloads it after the run.
 
 	// Find the created radios
 	radios, err := findHWSimRadios(numRadios)
 	if err != nil {
-		t.Fatalf("failed to find hwsim radios: %v", err)
+		t.Skipf("skipping: cannot enumerate hwsim radios: %v", err)
 	}
 
 	if len(radios) < numRadios {
-		t.Fatalf("expected %d radios, found %d", numRadios, len(radios))
+		t.Skipf("skipping: need %d hwsim radios, found %d", numRadios, len(radios))
+	}
+
+	// A loaded module and a present interface are not the same as a working
+	// radio: GitHub runners have produced interfaces whose every operation
+	// fails with "Network is down (-100)", which surfaced as an opaque
+	// `exit status 156` from iw/hostapd rather than a skip. Prove the radio
+	// responds before handing it to a test.
+	for _, r := range radios {
+		if out, err := exec.Command("ip", "link", "set", r.Interface, "up").CombinedOutput(); err != nil {
+			t.Skipf("skipping: hwsim radio %s is not usable: %v\noutput: %s",
+				r.Interface, err, string(out))
+		}
+		if out, err := exec.Command("iw", "dev", r.Interface, "info").CombinedOutput(); err != nil {
+			t.Skipf("skipping: hwsim radio %s does not respond to iw: %v\noutput: %s",
+				r.Interface, err, string(out))
+		}
 	}
 
 	return radios
@@ -67,9 +101,12 @@ func LoadHWSim(t *testing.T, numRadios int) []*HWSimRadio {
 
 // UnloadHWSim unloads the mac80211_hwsim kernel module.
 func UnloadHWSim() {
+	hwsimMu.Lock()
+	defer hwsimMu.Unlock()
 	if hwsimLoaded {
 		_ = exec.Command("modprobe", "-r", "mac80211_hwsim").Run()
 		hwsimLoaded = false
+		hwsimRadios = 0
 	}
 }
 

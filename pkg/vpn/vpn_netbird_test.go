@@ -1,11 +1,14 @@
 package vpn
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConnectNetBird_MissingBinary(t *testing.T) {
@@ -550,4 +553,203 @@ func TestListVPNs_MultiNetBirdUnreadableProfileStillReportsDaemon(t *testing.T) 
 		assert.True(t, v.Ambiguous,
 			"%q must be flagged ambiguous so the caller can surface the live daemon", v.Name)
 	}
+}
+
+type statusStep = struct {
+	output string
+	err    error
+}
+
+// newNetBirdLoginFixture scripts "netbird status --json" as the given
+// daemon states, in call order, and lets "netbird up" fail with upErr. The
+// first state is also what Connect's stop-all sweep sees beforehand, so it
+// must not be a running state.
+func newNetBirdLoginFixture(t *testing.T, cfg *types.VPNConfig, upCmd string, upErr error, states ...string) (*Manager, *sequencingExecutor) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	steps := make([]statusStep, 0, len(states)+1)
+	for _, st := range append(states[:1:1], states...) {
+		steps = append(steps, statusStep{output: `{"daemonStatus":"` + st + `"}`})
+	}
+	seq := &sequencingExecutor{
+		mockSystemExecutor: mockSystemExecutor{
+			commands: map[string]string{
+				"ip route show default":          "default via 192.168.1.1 dev eth0",
+				"netbird profile select vesperx": "Profile switched successfully to: vesperx",
+				upCmd:                            "",
+			},
+			errors: map[string]error{},
+		},
+		callSequence: map[string][]struct {
+			output string
+			err    error
+		}{"netbird status --json": steps},
+	}
+	if upErr != nil {
+		seq.errors[upCmd] = upErr
+	}
+	configMgr := &mockConfigManager{vpnConfigs: map[string]*types.VPNConfig{"nb": cfg}}
+	manager := NewManagerWithDir(seq, &mockLogger{}, configMgr, tmpDir)
+	manager.verifyAttempts = 2
+	manager.verifyDelay = 0
+	return manager, seq
+}
+
+const loginCmd = "sudo netbird profile select vesperx && sudo netbird up"
+
+// An SSO profile whose session lapsed makes "netbird up" wait for a browser
+// login whose URL net cannot show; it looked hung, and a Ctrl-C then took
+// WiFi down. When Management has refused the peer, fail fast instead, with
+// the command that logs in.
+func TestConnectNetBird_NeedsLoginFailsFast(t *testing.T) {
+	for _, state := range []string{"NeedsLogin", "SessionExpired"} {
+		t.Run(state, func(t *testing.T) {
+			manager, seq := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", nil, state)
+
+			err := manager.Connect("nb")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), loginCmd)
+			seq.assertCommandNotExecuted(t, "netbird up --disable-dns")
+		})
+	}
+}
+
+// LoginFailed is left behind by an interrupted browser login, but equally by
+// an unreachable Management, so it must not block a connect that may work.
+func TestConnectNetBird_StaleLoginFailedStillTriesUp(t *testing.T) {
+	manager, seq := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", nil, "LoginFailed", "Connected")
+
+	require.NoError(t, manager.Connect("nb"))
+	seq.assertCommandExecuted(t, "netbird up --disable-dns")
+}
+
+// When "up" does fail and the daemon is waiting on a login, the error names
+// the command that logs in rather than only the timeout.
+func TestConnectNetBird_UpFailureNamesLoginCommand(t *testing.T) {
+	upErr := errors.New("command timed out after 30s")
+	manager, _ := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", upErr, "Idle", "LoginFailed")
+
+	err := manager.Connect("nb")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command timed out after 30s")
+	assert.Contains(t, err.Error(), loginCmd)
+}
+
+func TestConnectNetBird_UpFailureWithoutLoginStateKeepsError(t *testing.T) {
+	upErr := errors.New("daemon unreachable")
+	manager, _ := newNetBirdLoginFixture(t, &types.VPNConfig{Type: "netbird", Profile: "vesperx"}, "netbird up --disable-dns", upErr, "Idle", "Idle")
+
+	err := manager.Connect("nb")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to connect NetBird: daemon unreachable")
+	assert.NotContains(t, err.Error(), "netbird profile select")
+}
+
+// A setup key logs in without a browser, so a login-required daemon is
+// exactly what "up --setup-key-file" is for: no fail-fast.
+func TestConnectNetBird_SetupKeySkipsLoginCheck(t *testing.T) {
+	cfg := &types.VPNConfig{Type: "netbird", Profile: "vesperx", SetupKey: "XXXXXXXX"}
+	manager, seq := newNetBirdLoginFixture(t, cfg, "unused", nil, "NeedsLogin", "Connected")
+
+	require.NoError(t, manager.Connect("nb"))
+	found := false
+	for _, cmd := range seq.executedCommands {
+		if strings.HasPrefix(cmd, "netbird up --setup-key-file ") {
+			found = true
+		}
+	}
+	assert.True(t, found, "up must run with the setup key: %v", seq.executedCommands)
+}
+
+func TestNetBirdLoginCommand(t *testing.T) {
+	assert.Equal(t, loginCmd, netBirdLoginCommand("vesperx"))
+	assert.Equal(t, "sudo netbird up", netBirdLoginCommand(""))
+}
+
+// --- accept_dns: let NetBird own resolv.conf ---
+
+// netop passed --disable-dns unconditionally, so NetBird's resolver was never
+// installed and .netbird.cloud names never resolved. With accept_dns the flag
+// must be omitted so NetBird manages DNS itself.
+func TestConnectNetBird_AcceptDNSOmitsDisableDNS(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			"netbird up":            "",
+			"netbird status --json": `{"daemonStatus":"Connected"}`,
+		},
+	}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird", AcceptDNS: true},
+		},
+	}
+	manager := NewManagerWithDir(executor, &mockLogger{}, configMgr, t.TempDir())
+	manager.routeMgr = newFakeRoutes()
+	manager.linkMgr = newFakeLinks()
+
+	require.NoError(t, manager.Connect("nb"))
+
+	joined := strings.Join(executor.executedCommands, " | ")
+	assert.NotContains(t, joined, "--disable-dns",
+		"accept_dns must let NetBird manage DNS, so --disable-dns must not be passed")
+}
+
+// Without accept_dns the previous behaviour is unchanged: netop owns DNS.
+func TestConnectNetBird_WithoutAcceptDNSKeepsDisableDNS(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default":    "default via 192.168.1.1 dev eth0",
+			"netbird up --disable-dns": "",
+			"netbird status --json":    `{"daemonStatus":"Connected"}`,
+		},
+	}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird"},
+		},
+	}
+	manager := NewManagerWithDir(executor, &mockLogger{}, configMgr, t.TempDir())
+	manager.routeMgr = newFakeRoutes()
+	manager.linkMgr = newFakeLinks()
+
+	require.NoError(t, manager.Connect("nb"))
+
+	joined := strings.Join(executor.executedCommands, " | ")
+	assert.Contains(t, joined, "--disable-dns",
+		"without accept_dns netop keeps owning DNS (unchanged behaviour)")
+}
+
+// NetBird cannot write resolv.conf while netop's immutable flag is set, so the
+// lock must be released before `netbird up` — the same requirement Tailscale has.
+func TestConnectNetBird_AcceptDNSUnlocksResolvConf(t *testing.T) {
+	executor := &mockSystemExecutor{
+		commands: map[string]string{
+			"ip route show default": "default via 192.168.1.1 dev eth0",
+			"netbird up":            "",
+			"netbird status --json": `{"daemonStatus":"Connected"}`,
+		},
+	}
+	configMgr := &mockConfigManager{
+		vpnConfigs: map[string]*types.VPNConfig{
+			"nb": {Type: "netbird", AcceptDNS: true},
+		},
+	}
+	manager := NewManagerWithDir(executor, &mockLogger{}, configMgr, t.TempDir())
+	manager.routeMgr = newFakeRoutes()
+	manager.linkMgr = newFakeLinks()
+
+	var unlocked []string
+	manager.resolvConfPath = "/tmp/test-resolv.conf"
+	manager.setImmutable = func(path string, on bool) error {
+		if !on {
+			unlocked = append(unlocked, path)
+		}
+		return nil
+	}
+
+	require.NoError(t, manager.Connect("nb"))
+
+	assert.Contains(t, unlocked, "/tmp/test-resolv.conf",
+		"accept_dns must clear the immutable flag so NetBird can write resolv.conf")
 }

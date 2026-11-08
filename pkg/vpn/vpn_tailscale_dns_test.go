@@ -53,6 +53,7 @@ func newTailscaleDNSFixture(t *testing.T, cfg *types.VPNConfig, setCmd string) (
 			err    error
 		}{
 			"tailscale status --json": {
+				{output: `{"BackendState":"Stopped"}`}, // stop-all sweep: not running
 				{output: `{"BackendState":"Stopped"}`},
 				{output: `{"BackendState":"Running"}`},
 			},
@@ -107,11 +108,13 @@ const (
 	acceptDNSOn  = "tailscale set --accept-dns=true"
 )
 
-// newGaveUpFixture reproduces the 2026-10-13 failure: tailscaled was already
-// running with accept-dns on when net held resolv.conf locked, so its DNS
-// write failed and it never retried. resolv.conf still holds net's servers.
-// reapplies says whether flipping accept-dns off and on makes tailscaled
-// write the file again, as it does on the real daemon.
+// newGaveUpFixture: Tailscale is up with accept-dns on, but resolv.conf still
+// holds net's servers after connecting. On 2026-10-13 that happened because
+// tailscaled had failed its DNS write while net held the file locked and
+// never retried. Connect now brings a running tailscaled down first, so the
+// "up" is a real transition, but net still checks the result rather than
+// trusting it. reapplies says whether flipping accept-dns off and on makes
+// tailscaled write the file, as it does on the real daemon.
 func newGaveUpFixture(t *testing.T, reapplies bool) (*Manager, *sequencingExecutor, *warnRecorder) {
 	t.Helper()
 	setCmd := "tailscale set --accept-dns=true --exit-node= --accept-routes=false"
@@ -120,8 +123,9 @@ func newGaveUpFixture(t *testing.T, reapplies bool) (*Manager, *sequencingExecut
 		output string
 		err    error
 	}{
-		{output: `{"BackendState":"Running"}`},
-		{output: `{"BackendState":"Running"}`},
+		{output: `{"BackendState":"Running"}`}, // stop-all sweep: started at boot, brought down
+		{output: `{"BackendState":"Stopped"}`}, // backend state before "up"
+		{output: `{"BackendState":"Running"}`}, // verify after "up"
 	}
 	writeResolvConf(t, manager.resolvConfPath, "nameserver 1.1.1.1\n")
 
@@ -139,8 +143,8 @@ func newGaveUpFixture(t *testing.T, reapplies bool) (*Manager, *sequencingExecut
 	return manager, seq, logger
 }
 
-// "up" and "set" are no-ops for a tailscaled whose prefs already match, so
-// after unlocking resolv.conf net must flip accept-dns to make it re-apply.
+// When tailscaled has not taken over resolv.conf after connecting, net flips
+// accept-dns off and on: a real pref change that makes it apply DNS again.
 func TestConnectTailscale_AcceptDNSReappliesWhenTailscaledGaveUp(t *testing.T) {
 	manager, seq, _ := newGaveUpFixture(t, true)
 
@@ -170,8 +174,8 @@ func TestConnectTailscale_AcceptDNSReappliedSilently(t *testing.T) {
 	assert.Empty(t, logger.warns)
 }
 
-// A tailscaled that came up after the unlock wrote DNS itself; bouncing its
-// pref would needlessly rewrite resolv.conf twice.
+// A tailscaled that wrote DNS itself as it came up must not have its pref
+// bounced: that would needlessly rewrite resolv.conf twice.
 func TestConnectTailscale_AcceptDNSSkipsReapplyWhenAlreadyApplied(t *testing.T) {
 	setCmd := "tailscale set --accept-dns=true --exit-node= --accept-routes=false"
 	manager, seq, _ := newTailscaleDNSFixture(t, &types.VPNConfig{Type: "tailscale", AcceptDNS: true}, setCmd)
@@ -239,6 +243,7 @@ func TestConnectTailscale_AcceptDNSNeedsLoginRestatesPref(t *testing.T) {
 			err    error
 		}{
 			"tailscale status --json": {
+				{output: `{"BackendState":"NeedsLogin"}`}, // stop-all sweep: not running
 				{output: `{"BackendState":"NeedsLogin"}`},
 				{output: `{"BackendState":"Running"}`},
 			},

@@ -27,7 +27,6 @@ jobs:
             hostapd \
             dnsmasq \
             iw \
-            wireless-tools \
             wireguard-tools \
             iproute2
 
@@ -49,7 +48,13 @@ jobs:
         run: |
           # Run integration tests with sudo
           # Tests will skip gracefully if capabilities are missing
-          sudo go test -tags=integration -v -timeout=10m ./...
+          #
+          # -p 1: these tests drive global kernel state — one shared
+          # mac80211_hwsim module, host interfaces, resolv.conf. `go test ./...`
+          # runs package binaries in parallel by default, so pkg/wifi and
+          # pkg/hotspot would modprobe -r the radio out from under each other,
+          # which showed up as an intermittent "Network is down (-100)".
+          sudo go test -tags=integration -p 1 -v -timeout=10m ./...
 
       - name: Cleanup
         if: always()

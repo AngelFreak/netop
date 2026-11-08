@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,8 +31,11 @@ type Manager struct {
 	routeMgr      types.RouteManager          // netlink-backed routing table access (gateway detection, route restore)
 	addrMgr       types.AddrManager           // netlink-backed interface address access (WireGuard iface IP)
 	linkMgr       types.LinkManager           // netlink-backed link access (WireGuard iface create/delete/enumerate)
+	ruleMgr       types.RuleManager           // netlink-backed policy rules (keeps the local LAN off Tailscale's table)
 	wgConfig      types.WireGuardConfigurator // wgctrl-backed WireGuard config; nil until first use / injected in tests
+	networkMgr    types.NetworkManager        // resolv.conf access for VPN-provided DNS; nil disables DNS handling
 	endpointRoute string                      // Stores the VPN endpoint IP for cleanup on disconnect
+	originalDNS   string                      // Comma-separated pre-VPN nameservers, restored on disconnect
 	runtimeDir    string                      // Directory for runtime files (active-vpn state file)
 	mu            sync.Mutex                  // Protects endpointRoute and serializes Connect/Disconnect/state file operations
 
@@ -47,8 +51,22 @@ type Manager struct {
 	setImmutable   func(path string, immutable bool) error
 }
 
+// SetNetworkManager injects the network manager used to apply VPN-provided DNS
+// (a WireGuard config's `DNS =` key) and to restore the previous nameservers on
+// disconnect. Without it, VPN DNS handling is skipped.
+func (m *Manager) SetNetworkManager(networkMgr types.NetworkManager) {
+	m.networkMgr = networkMgr
+}
+
+// HasNetworkManager reports whether a network manager has been injected, and so
+// whether VPN-provided DNS will be applied. Used to assert the production
+// wiring, which unit tests that inject their own manager cannot verify.
+func (m *Manager) HasNetworkManager() bool {
+	return m.networkMgr != nil
+}
+
 // vpnState holds the state information stored in the active-vpn file
-// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
+// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute|originalDNS
 type vpnState struct {
 	Name              string
 	Interface         string
@@ -56,6 +74,10 @@ type vpnState struct {
 	OriginalGateway   string
 	OriginalInterface string
 	EndpointRoute     string
+	// OriginalDNS holds the comma-separated nameservers that were in
+	// resolv.conf before a VPN-provided DNS replaced them, so disconnect can
+	// put them back. Empty when the VPN did not set DNS.
+	OriginalDNS string
 }
 
 // NewManager creates a new VPN manager with the default runtime directory
@@ -72,6 +94,7 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		routeMgr:       netlink.NewRouteManager(),
 		addrMgr:        netlink.NewAddrManager(),
 		linkMgr:        netlink.NewLinkManager(),
+		ruleMgr:        netlink.NewRuleManager(),
 		runtimeDir:     runtimeDir,
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
@@ -119,8 +142,16 @@ func (m *Manager) Connect(name string) error {
 		// original route before saving new state, mirroring Disconnect — else
 		// the old /32 endpoint route leaks permanently.
 		m.removeEndpointRoute(existingState)
+		m.restoreDNS(existingState)
 		m.restoreDefaultRouteFromState(existingState)
 		m.clearActiveVPN()
+	}
+
+	// Also stop VPNs net has no record of (e.g. daemons that reconnected at
+	// boot). Bringing a second overlay up beside them leaves two tunnels
+	// fighting over routes and DNS.
+	if _, err := m.stopUntrackedVPNs(); err != nil {
+		return fmt.Errorf("cannot stop running VPNs before connecting '%s': %w", name, err)
 	}
 
 	// Load VPN config from ConfigManager
@@ -136,6 +167,9 @@ func (m *Manager) Connect(name string) error {
 	// Reset the endpoint route tracker; connectWireGuard sets it when it
 	// adds a protective route to the VPN endpoint.
 	m.endpointRoute = ""
+	// Reset the DNS snapshot; connectWireGuard sets it when the config
+	// provides its own nameservers.
+	m.originalDNS = ""
 
 	var connectErr error
 	var vpnIface string
@@ -153,7 +187,19 @@ func (m *Manager) Connect(name string) error {
 		if !m.executor.HasCommand("tailscale") {
 			return fmt.Errorf("tailscale CLI not found. Install it: https://tailscale.com/download/linux")
 		}
+		// Before Tailscale installs the tailnet's subnet routes, keep the
+		// uplink's own LAN on the main table: a peer advertising this same
+		// subnet would otherwise capture the local gateway and DNS server.
+		// With an exit node, LAN access is Tailscale's call
+		// (--exit-node-allow-lan-access), so net stays out of it.
+		keepLAN := config.AcceptRoutes && config.ExitNode == ""
+		if keepLAN {
+			m.keepLocalLANDirect(origIface)
+		}
 		connectErr = m.connectTailscale(config)
+		if connectErr != nil && keepLAN {
+			m.clearLocalLANRules()
+		}
 		vpnIface = "tailscale0"
 	case "netbird":
 		if !m.executor.HasCommand("netbird") {
@@ -180,6 +226,7 @@ func (m *Manager) Connect(name string) error {
 		OriginalGateway:   origGW,
 		OriginalInterface: origIface,
 		EndpointRoute:     m.endpointRoute,
+		OriginalDNS:       m.originalDNS,
 	}
 	if err := m.setActiveVPNState(state); err != nil {
 		m.logger.Debug("Failed to record active VPN state", "error", err)
@@ -214,8 +261,8 @@ func (m *Manager) Disconnect(name string) error {
 		// State file exists but no type — legacy format
 		m.logger.Debug("Legacy VPN state, using legacy disconnect")
 		m.disconnectLegacy()
-	} else {
-		// No state file at all — no VPN was connected via net
+	} else if name != "" {
+		// No state file at all — the named VPN was not connected via net
 		m.logger.Debug("No active VPN to disconnect")
 		return fmt.Errorf("no active VPN connection")
 	}
@@ -227,16 +274,94 @@ func (m *Manager) Disconnect(name string) error {
 		return disconnectErr
 	}
 
-	// Remove the VPN endpoint route if we added one.
-	m.removeEndpointRoute(state)
+	if state != nil {
+		// Remove the VPN endpoint route if we added one.
+		m.removeEndpointRoute(state)
 
-	// Restore default route via the physical interface using saved original route
-	m.restoreDefaultRouteFromState(state)
+		// Put back the nameservers the VPN replaced, so disconnecting does not
+		// leave the system pointing at a resolver inside the dead tunnel.
+		m.restoreDNS(state)
 
-	// Clear the active VPN state file
-	m.clearActiveVPN()
+		// Restore default route via the physical interface using saved original route
+		m.restoreDefaultRouteFromState(state)
 
+		// Clear the active VPN state file
+		m.clearActiveVPN()
+	}
+
+	// A named disconnect targets that one VPN; only "stop all" sweeps.
+	if name != "" {
+		return nil
+	}
+	stopped, err := m.stopUntrackedVPNs()
+	if err != nil {
+		return err
+	}
+	if state == nil && len(stopped) == 0 {
+		m.logger.Debug("No active VPN to disconnect")
+		return fmt.Errorf("no active VPN connection")
+	}
 	return nil
+}
+
+// stopUntrackedVPNs brings down every VPN still running that net has no
+// record of. The state file lives in /run, which is wiped at boot, while the
+// Tailscale and NetBird daemons reconnect on their own — so after a reboot
+// "stop all" cannot rely on the state file. It returns what it stopped; a
+// VPN that fails to stop is an error, since leaving it up beside a new one
+// is exactly what this guards against.
+func (m *Manager) stopUntrackedVPNs() ([]string, error) {
+	var stopped []string
+	var errs []error
+	record := func(what string, err error) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop %s: %w", what, err))
+			return
+		}
+		m.logger.Info("Stopped VPN not tracked by net", "vpn", what)
+		stopped = append(stopped, what)
+	}
+
+	if m.executor.HasCommand("tailscale") {
+		// Starting counts: the daemon is already installing routes.
+		if st, err := m.tailscaleBackendState(); err == nil && (st == "Running" || st == "Starting") {
+			_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down")
+			record("Tailscale", err)
+			if err == nil {
+				m.clearLocalLANRules()
+			}
+		}
+	}
+
+	if m.executor.HasCommand("netbird") {
+		// Connecting counts: with Management unreachable the daemon stays
+		// there, but its interface and routes are already up.
+		if st := m.netBirdDaemonStatus(); st == "Connected" || st == "Connecting" {
+			_, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down")
+			record("NetBird", err)
+		}
+	}
+
+	if out, err := m.executor.ExecuteWithTimeout(2*time.Second, "pgrep", "-f", openVPNProcessPattern); err == nil && strings.TrimSpace(out) != "" {
+		m.killProcess(openVPNProcessPattern)
+		record("OpenVPN", nil)
+	}
+
+	// Listed after NetBird is down. Its kernel interface (wt*) is
+	// WireGuard-typed but owned by the NetBird daemon, so it is never deleted
+	// here — that would wedge the daemon.
+	wgIfaces, err := m.linkMgr.ListByType("wireguard")
+	if err != nil {
+		m.logger.Debug("Failed to list WireGuard interfaces", "error", err)
+	}
+	for _, iface := range wgIfaces {
+		if strings.HasPrefix(iface, "wt") {
+			continue
+		}
+		record("WireGuard "+iface, m.linkMgr.Delete(iface))
+	}
+
+	return stopped, errors.Join(errs...)
 }
 
 // disconnectTracked disconnects using tracked state (process isolation)
@@ -279,6 +404,7 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 			m.logger.Warn("Failed to disconnect Tailscale", "error", err)
 			return fmt.Errorf("failed to disconnect Tailscale: %w", err)
 		}
+		m.clearLocalLANRules()
 	case "netbird":
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
 			m.logger.Warn("Failed to disconnect NetBird", "error", err)
@@ -334,6 +460,8 @@ func (m *Manager) disconnectLegacy() {
 	if m.executor.HasCommand("tailscale") {
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
 			m.logger.Debug("Failed to disconnect Tailscale (legacy)", "error", err)
+		} else {
+			m.clearLocalLANRules()
 		}
 	}
 	if m.executor.HasCommand("netbird") {
@@ -432,6 +560,18 @@ func isVPNInterface(iface string) bool {
 		strings.HasPrefix(iface, "tailscale") || strings.HasPrefix(iface, "wt") ||
 		strings.HasPrefix(iface, "utun")
 }
+
+// localLANRulePriority is where net's "keep the local LAN direct" rules sit:
+// after Tailscale's fwmark rules (5210-5250) and before its table 52 lookup
+// (5270), so a subnet route the tailnet advertises for the LAN the machine is
+// on cannot pull traffic for the local gateway and DNS server into the tunnel.
+const localLANRulePriority = 5260
+
+// openVPNProcessPattern matches an openvpn daemon by the command it runs, not
+// any command line that merely mentions "openvpn" (an editor on a .conf file,
+// or the shell that invoked net). [^ ]* rather than \S keeps it POSIX ERE, as
+// BusyBox pgrep uses musl's regex.
+const openVPNProcessPattern = `^([^ ]*/)?openvpn( |$)`
 
 // killProcess kills processes matching a pattern, with SIGKILL fallback if graceful shutdown fails
 func (m *Manager) killProcess(pattern string) {
@@ -790,7 +930,7 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 	// it on "down". net's immutable lock would make that write fail, so it
 	// is released first — before a profile switch can trigger the write.
 	if config.AcceptDNS {
-		m.unlockResolvConfForTailscale()
+		m.unlockResolvConfForVPNDNS("Tailscale")
 	}
 
 	// Switch profile if specified (for multi-account support).
@@ -869,15 +1009,14 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 // after its accept-dns pref is flipped.
 const tailscaleDNSAttempts = 5
 
-// ensureTailscaleDNS makes sure tailscaled has taken over resolv.conf.
+// ensureTailscaleDNS makes sure tailscaled has taken over resolv.conf after
+// connecting with accept_dns, rather than trusting that it did.
 //
-// A tailscaled that was already running when net held resolv.conf locked
-// (e.g. it auto-started at boot before `net <network>` locked the file) has
-// failed its DNS write and does not retry. Its prefs already match what net
-// asks for, so "up" and "set" change nothing and the unlock alone never
-// reaches it. Flipping accept-dns off and on is a real pref change, which
-// makes tailscaled apply its DNS config again. Failure is a warning, not an
-// error: the tunnel works, only tailnet names won't resolve.
+// tailscaled does not retry a DNS write that failed (on 2026-10-13: while net
+// held resolv.conf locked), and an "up" or "set" whose prefs already match is
+// a no-op that never reaches it. Flipping accept-dns off and on is a real pref
+// change, which makes tailscaled apply its DNS config again. Failure is a
+// warning, not an error: the tunnel works, only tailnet names won't resolve.
 func (m *Manager) ensureTailscaleDNS() {
 	if m.resolvConfUsesTailscale() {
 		return
@@ -918,19 +1057,6 @@ func (m *Manager) resolvConfUsesTailscale() bool {
 // tailscaleDNSIP is the MagicDNS resolver tailscaled writes to resolv.conf.
 var tailscaleDNSIP = net.ParseIP("100.100.100.100")
 
-// unlockResolvConfForTailscale clears the immutable flag net puts on
-// resolv.conf so tailscaled can write it. A failure is logged, not returned:
-// the tunnel works without it, only tailnet names won't resolve.
-func (m *Manager) unlockResolvConfForTailscale() {
-	setImmutable, path := m.setImmutable, m.resolvConfFile()
-	if setImmutable == nil { // zero-value Managers built in tests
-		setImmutable = system.SetImmutable
-	}
-	if err := setImmutable(path, false); err != nil {
-		m.logger.Warn("Failed to unlock resolv.conf for Tailscale DNS; tailnet names may not resolve", "path", path, "error", err)
-	}
-}
-
 // resolvConfFile returns the resolv.conf path, defaulting for zero-value
 // Managers built in tests.
 func (m *Manager) resolvConfFile() string {
@@ -938,6 +1064,57 @@ func (m *Manager) resolvConfFile() string {
 		return "/etc/resolv.conf"
 	}
 	return m.resolvConfPath
+}
+
+// keepLocalLANDirect adds `to <subnet> lookup main` ahead of Tailscale's
+// table 52 for each subnet directly connected to uplink, after clearing any
+// left over from an earlier session. A failure is logged, not returned: the
+// tunnel works without it; only a tailnet route overlapping this LAN would
+// then break local DNS.
+func (m *Manager) keepLocalLANDirect(uplink string) {
+	m.clearLocalLANRules()
+	if m.ruleMgr == nil || uplink == "" {
+		return
+	}
+	routes, err := m.routeMgr.ListRoutes()
+	if err != nil {
+		m.logger.Warn("Failed to read local subnets; a tailnet route for this LAN could break local DNS", "error", err)
+		return
+	}
+	for _, r := range routes {
+		if r.Iface != uplink || r.Gw != "" || r.IsDefault() {
+			continue
+		}
+		if err := m.ruleMgr.AddLookupMain(r.Dst, localLANRulePriority); err != nil {
+			m.logger.Warn("Failed to keep local LAN off the tailnet; a tailnet route for it would break local DNS", "subnet", r.Dst, "error", err)
+			continue
+		}
+		m.logger.Debug("Keeping local LAN direct", "subnet", r.Dst, "interface", uplink)
+	}
+}
+
+// clearLocalLANRules removes every rule keepLocalLANDirect added. net owns
+// localLANRulePriority, so all rules there are its own.
+func (m *Manager) clearLocalLANRules() {
+	if m.ruleMgr == nil { // zero-value Managers built in tests
+		return
+	}
+	if err := m.ruleMgr.DelRules(localLANRulePriority); err != nil {
+		m.logger.Debug("Failed to remove local LAN rules", "error", err)
+	}
+}
+
+// unlockResolvConfForTailscale clears the immutable flag net puts on
+// resolv.conf so tailscaled can write it. A failure is logged, not returned:
+// the tunnel works without it, only tailnet names won't resolve.
+func (m *Manager) unlockResolvConfForVPNDNS(vpnName string) {
+	setImmutable, path := m.setImmutable, m.resolvConfFile()
+	if setImmutable == nil { // zero-value Managers built in tests
+		setImmutable = system.SetImmutable
+	}
+	if err := setImmutable(path, false); err != nil {
+		m.logger.Warn("Failed to unlock resolv.conf for VPN DNS; internal names may not resolve", "vpn", vpnName, "path", path, "error", err)
+	}
 }
 
 // isEmptyStderrError returns true when the error is a command failure with
@@ -964,6 +1141,16 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 		}
 	}
 
+	// An SSO-enrolled profile whose session lapsed makes "up" wait for a
+	// browser login whose URL net cannot show, so it looks hung. When
+	// Management has already refused the peer, fail fast with the command
+	// that logs in. A setup key logs in without a browser, so it skips this.
+	if config.SetupKey == "" {
+		if st := m.netBirdDaemonStatus(); st == "NeedsLogin" || st == "SessionExpired" {
+			return fmt.Errorf("NetBird needs a login (daemon status %s); SSO logins expire, 24h by default. Log in once in a browser with: %s (or set setup_key in the config)", st, netBirdLoginCommand(config.Profile))
+		}
+	}
+
 	// Profile is applied via "profile select" above, so it is intentionally
 	// omitted from "up" here.
 	args := []string{"up"}
@@ -982,11 +1169,24 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 		args = append(args, "--management-url", config.ManagementURL)
 	}
 
-	// Always disable DNS (netop manages resolv.conf)
-	args = append(args, "--disable-dns")
+	// With accept_dns, NetBird runs its own resolver (for .netbird.cloud peer
+	// names) and writes resolv.conf itself, so --disable-dns must be omitted
+	// and net's immutable lock released first — otherwise NetBird's write
+	// fails and peer names never resolve. Without it, net owns DNS as before.
+	if config.AcceptDNS {
+		m.unlockResolvConfForVPNDNS("NetBird")
+	} else {
+		args = append(args, "--disable-dns")
+	}
 
 	_, err := m.executor.ExecuteWithTimeout(30*time.Second, "netbird", args...)
 	if err != nil {
+		// LoginFailed also follows an unreachable Management, so it is only
+		// trusted here, to explain an "up" that already failed.
+		switch st := m.netBirdDaemonStatus(); st {
+		case "NeedsLogin", "SessionExpired", "LoginFailed":
+			return fmt.Errorf("failed to connect NetBird: %w (daemon status %s; if this profile logs in via SSO, its session may have expired. Log in once in a browser with: %s)", err, st, netBirdLoginCommand(config.Profile))
+		}
 		return fmt.Errorf("failed to connect NetBird: %w", err)
 	}
 
@@ -997,6 +1197,31 @@ func (m *Manager) connectNetBird(config *types.VPNConfig) error {
 
 	m.logger.Info("NetBird connected")
 	return nil
+}
+
+// netBirdDaemonStatus returns the daemon's status (e.g. "Connected",
+// "NeedsLogin"), or "" when it cannot be read.
+func (m *Manager) netBirdDaemonStatus() string {
+	output, err := m.executor.ExecuteWithTimeout(5*time.Second, "netbird", "status", "--json")
+	if err != nil {
+		return ""
+	}
+	var st struct {
+		DaemonStatus string `json:"daemonStatus"`
+	}
+	if err := json.Unmarshal([]byte(output), &st); err != nil {
+		return ""
+	}
+	return st.DaemonStatus
+}
+
+// netBirdLoginCommand is the interactive login for a NetBird profile, run as
+// root since that is whose profiles net uses.
+func netBirdLoginCommand(profile string) string {
+	if profile == "" {
+		return "sudo netbird up"
+	}
+	return "sudo netbird profile select " + profile + " && sudo netbird up"
 }
 
 // openVPNDevice extracts the tunnel device name from an OpenVPN config.
@@ -1095,6 +1320,14 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		return fmt.Errorf("WireGuard configuration unavailable: %w", err)
 	}
 
+	// Parse the wg-quick [Interface] settings the kernel device does not take
+	// (MTU, DNS) before creating anything, so an invalid value fails before we
+	// touch the link rather than halfway through setup.
+	settings, err := wgconfig.ParseSettings(config.Config)
+	if err != nil {
+		return fmt.Errorf("invalid WireGuard config: %w", err)
+	}
+
 	// Create WireGuard interface — if it already exists, delete and recreate
 	// to ensure clean state (no stale routes/config from previous connection)
 	err = m.linkMgr.AddWireGuard(iface)
@@ -1121,6 +1354,18 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 			// Clean up interface on failure
 			m.linkMgr.Delete(iface)
 			return fmt.Errorf("failed to set WireGuard IP: %w", err)
+		}
+	}
+
+	// Apply the config's MTU while the link is still down, so it never carries
+	// traffic at the wrong MTU. Tunnels over paths with reduced MTU need this
+	// to avoid fragmentation stalls.
+	if settings.MTU > 0 {
+		m.logger.Debug("Setting WireGuard MTU", "interface", iface, "mtu", settings.MTU)
+		if err := m.linkMgr.SetMTU(iface, settings.MTU); err != nil {
+			// Clean up interface on failure
+			m.linkMgr.Delete(iface)
+			return fmt.Errorf("failed to set WireGuard MTU %d: %w", settings.MTU, err)
 		}
 	}
 
@@ -1171,8 +1416,49 @@ func (m *Manager) connectWireGuard(config *types.VPNConfig, origGW, origIface st
 		}
 	}
 
+	// Apply the config's DNS last: the resolver usually lives inside the
+	// tunnel, so it is only reachable once routes are in place. A DNS failure
+	// is not fatal — the tunnel itself is up and usable.
+	m.applyVPNDNS(settings.DNS)
+
 	m.logger.Info("WireGuard VPN connection established", "interface", iface)
 	return nil
+}
+
+// applyVPNDNS writes VPN-provided nameservers to resolv.conf, recording the
+// previous ones in m.originalDNS so Disconnect can restore them. Non-address
+// entries (wg-quick allows search domains in DNS=) are left to the network
+// manager, which skips them. A nil networkMgr or empty list is a no-op, so a
+// config without DNS behaves exactly as before.
+func (m *Manager) applyVPNDNS(servers []string) {
+	if len(servers) == 0 || m.networkMgr == nil {
+		return
+	}
+	// Snapshot the current nameservers first so disconnect can restore them.
+	if prior, err := m.networkMgr.GetDNS(); err != nil {
+		m.logger.Debug("Could not read current DNS; will not restore on disconnect", "error", err)
+	} else {
+		m.originalDNS = strings.Join(prior, ",")
+	}
+	m.logger.Info("Applying VPN-provided DNS", "servers", servers)
+	if err := m.networkMgr.SetDNS(servers); err != nil {
+		// Non-fatal: the tunnel is up, only name resolution is affected.
+		m.logger.Warn("Failed to apply VPN DNS", "servers", servers, "error", err)
+		m.originalDNS = ""
+	}
+}
+
+// restoreDNS puts back the nameservers that were in place before a VPN
+// replaced them. No-op when the VPN never set DNS.
+func (m *Manager) restoreDNS(state *vpnState) {
+	if state == nil || state.OriginalDNS == "" || m.networkMgr == nil {
+		return
+	}
+	servers := strings.Split(state.OriginalDNS, ",")
+	m.logger.Debug("Restoring pre-VPN DNS", "servers", servers)
+	if err := m.networkMgr.SetDNS(servers); err != nil {
+		m.logger.Warn("Failed to restore pre-VPN DNS", "servers", servers, "error", err)
+	}
 }
 
 // extractEndpoint extracts the endpoint IP from a WireGuard config
@@ -1264,10 +1550,11 @@ func (m *Manager) setActiveVPNState(state vpnState) error {
 		// Non-fatal: status will fall back to interface detection
 		return err
 	}
-	// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute
-	content := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+	// Format: vpn-name|interface|type|originalGateway|originalInterface|endpointRoute|originalDNS
+	content := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s",
 		state.Name, state.Interface, state.Type,
-		state.OriginalGateway, state.OriginalInterface, state.EndpointRoute)
+		state.OriginalGateway, state.OriginalInterface, state.EndpointRoute,
+		state.OriginalDNS)
 	// Use 0600 for consistency with other runtime files (e.g., wg.conf, openvpn.conf)
 	return os.WriteFile(activeVPNFile, []byte(content), 0600)
 }
@@ -1300,6 +1587,11 @@ func (m *Manager) getActiveVPNState() *vpnState {
 	}
 	if len(parts) >= 6 {
 		state.EndpointRoute = parts[5]
+	}
+	// Written by newer versions only; a 6-field file from before this field
+	// existed still loads with an empty OriginalDNS.
+	if len(parts) >= 7 {
+		state.OriginalDNS = parts[6]
 	}
 	return state
 }
