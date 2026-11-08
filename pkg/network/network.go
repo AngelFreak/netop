@@ -40,6 +40,10 @@ type Manager struct {
 	// when unavailable. Defaults to a sysfs read; overridable in tests, which
 	// have no real interface.
 	rxPacketsFn func(iface string) int64
+	// currentMACFn reads an interface's current hardware address. Defaults to
+	// a net.InterfaceByName lookup; overridable in tests, which have no real
+	// interface to read.
+	currentMACFn func(iface string) string
 }
 
 // NewManager creates a new network manager
@@ -55,6 +59,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		resolvConfPath:   "/etc/resolv.conf",
 		setImmutable:     system.SetImmutable,
 		rxPacketsFn:      rxPackets,
+		currentMACFn:     readCurrentMAC,
 	}
 }
 
@@ -285,10 +290,19 @@ func (m *Manager) SetMAC(iface, mac string) error {
 	}
 
 	if mac == "permanent" {
-		// Restore the factory/permanent MAC address
-		permMAC, err := m.getPermanentMAC(iface)
+		// Prefer netlink: it needs no external binary, and ethtool is absent
+		// on the minimal systems netop targets. The kernel reports a permanent
+		// address only when it differs from the current one, so an empty
+		// result means the interface is already on its factory MAC.
+		permMAC, err := m.linkMgr.GetPermanentMAC(iface)
 		if err != nil {
-			return fmt.Errorf("failed to get permanent MAC: %w", err)
+			if permMAC, err = m.getPermanentMAC(iface); err != nil {
+				return fmt.Errorf("failed to get permanent MAC: %w", err)
+			}
+		}
+		if permMAC == "" {
+			m.logger.Debug("Interface already on its permanent MAC", "interface", iface)
+			return nil
 		}
 		mac = permMAC
 	}
@@ -651,6 +665,64 @@ func (m *Manager) expandMACTemplate(template string) string {
 	return result
 }
 
+// randomizedMACHint returns advice to append to a DHCP-failure error when the
+// interface is presenting a randomized MAC rather than its factory one.
+//
+// Networks that authorize clients by MAC (offices, hotels, campus) silently
+// drop DISCOVERs from an unknown MAC, so a randomized MAC fails with no
+// diagnostic beyond dhclient's timeout — indistinguishable from an unplugged
+// cable. Returns "" when the MAC is not randomized, when the permanent MAC is
+// unavailable, or when the two already match, so the advice never fires where
+// it would be wrong.
+func (m *Manager) randomizedMACHint(iface, macPolicy string) string {
+	switch macPolicy {
+	case "", "permanent":
+		return ""
+	}
+
+	// Netlink, not `ethtool -P`: ethtool is absent on many minimal systems
+	// (and on this project's target Alpine/embedded hosts), where shelling out
+	// would make this hint silently never fire.
+	permMAC, err := m.linkMgr.GetPermanentMAC(iface)
+	if err != nil {
+		m.logger.Debug("Cannot read permanent MAC for DHCP failure hint", "interface", iface, "error", err)
+		return ""
+	}
+	// Empty means the kernel reported no distinct permanent address, i.e. the
+	// interface is already on its factory MAC.
+	if permMAC == "" {
+		return ""
+	}
+
+	currentMAC := m.currentMAC(iface)
+	if currentMAC == "" || strings.EqualFold(currentMAC, permMAC) {
+		return ""
+	}
+
+	return fmt.Sprintf("\n\n  %s is using a randomized MAC (%s) instead of its\n"+
+		"  permanent MAC (%s). Networks that authorize by MAC will not reply.\n\n"+
+		"  To use the permanent MAC, set  mac: permanent  on this network in your config.",
+		iface, currentMAC, permMAC)
+}
+
+// currentMAC returns the interface's current hardware address, or "" if it
+// cannot be determined.
+func (m *Manager) currentMAC(iface string) string {
+	if m.currentMACFn == nil {
+		return readCurrentMAC(iface)
+	}
+	return m.currentMACFn(iface)
+}
+
+// readCurrentMAC reads an interface's hardware address from the kernel.
+func readCurrentMAC(iface string) string {
+	link, err := net.InterfaceByName(iface)
+	if err != nil || link.HardwareAddr == nil {
+		return ""
+	}
+	return link.HardwareAddr.String()
+}
+
 // getPermanentMAC retrieves the factory/permanent MAC address using ethtool
 func (m *Manager) getPermanentMAC(iface string) (string, error) {
 	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "ethtool", "-P", iface)
@@ -936,8 +1008,14 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 					if rxAfter := m.rxCount(config.Interface); rxBefore >= 0 && rxAfter >= rxBefore {
 						rxDelta = rxAfter - rxBefore
 					}
+					hint := m.describeDHCPSilence(rxDelta)
+					// A port that passed no frames blocks every MAC, so blaming
+					// the randomized one would send the user after the wrong fix.
+					if rxDelta != 0 {
+						hint += m.randomizedMACHint(config.Interface, config.MAC)
+					}
 					return fmt.Errorf("failed to obtain DHCP lease on %s: %w%s",
-						config.Interface, err, m.describeDHCPSilence(rxDelta))
+						config.Interface, err, hint)
 				}
 				m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 			}
