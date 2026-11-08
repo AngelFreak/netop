@@ -56,11 +56,38 @@ vpn:
     config: |
       [Interface]
       PrivateKey = YOUR_PRIVATE_KEY_HERE
+      # MTU and DNS are optional. MTU is applied to the interface; DNS is
+      # written to resolv.conf and restored when the VPN disconnects.
+      # Other wg-quick-only keys (Address, Table, PostUp/PreDown) are ignored:
+      # set the interface address with the `address:` key above.
+      MTU = 1380
+      DNS = 10.0.0.1
 
       [Peer]
       Endpoint = vpn.example.com:51820
       PublicKey = SERVER_PUBLIC_KEY_HERE
       AllowedIPs = 0.0.0.0/0
+  # Split-tunnel: reach only the listed subnets, leave other traffic alone.
+  # Note `gateway: false` — with `gateway: true` the default route moves to the
+  # tunnel while AllowedIPs covers only these subnets, which blackholes
+  # everything else.
+  myvpn-split:
+    type: wireguard
+    address: 10.77.0.13/32
+    interface: wg0
+    gateway: false
+    config: |
+      [Interface]
+      PrivateKey = YOUR_PRIVATE_KEY_HERE
+      MTU = 1380
+      DNS = 10.77.0.1
+
+      [Peer]
+      PublicKey = SERVER_PUBLIC_KEY_HERE
+      PresharedKey = OPTIONAL_PRESHARED_KEY
+      Endpoint = vpn.example.com:51830
+      AllowedIPs = 10.77.0.0/24, 10.78.0.0/16
+      PersistentKeepalive = 25
   my-tailscale:
     type: tailscale
     profile: work@company.com      # Optional: switch Tailscale profile (multi-account)
@@ -80,6 +107,8 @@ vpn:
     type: netbird
     setup_key: XXXXXXXX            # Optional: omit if already logged in
     management_url: https://api.netbird.io  # Optional: defaults to NetBird cloud
+    accept_dns: true               # Optional: let NetBird own DNS so
+                                   # .netbird.cloud peer names resolve
 
 tunnel:
   app:
