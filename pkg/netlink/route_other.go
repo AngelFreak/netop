@@ -77,3 +77,24 @@ func (m *RouteManager) FlushRoutes(iface string) error {
 func (m *RouteManager) ListRoutes() ([]types.Route, error) {
 	return nil, ErrUnsupported
 }
+
+var _ types.RuleManager = (*RuleManager)(nil)
+
+// RuleManager is the non-Linux stub implementation of types.RuleManager.
+type RuleManager struct{}
+
+// NewRuleManager returns a stub RuleManager whose operations all fail with
+// ErrUnsupported on non-Linux platforms.
+func NewRuleManager() *RuleManager {
+	return &RuleManager{}
+}
+
+// AddLookupMain always returns ErrUnsupported on non-Linux platforms.
+func (m *RuleManager) AddLookupMain(dst string, priority int) error {
+	return ErrUnsupported
+}
+
+// DelRules always returns ErrUnsupported on non-Linux platforms.
+func (m *RuleManager) DelRules(priority int) error {
+	return ErrUnsupported
+}

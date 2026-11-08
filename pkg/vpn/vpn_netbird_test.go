@@ -561,12 +561,14 @@ type statusStep = struct {
 }
 
 // newNetBirdLoginFixture scripts "netbird status --json" as the given
-// daemon states, in call order, and lets "netbird up" fail with upErr.
+// daemon states, in call order, and lets "netbird up" fail with upErr. The
+// first state is also what Connect's stop-all sweep sees beforehand, so it
+// must not be a running state.
 func newNetBirdLoginFixture(t *testing.T, cfg *types.VPNConfig, upCmd string, upErr error, states ...string) (*Manager, *sequencingExecutor) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	steps := make([]statusStep, 0, len(states))
-	for _, st := range states {
+	steps := make([]statusStep, 0, len(states)+1)
+	for _, st := range append(states[:1:1], states...) {
 		steps = append(steps, statusStep{output: `{"daemonStatus":"` + st + `"}`})
 	}
 	seq := &sequencingExecutor{

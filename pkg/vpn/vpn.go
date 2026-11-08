@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,6 +31,7 @@ type Manager struct {
 	routeMgr      types.RouteManager          // netlink-backed routing table access (gateway detection, route restore)
 	addrMgr       types.AddrManager           // netlink-backed interface address access (WireGuard iface IP)
 	linkMgr       types.LinkManager           // netlink-backed link access (WireGuard iface create/delete/enumerate)
+	ruleMgr       types.RuleManager           // netlink-backed policy rules (keeps the local LAN off Tailscale's table)
 	wgConfig      types.WireGuardConfigurator // wgctrl-backed WireGuard config; nil until first use / injected in tests
 	networkMgr    types.NetworkManager        // resolv.conf access for VPN-provided DNS; nil disables DNS handling
 	endpointRoute string                      // Stores the VPN endpoint IP for cleanup on disconnect
@@ -92,6 +94,7 @@ func NewManagerWithDir(executor types.SystemExecutor, logger types.Logger, confi
 		routeMgr:       netlink.NewRouteManager(),
 		addrMgr:        netlink.NewAddrManager(),
 		linkMgr:        netlink.NewLinkManager(),
+		ruleMgr:        netlink.NewRuleManager(),
 		runtimeDir:     runtimeDir,
 		verifyAttempts: 30,
 		verifyDelay:    time.Second,
@@ -144,6 +147,13 @@ func (m *Manager) Connect(name string) error {
 		m.clearActiveVPN()
 	}
 
+	// Also stop VPNs net has no record of (e.g. daemons that reconnected at
+	// boot). Bringing a second overlay up beside them leaves two tunnels
+	// fighting over routes and DNS.
+	if _, err := m.stopUntrackedVPNs(); err != nil {
+		return fmt.Errorf("cannot stop running VPNs before connecting '%s': %w", name, err)
+	}
+
 	// Load VPN config from ConfigManager
 	config, err := m.configMgr.GetVPNConfig(name)
 	if err != nil {
@@ -177,7 +187,19 @@ func (m *Manager) Connect(name string) error {
 		if !m.executor.HasCommand("tailscale") {
 			return fmt.Errorf("tailscale CLI not found. Install it: https://tailscale.com/download/linux")
 		}
+		// Before Tailscale installs the tailnet's subnet routes, keep the
+		// uplink's own LAN on the main table: a peer advertising this same
+		// subnet would otherwise capture the local gateway and DNS server.
+		// With an exit node, LAN access is Tailscale's call
+		// (--exit-node-allow-lan-access), so net stays out of it.
+		keepLAN := config.AcceptRoutes && config.ExitNode == ""
+		if keepLAN {
+			m.keepLocalLANDirect(origIface)
+		}
 		connectErr = m.connectTailscale(config)
+		if connectErr != nil && keepLAN {
+			m.clearLocalLANRules()
+		}
 		vpnIface = "tailscale0"
 	case "netbird":
 		if !m.executor.HasCommand("netbird") {
@@ -239,8 +261,8 @@ func (m *Manager) Disconnect(name string) error {
 		// State file exists but no type — legacy format
 		m.logger.Debug("Legacy VPN state, using legacy disconnect")
 		m.disconnectLegacy()
-	} else {
-		// No state file at all — no VPN was connected via net
+	} else if name != "" {
+		// No state file at all — the named VPN was not connected via net
 		m.logger.Debug("No active VPN to disconnect")
 		return fmt.Errorf("no active VPN connection")
 	}
@@ -252,20 +274,94 @@ func (m *Manager) Disconnect(name string) error {
 		return disconnectErr
 	}
 
-	// Remove the VPN endpoint route if we added one.
-	m.removeEndpointRoute(state)
+	if state != nil {
+		// Remove the VPN endpoint route if we added one.
+		m.removeEndpointRoute(state)
 
-	// Put back the nameservers the VPN replaced, so disconnecting does not
-	// leave the system pointing at a resolver inside the dead tunnel.
-	m.restoreDNS(state)
+		// Put back the nameservers the VPN replaced, so disconnecting does not
+		// leave the system pointing at a resolver inside the dead tunnel.
+		m.restoreDNS(state)
 
-	// Restore default route via the physical interface using saved original route
-	m.restoreDefaultRouteFromState(state)
+		// Restore default route via the physical interface using saved original route
+		m.restoreDefaultRouteFromState(state)
 
-	// Clear the active VPN state file
-	m.clearActiveVPN()
+		// Clear the active VPN state file
+		m.clearActiveVPN()
+	}
 
+	// A named disconnect targets that one VPN; only "stop all" sweeps.
+	if name != "" {
+		return nil
+	}
+	stopped, err := m.stopUntrackedVPNs()
+	if err != nil {
+		return err
+	}
+	if state == nil && len(stopped) == 0 {
+		m.logger.Debug("No active VPN to disconnect")
+		return fmt.Errorf("no active VPN connection")
+	}
 	return nil
+}
+
+// stopUntrackedVPNs brings down every VPN still running that net has no
+// record of. The state file lives in /run, which is wiped at boot, while the
+// Tailscale and NetBird daemons reconnect on their own — so after a reboot
+// "stop all" cannot rely on the state file. It returns what it stopped; a
+// VPN that fails to stop is an error, since leaving it up beside a new one
+// is exactly what this guards against.
+func (m *Manager) stopUntrackedVPNs() ([]string, error) {
+	var stopped []string
+	var errs []error
+	record := func(what string, err error) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop %s: %w", what, err))
+			return
+		}
+		m.logger.Info("Stopped VPN not tracked by net", "vpn", what)
+		stopped = append(stopped, what)
+	}
+
+	if m.executor.HasCommand("tailscale") {
+		// Starting counts: the daemon is already installing routes.
+		if st, err := m.tailscaleBackendState(); err == nil && (st == "Running" || st == "Starting") {
+			_, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down")
+			record("Tailscale", err)
+			if err == nil {
+				m.clearLocalLANRules()
+			}
+		}
+	}
+
+	if m.executor.HasCommand("netbird") {
+		// Connecting counts: with Management unreachable the daemon stays
+		// there, but its interface and routes are already up.
+		if st := m.netBirdDaemonStatus(); st == "Connected" || st == "Connecting" {
+			_, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down")
+			record("NetBird", err)
+		}
+	}
+
+	if out, err := m.executor.ExecuteWithTimeout(2*time.Second, "pgrep", "-f", openVPNProcessPattern); err == nil && strings.TrimSpace(out) != "" {
+		m.killProcess(openVPNProcessPattern)
+		record("OpenVPN", nil)
+	}
+
+	// Listed after NetBird is down. Its kernel interface (wt*) is
+	// WireGuard-typed but owned by the NetBird daemon, so it is never deleted
+	// here — that would wedge the daemon.
+	wgIfaces, err := m.linkMgr.ListByType("wireguard")
+	if err != nil {
+		m.logger.Debug("Failed to list WireGuard interfaces", "error", err)
+	}
+	for _, iface := range wgIfaces {
+		if strings.HasPrefix(iface, "wt") {
+			continue
+		}
+		record("WireGuard "+iface, m.linkMgr.Delete(iface))
+	}
+
+	return stopped, errors.Join(errs...)
 }
 
 // disconnectTracked disconnects using tracked state (process isolation)
@@ -308,6 +404,7 @@ func (m *Manager) disconnectTracked(state *vpnState) error {
 			m.logger.Warn("Failed to disconnect Tailscale", "error", err)
 			return fmt.Errorf("failed to disconnect Tailscale: %w", err)
 		}
+		m.clearLocalLANRules()
 	case "netbird":
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "netbird", "down"); err != nil {
 			m.logger.Warn("Failed to disconnect NetBird", "error", err)
@@ -363,6 +460,8 @@ func (m *Manager) disconnectLegacy() {
 	if m.executor.HasCommand("tailscale") {
 		if _, err := m.executor.ExecuteWithTimeout(10*time.Second, "tailscale", "down"); err != nil {
 			m.logger.Debug("Failed to disconnect Tailscale (legacy)", "error", err)
+		} else {
+			m.clearLocalLANRules()
 		}
 	}
 	if m.executor.HasCommand("netbird") {
@@ -461,6 +560,18 @@ func isVPNInterface(iface string) bool {
 		strings.HasPrefix(iface, "tailscale") || strings.HasPrefix(iface, "wt") ||
 		strings.HasPrefix(iface, "utun")
 }
+
+// localLANRulePriority is where net's "keep the local LAN direct" rules sit:
+// after Tailscale's fwmark rules (5210-5250) and before its table 52 lookup
+// (5270), so a subnet route the tailnet advertises for the LAN the machine is
+// on cannot pull traffic for the local gateway and DNS server into the tunnel.
+const localLANRulePriority = 5260
+
+// openVPNProcessPattern matches an openvpn daemon by the command it runs, not
+// any command line that merely mentions "openvpn" (an editor on a .conf file,
+// or the shell that invoked net). [^ ]* rather than \S keeps it POSIX ERE, as
+// BusyBox pgrep uses musl's regex.
+const openVPNProcessPattern = `^([^ ]*/)?openvpn( |$)`
 
 // killProcess kills processes matching a pattern, with SIGKILL fallback if graceful shutdown fails
 func (m *Manager) killProcess(pattern string) {
@@ -888,6 +999,44 @@ func (m *Manager) connectTailscale(config *types.VPNConfig) error {
 
 	m.logger.Info("Tailscale connected")
 	return nil
+}
+
+// keepLocalLANDirect adds `to <subnet> lookup main` ahead of Tailscale's
+// table 52 for each subnet directly connected to uplink, after clearing any
+// left over from an earlier session. A failure is logged, not returned: the
+// tunnel works without it; only a tailnet route overlapping this LAN would
+// then break local DNS.
+func (m *Manager) keepLocalLANDirect(uplink string) {
+	m.clearLocalLANRules()
+	if m.ruleMgr == nil || uplink == "" {
+		return
+	}
+	routes, err := m.routeMgr.ListRoutes()
+	if err != nil {
+		m.logger.Warn("Failed to read local subnets; a tailnet route for this LAN could break local DNS", "error", err)
+		return
+	}
+	for _, r := range routes {
+		if r.Iface != uplink || r.Gw != "" || r.IsDefault() {
+			continue
+		}
+		if err := m.ruleMgr.AddLookupMain(r.Dst, localLANRulePriority); err != nil {
+			m.logger.Warn("Failed to keep local LAN off the tailnet; a tailnet route for it would break local DNS", "subnet", r.Dst, "error", err)
+			continue
+		}
+		m.logger.Debug("Keeping local LAN direct", "subnet", r.Dst, "interface", uplink)
+	}
+}
+
+// clearLocalLANRules removes every rule keepLocalLANDirect added. net owns
+// localLANRulePriority, so all rules there are its own.
+func (m *Manager) clearLocalLANRules() {
+	if m.ruleMgr == nil { // zero-value Managers built in tests
+		return
+	}
+	if err := m.ruleMgr.DelRules(localLANRulePriority); err != nil {
+		m.logger.Debug("Failed to remove local LAN rules", "error", err)
+	}
 }
 
 // unlockResolvConfForTailscale clears the immutable flag net puts on

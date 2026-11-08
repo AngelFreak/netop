@@ -51,6 +51,7 @@ func newTailscaleDNSFixture(t *testing.T, cfg *types.VPNConfig, setCmd string) (
 			err    error
 		}{
 			"tailscale status --json": {
+				{output: `{"BackendState":"Stopped"}`}, // stop-all sweep: not running
 				{output: `{"BackendState":"Stopped"}`},
 				{output: `{"BackendState":"Running"}`},
 			},
@@ -100,6 +101,7 @@ func TestConnectTailscale_AcceptDNSNeedsLoginRestatesPref(t *testing.T) {
 			err    error
 		}{
 			"tailscale status --json": {
+				{output: `{"BackendState":"NeedsLogin"}`}, // stop-all sweep: not running
 				{output: `{"BackendState":"NeedsLogin"}`},
 				{output: `{"BackendState":"Running"}`},
 			},
