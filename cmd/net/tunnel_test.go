@@ -308,6 +308,12 @@ func TestStatus_JSONIncludesTunnels(t *testing.T) {
 // The wired path: argv through the real cobra tree and App into a real
 // tunnel.Manager, which runs the real ssh client against testsshd.
 func TestWiring_TunnelEndToEnd(t *testing.T) {
+	// Run as if sudo was not used. Under `sudo go test` (as CI runs the
+	// integration suite) SUDO_UID is set, so the real command path would drop
+	// this whole test process to the caller, irreversibly, and that user cannot
+	// write the root-owned temp dir. The drop has its own test, run in a child
+	// process: TestDropSudoPrivileges_Integration.
+	t.Setenv("SUDO_UID", "")
 	server := testsshd.Start(t)
 	dir, err := os.MkdirTemp("", "nt")
 	require.NoError(t, err)
