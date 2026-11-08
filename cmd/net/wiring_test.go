@@ -17,21 +17,31 @@ import (
 // would have written to stdout. This is the wired path an agent actually hits.
 func runRoot(t *testing.T, args ...string) string {
 	t.Helper()
+	return runRootWith(t, nil, args...)
+}
+
+// runRootWith is runRoot with the fixture App adjusted by customize first.
+func runRootWith(t *testing.T, customize func(*App), args ...string) string {
+	t.Helper()
 	fixture, _ := goldenApp()
+	if customize != nil {
+		customize(fixture)
+	}
 
 	savedPre := rootCmd.PersistentPreRun
 	savedLogger, savedCfg, savedWifi, savedVPN, savedNet := logger, cfgManager, wifiMgr, vpnMgr, netMgr
-	savedHotspot, savedDHCP, savedIface, savedJSON := hotspotMgr, dhcpMgr, iface, jsonOut
+	savedHotspot, savedDHCP, savedTunnel, savedIface, savedJSON := hotspotMgr, dhcpMgr, tunnelMgr, iface, jsonOut
 	t.Cleanup(func() {
 		rootCmd.PersistentPreRun = savedPre
 		logger, cfgManager, wifiMgr, vpnMgr, netMgr = savedLogger, savedCfg, savedWifi, savedVPN, savedNet
-		hotspotMgr, dhcpMgr, iface, jsonOut = savedHotspot, savedDHCP, savedIface, savedJSON
+		hotspotMgr, dhcpMgr, tunnelMgr, iface, jsonOut = savedHotspot, savedDHCP, savedTunnel, savedIface, savedJSON
 		rootCmd.SetArgs(nil)
 	})
 
 	rootCmd.PersistentPreRun = func(*cobra.Command, []string) {
 		logger = fixture.Logger
 		cfgManager, wifiMgr, vpnMgr, netMgr, hotspotMgr, dhcpMgr = fixture.ConfigMgr, fixture.WiFiMgr, fixture.VPNMgr, fixture.NetworkMgr, fixture.HotspotMgr, fixture.DHCPMgr
+		tunnelMgr = fixture.TunnelMgr
 		iface = fixture.Interface
 	}
 
@@ -41,6 +51,7 @@ func runRoot(t *testing.T, args ...string) string {
 	os.Stdout = w
 	defer func() { os.Stdout = origStdout }()
 
+	jsonOut = false // flag values outlive Execute; each run is a fresh process
 	rootCmd.SetArgs(args)
 	execErr := rootCmd.Execute()
 	w.Close()

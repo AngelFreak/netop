@@ -18,6 +18,7 @@ import (
 	"github.com/angelfreak/net/pkg/network"
 	"github.com/angelfreak/net/pkg/portal"
 	"github.com/angelfreak/net/pkg/system"
+	"github.com/angelfreak/net/pkg/tunnel"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/angelfreak/net/pkg/vpn"
 	"github.com/angelfreak/net/pkg/wifi"
@@ -43,6 +44,7 @@ var (
 	netMgr      types.NetworkManager
 	hotspotMgr  types.HotspotManager
 	dhcpMgr     types.DHCPManager
+	tunnelMgr   types.TunnelManager
 )
 
 // rootCmd is the base command when called without any subcommands
@@ -135,7 +137,7 @@ func commandNeedsRootArgs(args []string) bool {
 		}
 		// First positional arg is the subcommand — check if it's root-exempt
 		switch arg {
-		case "help", "completion", "status", "show", "list", "portal", "ai":
+		case "help", "completion", "status", "show", "list", "portal", "ai", "tunnel":
 			return false
 		default:
 			// First positional arg is not exempt, needs root
@@ -282,6 +284,7 @@ func initializeManagers() {
 	vpnMgr = vpnManager
 	hotspotMgr = hotspot.NewHotspotManager(sysExecutor, logger)
 	dhcpMgr = dhcp.NewDHCPManager(sysExecutor, logger)
+	tunnelMgr = tunnel.NewManager(sysExecutor, logger, tunnel.DefaultDir())
 }
 
 // createApp creates an App instance from the global managers for testable execution.
@@ -297,6 +300,7 @@ func createApp() *App {
 		DHCPMgr:    dhcpMgr,
 		PortalDet:  createPortalDetector(),
 		RouteMgr:   netlink.NewRouteManager(),
+		TunnelMgr:  tunnelMgr,
 		Interface:  iface,
 		NoVPN:      noVPN,
 		Debug:      debug,
