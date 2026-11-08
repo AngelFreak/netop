@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/angelfreak/net/pkg/config"
 	"github.com/angelfreak/net/pkg/types"
@@ -60,9 +62,149 @@ func newTailscaleDNSFixture(t *testing.T, cfg *types.VPNConfig, setCmd string) (
 	configMgr := &mockConfigManager{vpnConfigs: map[string]*types.VPNConfig{"ts": cfg}}
 	manager := NewManagerWithDir(seq, &mockLogger{}, configMgr, tmpDir)
 	manager.resolvConfPath = filepath.Join(tmpDir, "resolv.conf")
+	manager.verifyDelay = 0
+	// By default tailscaled took over DNS as it came up.
+	writeResolvConf(t, manager.resolvConfPath, quad100ResolvConf)
 	rec := &immutableRecorder{ran: func() int { return len(seq.executedCommands) }}
 	manager.setImmutable = rec.set
 	return manager, seq, rec
+}
+
+const quad100ResolvConf = "nameserver 100.100.100.100\nsearch example.ts.net\n"
+
+func writeResolvConf(t *testing.T, path, content string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+}
+
+// hookExecutor runs a hook after a matching command, so tests can act out
+// what tailscaled does in response (e.g. rewriting resolv.conf).
+type hookExecutor struct {
+	*sequencingExecutor
+	hooks map[string]func()
+}
+
+func (h *hookExecutor) Execute(cmd string, args ...string) (string, error) {
+	out, err := h.sequencingExecutor.Execute(cmd, args...)
+	if hook := h.hooks[strings.Join(append([]string{cmd}, args...), " ")]; hook != nil {
+		hook()
+	}
+	return out, err
+}
+
+func (h *hookExecutor) ExecuteWithTimeout(_ time.Duration, cmd string, args ...string) (string, error) {
+	return h.Execute(cmd, args...)
+}
+
+type warnRecorder struct {
+	mockLogger
+	warns []string
+}
+
+func (w *warnRecorder) Warn(msg string, _ ...interface{}) { w.warns = append(w.warns, msg) }
+
+const (
+	acceptDNSOff = "tailscale set --accept-dns=false"
+	acceptDNSOn  = "tailscale set --accept-dns=true"
+)
+
+// newGaveUpFixture: Tailscale is up with accept-dns on, but resolv.conf still
+// holds net's servers after connecting. On 2026-10-13 that happened because
+// tailscaled had failed its DNS write while net held the file locked and
+// never retried. Connect now brings a running tailscaled down first, so the
+// "up" is a real transition, but net still checks the result rather than
+// trusting it. reapplies says whether flipping accept-dns off and on makes
+// tailscaled write the file, as it does on the real daemon.
+func newGaveUpFixture(t *testing.T, reapplies bool) (*Manager, *sequencingExecutor, *warnRecorder) {
+	t.Helper()
+	setCmd := "tailscale set --accept-dns=true --exit-node= --accept-routes=false"
+	manager, seq, _ := newTailscaleDNSFixture(t, &types.VPNConfig{Type: "tailscale", AcceptDNS: true}, setCmd)
+	seq.callSequence["tailscale status --json"] = []struct {
+		output string
+		err    error
+	}{
+		{output: `{"BackendState":"Running"}`}, // stop-all sweep: started at boot, brought down
+		{output: `{"BackendState":"Stopped"}`}, // backend state before "up"
+		{output: `{"BackendState":"Running"}`}, // verify after "up"
+	}
+	writeResolvConf(t, manager.resolvConfPath, "nameserver 1.1.1.1\n")
+
+	turnedOff := false
+	manager.executor = &hookExecutor{sequencingExecutor: seq, hooks: map[string]func(){
+		acceptDNSOff: func() { turnedOff = true },
+		acceptDNSOn: func() {
+			if reapplies && turnedOff {
+				writeResolvConf(t, manager.resolvConfPath, quad100ResolvConf)
+			}
+		},
+	}}
+	logger := &warnRecorder{}
+	manager.logger = logger
+	return manager, seq, logger
+}
+
+// When tailscaled has not taken over resolv.conf after connecting, net flips
+// accept-dns off and on: a real pref change that makes it apply DNS again.
+func TestConnectTailscale_AcceptDNSReappliesWhenTailscaledGaveUp(t *testing.T) {
+	manager, seq, _ := newGaveUpFixture(t, true)
+
+	require.NoError(t, manager.Connect("ts"))
+
+	off := slices.Index(seq.executedCommands, acceptDNSOff)
+	on := slices.Index(seq.executedCommands, acceptDNSOn)
+	require.NotEqual(t, -1, off, "accept-dns must be turned off to force a re-apply")
+	assert.Less(t, off, on, "accept-dns must be turned back on after being turned off")
+}
+
+func TestConnectTailscale_AcceptDNSReapplyLeavesTailscaleDNS(t *testing.T) {
+	manager, _, _ := newGaveUpFixture(t, true)
+
+	require.NoError(t, manager.Connect("ts"))
+
+	content, err := os.ReadFile(manager.resolvConfPath)
+	require.NoError(t, err)
+	assert.Equal(t, quad100ResolvConf, string(content))
+}
+
+func TestConnectTailscale_AcceptDNSReappliedSilently(t *testing.T) {
+	manager, _, logger := newGaveUpFixture(t, true)
+
+	require.NoError(t, manager.Connect("ts"))
+
+	assert.Empty(t, logger.warns)
+}
+
+// A tailscaled that wrote DNS itself as it came up must not have its pref
+// bounced: that would needlessly rewrite resolv.conf twice.
+func TestConnectTailscale_AcceptDNSSkipsReapplyWhenAlreadyApplied(t *testing.T) {
+	setCmd := "tailscale set --accept-dns=true --exit-node= --accept-routes=false"
+	manager, seq, _ := newTailscaleDNSFixture(t, &types.VPNConfig{Type: "tailscale", AcceptDNS: true}, setCmd)
+
+	require.NoError(t, manager.Connect("ts"))
+
+	seq.assertCommandNotExecuted(t, acceptDNSOff)
+}
+
+// If tailscaled still does not take over DNS, the tunnel stays up (it works
+// without DNS) but net must not report it as if MagicDNS were working.
+func TestConnectTailscale_AcceptDNSWarnsWhenReapplyFails(t *testing.T) {
+	manager, _, logger := newGaveUpFixture(t, false)
+
+	require.NoError(t, manager.Connect("ts"))
+
+	assert.Len(t, logger.warns, 1)
+}
+
+// Without accept_dns net owns DNS, so resolv.conf not pointing at Tailscale
+// is expected and must not trigger a re-apply.
+func TestConnectTailscale_DefaultNeverReappliesDNS(t *testing.T) {
+	setCmd := "tailscale set --accept-dns=false --exit-node= --accept-routes=false"
+	manager, seq, _ := newTailscaleDNSFixture(t, &types.VPNConfig{Type: "tailscale"}, setCmd)
+	writeResolvConf(t, manager.resolvConfPath, "nameserver 1.1.1.1\n")
+
+	require.NoError(t, manager.Connect("ts"))
+
+	seq.assertCommandNotExecuted(t, acceptDNSOn)
 }
 
 // With accept_dns, Tailscale owns resolv.conf: net turns its DNS on and
@@ -112,6 +254,7 @@ func TestConnectTailscale_AcceptDNSNeedsLoginRestatesPref(t *testing.T) {
 	}}
 	manager := NewManagerWithDir(seq, &mockLogger{}, configMgr, tmpDir)
 	manager.resolvConfPath = filepath.Join(tmpDir, "resolv.conf")
+	writeResolvConf(t, manager.resolvConfPath, quad100ResolvConf)
 	manager.setImmutable = func(string, bool) error { return nil }
 
 	require.NoError(t, manager.Connect("ts"))
