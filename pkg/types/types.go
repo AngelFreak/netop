@@ -519,6 +519,17 @@ type LinkManager interface {
 	SetMTU(iface string, mtu int) error
 }
 
+// RuleManager manages IPv4 policy-routing rules (`ip rule`) via netlink. Write
+// operations require CAP_NET_ADMIN. Implementations must return a clear error
+// (never panic) when netlink is restricted.
+type RuleManager interface {
+	// AddLookupMain adds the rule `to <dst> lookup main priority <priority>`,
+	// where dst is an IPv4 CIDR. An identical existing rule is not an error.
+	AddLookupMain(dst string, priority int) error
+	// DelRules removes every IPv4 rule at priority. Having none is not an error.
+	DelRules(priority int) error
+}
+
 // FirewallManager configures the IPv4 NAT/forwarding rules that let clients on
 // an internal interface (hotspot or DHCP-served) reach the internet through an
 // outbound interface. It wraps iptables (via github.com/coreos/go-iptables),
