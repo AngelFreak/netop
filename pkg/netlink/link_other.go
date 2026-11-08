@@ -37,3 +37,6 @@ func (m *LinkManager) GetPermanentMAC(iface string) (string, error) { return "",
 
 // SetMAC always returns ErrUnsupported on non-Linux platforms.
 func (m *LinkManager) SetMAC(iface, mac string) error { return ErrUnsupported }
+
+// SetMTU always returns ErrUnsupported on non-Linux platforms.
+func (m *LinkManager) SetMTU(iface string, mtu int) error { return ErrUnsupported }

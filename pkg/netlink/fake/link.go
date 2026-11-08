@@ -26,6 +26,7 @@ type LinkManager struct {
 	Deleted     []string
 	AddedWG     []string
 	SetMACCalls []MACCall
+	SetMTUCalls []MTUCall
 
 	SetUpErr      error
 	SetDownErr    error
@@ -36,6 +37,13 @@ type LinkManager struct {
 	GetMACErr     error
 	GetPermMACErr error
 	SetMACErr     error
+	SetMTUErr     error
+}
+
+// MTUCall records the arguments of a single SetMTU invocation.
+type MTUCall struct {
+	Iface string
+	MTU   int
 }
 
 // MACCall records the arguments of a single SetMAC invocation.
@@ -129,5 +137,14 @@ func (m *LinkManager) SetMAC(iface, mac string) error {
 		m.MACs = map[string]string{}
 	}
 	m.MACs[iface] = mac
+	return nil
+}
+
+// SetMTU records the call.
+func (m *LinkManager) SetMTU(iface string, mtu int) error {
+	if m.SetMTUErr != nil {
+		return m.SetMTUErr
+	}
+	m.SetMTUCalls = append(m.SetMTUCalls, MTUCall{Iface: iface, MTU: mtu})
 	return nil
 }

@@ -50,7 +50,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		routeMgr:         netlink.NewRouteManager(),
 		addrMgr:          netlink.NewAddrManager(),
 		linkMgr:          netlink.NewLinkManager(),
-		dnsOwnershipPath: types.RuntimeDir + "/dns-owned",
+		dnsOwnershipPath: types.DNSOwnedPath,
 		resolvConfPath:   "/etc/resolv.conf",
 		setImmutable:     system.SetImmutable,
 		currentMACFn:     readCurrentMAC,
@@ -95,7 +95,7 @@ func (m *Manager) dnsOwnedPath() string {
 	if m.dnsOwnershipPath != "" {
 		return m.dnsOwnershipPath
 	}
-	return types.RuntimeDir + "/dns-owned"
+	return types.DNSOwnedPath
 }
 
 func (m *Manager) markDNSOwned() {
@@ -213,6 +213,13 @@ func (m *Manager) LockDNS() {
 	m.markDNSOwned()
 }
 
+// UnlockDNS undoes LockDNS: the immutable flag comes off and the ownership
+// marker is removed, so an aborted connect leaves no claim on resolv.conf.
+func (m *Manager) UnlockDNS() error {
+	m.clearDNSOwnership()
+	return m.unlockResolvConf()
+}
+
 // unlockResolvConf removes the immutable flag from /etc/resolv.conf natively
 // (replacing `chattr -i`). VPN clients like netbird set this flag and may leave
 // it after disconnecting, which prevents DHCP or net from updating DNS.
@@ -233,6 +240,29 @@ func (m *Manager) resolvConfHasNameserver() bool {
 		}
 	}
 	return false
+}
+
+// GetDNS returns the nameservers currently configured in resolv.conf, in file
+// order. A missing or nameserver-less file is not an error: it yields an empty
+// list, which callers treat as "nothing to restore".
+func (m *Manager) GetDNS() ([]string, error) {
+	output, err := os.ReadFile(m.resolvConf())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading %s: %w", m.resolvConf(), err)
+	}
+	var servers []string
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "nameserver "); ok {
+			if server := strings.TrimSpace(rest); server != "" {
+				servers = append(servers, server)
+			}
+		}
+	}
+	return servers, nil
 }
 
 // SetMAC sets the MAC address for an interface
@@ -833,6 +863,10 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		if err := m.writeFileDirect(m.resolvConf(), "# Waiting for DHCP\n"); err != nil {
 			m.logger.Warn("Failed to clear resolv.conf", "error", err)
 		}
+		// Hand DNS to the DHCP client: while the previous connection's
+		// ownership marker exists, net's DHCP hooks skip the lease's servers.
+		// LockDNS below takes ownership again once they are written.
+		m.clearDNSOwnership()
 	}
 
 	// Connect to WiFi if SSID is specified

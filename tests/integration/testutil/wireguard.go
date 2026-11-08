@@ -6,8 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/curve25519"
@@ -78,24 +78,21 @@ func (wg *WireGuardInterface) create() error {
 		return fmt.Errorf("failed to create interface: %v", err)
 	}
 
-	// Write private key to temp file
-	keyFile, err := os.CreateTemp("", "wg-key-*")
-	if err != nil {
-		return fmt.Errorf("failed to create key file: %v", err)
-	}
-	defer os.Remove(keyFile.Name())
-	defer keyFile.Close()
-
-	if _, err := keyFile.WriteString(wg.PrivateKey); err != nil {
-		return fmt.Errorf("failed to write private key: %v", err)
-	}
-	keyFile.Close()
-
-	// Set the private key
+	// Feed the private key through stdin rather than a temp file. `wg` opens
+	// the path itself, so a temp file has to be readable by whichever uid and
+	// namespace `wg` ends up in; under `sudo go test` + `ip netns exec` that
+	// failed with a bare "fopen: Permission denied" naming no path. /dev/stdin
+	// removes the filesystem from the equation.
 	if wg.ns != nil {
-		err = wg.ns.Exec("wg", "set", wg.Name, "private-key", keyFile.Name())
+		err = wg.ns.ExecStdin(wg.PrivateKey+"\n", "wg", "set", wg.Name, "private-key", "/dev/stdin")
 	} else {
-		err = exec.Command("wg", "set", wg.Name, "private-key", keyFile.Name()).Run()
+		cmd := exec.Command("wg", "set", wg.Name, "private-key", "/dev/stdin")
+		cmd.Stdin = strings.NewReader(wg.PrivateKey + "\n")
+		var out []byte
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			err = fmt.Errorf("%v\noutput: %s", err, string(out))
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("failed to set private key: %v", err)
