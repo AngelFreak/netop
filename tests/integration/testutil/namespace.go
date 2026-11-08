@@ -6,10 +6,16 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
+
+// nsCounter makes namespace names unique within a test binary, where every
+// test shares the same PID.
+var nsCounter atomic.Uint64
 
 // TestNamespace represents an isolated network namespace for testing.
 // Each test gets its own namespace to avoid affecting the host network.
@@ -25,12 +31,17 @@ func NewTestNamespace(t *testing.T) *TestNamespace {
 	SkipIfNotRoot(t)
 	SkipIfNoNetNS(t)
 
-	// Generate unique namespace name based on test name
-	name := fmt.Sprintf("netop-test-%d", unix.Getpid())
+	// Unique per namespace, not just per process: every test in a package
+	// shares one PID, so a PID-only name collides the moment two namespaces
+	// are live at once (parallel tests, or a cleanup that did not run) and
+	// `ip netns add` fails with "File exists". The counter makes each name
+	// distinct; the PID keeps packages, which run as separate binaries in
+	// parallel, from colliding with each other.
+	name := fmt.Sprintf("netop-test-%d-%d", unix.Getpid(), nsCounter.Add(1))
 
 	// Create the namespace
-	if err := exec.Command("ip", "netns", "add", name).Run(); err != nil {
-		t.Fatalf("failed to create network namespace %s: %v", name, err)
+	if out, err := exec.Command("ip", "netns", "add", name).CombinedOutput(); err != nil {
+		t.Fatalf("failed to create network namespace %s: %v\noutput: %s", name, err, string(out))
 	}
 
 	ns := &TestNamespace{
@@ -58,6 +69,23 @@ func (ns *TestNamespace) cleanup() {
 func (ns *TestNamespace) Exec(name string, args ...string) error {
 	cmdArgs := append([]string{"netns", "exec", ns.Name, name}, args...)
 	cmd := exec.Command("ip", cmdArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("command %q in namespace %s failed: %v\noutput: %s",
+			name, ns.Name, err, string(output))
+	}
+	return nil
+}
+
+// ExecStdin runs a command inside the network namespace, feeding stdin to it.
+//
+// This exists for `wg set ... private-key /dev/stdin`: passing the key through
+// stdin avoids a temp file that the command would have to open itself, which
+// is a permission failure waiting to happen across the sudo/netns boundary.
+func (ns *TestNamespace) ExecStdin(stdin string, name string, args ...string) error {
+	cmdArgs := append([]string{"netns", "exec", ns.Name, name}, args...)
+	cmd := exec.Command("ip", cmdArgs...)
+	cmd.Stdin = strings.NewReader(stdin)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("command %q in namespace %s failed: %v\noutput: %s",

@@ -1936,3 +1936,20 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureNoCounterNoClaim(t *testing.
 	assert.NotContains(t, err.Error(), "802.1X")
 	assert.NotContains(t, err.Error(), "frames were received")
 }
+
+func TestUnlockDNS_ClearsImmutableFlagAndOwnership(t *testing.T) {
+	// The inverse of LockDNS: an aborted connect must leave neither the
+	// immutable bit nor the ownership marker behind, otherwise a later
+	// `net stop` believes netop owns resolv.conf and overwrites it.
+	rec := &immutableRecorder{}
+	resolv := filepath.Join(t.TempDir(), "resolv.conf")
+	owned := filepath.Join(t.TempDir(), "dns-owned")
+	manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: newStrictMockExecutor(), logger: &mockLogger{}, setImmutable: rec.set, resolvConfPath: resolv, dnsOwnershipPath: owned}
+
+	manager.LockDNS()
+	assert.True(t, manager.isDNSOwned())
+
+	assert.NoError(t, manager.UnlockDNS())
+	assert.True(t, rec.sawUnlock(resolv))
+	assert.False(t, manager.isDNSOwned(), "ownership marker must be removed")
+}
