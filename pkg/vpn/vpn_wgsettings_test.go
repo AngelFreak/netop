@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -148,9 +149,11 @@ func (f *fakeNetworkManager) GetMAC(iface string) (string, error)               
 func (f *fakeNetworkManager) SetIP(iface, addr, gateway string, metric int) error { return nil }
 func (f *fakeNetworkManager) AddRoute(iface, destination, gateway string) error   { return nil }
 func (f *fakeNetworkManager) FlushRoutes(iface string) error                      { return nil }
-func (f *fakeNetworkManager) StartDHCP(iface string, hostname string) error       { return nil }
-func (f *fakeNetworkManager) DHCPRenew(iface string, hostname string) error       { return nil }
-func (f *fakeNetworkManager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
+func (f *fakeNetworkManager) StartDHCP(_ context.Context, iface string, hostname string) error {
+	return nil
+}
+func (f *fakeNetworkManager) DHCPRenew(iface string, hostname string) error { return nil }
+func (f *fakeNetworkManager) ConnectToConfiguredNetwork(_ context.Context, config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	return nil
 }
 func (f *fakeNetworkManager) GetConnectionInfo(iface string) (*types.Connection, error) {

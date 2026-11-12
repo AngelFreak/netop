@@ -3,6 +3,7 @@
 package dhcpclient
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -127,7 +128,15 @@ func (m *Manager) getDhclientTimeout() time.Duration {
 //
 // Each attempt is retried once on failure with a short delay, mirroring
 // NetworkManager's autoconnect-retries default.
-func (m *Manager) Acquire(iface string, hostname string) error {
+//
+// ctx ends the acquisition early: cancelling it (an interrupt) kills the
+// running client and skips the retry, so cleanup does not race a second
+// attempt (#89).
+func (m *Manager) Acquire(ctx context.Context, iface string, hostname string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Validate interface name to prevent command injection
 	if err := types.ValidateInterfaceName(iface); err != nil {
 		return fmt.Errorf("invalid interface: %w", err)
@@ -155,15 +164,15 @@ func (m *Manager) Acquire(iface string, hostname string) error {
 	switch {
 	case isWiredInterface(iface) && hasDhclient:
 		m.logger.Debug("Using dhclient for DHCP on wired interface", "interface", iface)
-		attempt = func() error { return m.acquireDhclient(iface, hostname) }
+		attempt = func() error { return m.acquireDhclient(ctx, iface, hostname) }
 		window = m.getDhclientTimeout()
 	case hasUdhcpc:
 		m.logger.Debug("Using udhcpc for DHCP", "interface", iface)
-		attempt = func() error { return m.acquireUdhcpc(iface, hostname) }
+		attempt = func() error { return m.acquireUdhcpc(ctx, iface, hostname) }
 		window = m.getUdhcpcTimeout()
 	case hasDhclient:
 		m.logger.Debug("Using dhclient for DHCP", "interface", iface)
-		attempt = func() error { return m.acquireDhclient(iface, hostname) }
+		attempt = func() error { return m.acquireDhclient(ctx, iface, hostname) }
 		window = m.getDhclientTimeout()
 	default:
 		return fmt.Errorf("no DHCP client found: install udhcpc (recommended) or dhclient")
@@ -173,17 +182,19 @@ func (m *Manager) Acquire(iface string, hostname string) error {
 	// silent 60s stalls, which reads as a hang rather than as discovery.
 	m.logger.Info(fmt.Sprintf("Requesting DHCP lease (attempt 1 of 2, up to %s)", window),
 		"interface", iface)
-	if err := attempt(); err == nil {
-		return nil
-	} else {
-		m.logger.Warn(fmt.Sprintf("DHCP attempt 1 failed, retrying (attempt 2 of 2, up to %s)", window),
-			"interface", iface, "error", err)
-		time.Sleep(RetryDelay)
-		if retryErr := attempt(); retryErr != nil {
-			return retryErr
-		}
+	err := attempt()
+	if err == nil {
 		return nil
 	}
+	if ctx.Err() != nil {
+		return err // interrupted: no retry
+	}
+	m.logger.Warn(fmt.Sprintf("DHCP attempt 1 failed, retrying (attempt 2 of 2, up to %s)", window),
+		"interface", iface, "error", err)
+	if sleepErr := system.Sleep(ctx, RetryDelay); sleepErr != nil {
+		return fmt.Errorf("DHCP retry abandoned: %w", sleepErr)
+	}
+	return attempt()
 }
 
 // isWiredInterface returns true if the interface name matches a wired prefix.
@@ -266,7 +277,8 @@ func (m *Manager) Release(iface string) error {
 // For simplicity, this performs a fresh acquisition (same behavior as original implementation).
 func (m *Manager) Renew(iface string, hostname string) error {
 	m.logger.Info("Renewing DHCP lease", "interface", iface)
-	return m.Acquire(iface, hostname)
+	// `net dhcp` registers no interrupt cleanups, so nothing races it.
+	return m.Acquire(context.Background(), iface, hostname)
 }
 
 // prepareUdhcpcScript writes net's udhcpc event script and checks that it
@@ -455,7 +467,7 @@ func (m *Manager) udhcpcPidFile(iface string) string {
 // The default BusyBox build sends only 3 DISCOVERs at 3s intervals (~9s
 // window), which is too short for many USB ethernet adapters, so -t/-T
 // widen the discovery window to ~18s, closer to dhclient's default.
-func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
+func (m *Manager) acquireUdhcpc(ctx context.Context, iface string, hostname string) error {
 	// Release any existing clients first
 	m.Release(iface)
 
@@ -485,7 +497,7 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 		args = append(args, "-x", "hostname:"+hostname)
 	}
 
-	_, err := m.executor.ExecuteWithTimeout(m.getUdhcpcTimeout(), "udhcpc", args...)
+	_, err := system.ExecuteWithin(ctx, m.executor, m.getUdhcpcTimeout(), "udhcpc", args...)
 	if err != nil {
 		// Clean up any partial state on failure
 		m.Release(iface)
@@ -497,7 +509,7 @@ func (m *Manager) acquireUdhcpc(iface string, hostname string) error {
 }
 
 // acquireDhclient uses dhclient (ISC) as fallback
-func (m *Manager) acquireDhclient(iface string, hostname string) error {
+func (m *Manager) acquireDhclient(ctx context.Context, iface string, hostname string) error {
 	// Release any existing clients first
 	m.Release(iface)
 
@@ -531,7 +543,7 @@ func (m *Manager) acquireDhclient(iface string, hostname string) error {
 	// the default 30s command timeout SIGKILLs the `timeout` process before
 	// dhclient's own window elapses — SIGKILL can't be forwarded, so dhclient
 	// is orphaned and any lease past 30s is silently lost. Give a 5s margin.
-	_, err := m.executor.ExecuteWithTimeout(dhclientTimeout+5*time.Second, "timeout", args...)
+	_, err := system.ExecuteWithin(ctx, m.executor, dhclientTimeout+5*time.Second, "timeout", args...)
 	if err != nil {
 		// Clean up any partial state on failure
 		m.Release(iface)

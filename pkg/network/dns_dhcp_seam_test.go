@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,7 +78,7 @@ type scriptedDHCPClient struct {
 	onAcquire func()
 }
 
-func (c *scriptedDHCPClient) Acquire(iface, hostname string) error {
+func (c *scriptedDHCPClient) Acquire(_ context.Context, iface, hostname string) error {
 	c.onAcquire()
 	return nil
 }
@@ -105,7 +106,7 @@ func TestConnectToConfiguredNetwork_DHCPDNSAfterOwnedDNSTakesLeaseServers(t *tes
 			wifi := &mockWiFiManagerImpl{onConnect: func() error { lease(); return nil }}
 			manager.dhcpClient = &scriptedDHCPClient{onAcquire: lease}
 
-			require.NoError(t, manager.ConnectToConfiguredNetwork(tc.config, "", wifi))
+			require.NoError(t, manager.ConnectToConfiguredNetwork(context.Background(), tc.config, "", wifi))
 			assert.Equal(t, "\nnameserver 217.26.160.4\n", got, "the lease's DNS must be written")
 			assert.True(t, manager.resolvConfHasNameserver())
 		})

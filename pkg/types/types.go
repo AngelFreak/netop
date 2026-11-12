@@ -311,8 +311,10 @@ type PortalDetector interface {
 // WiFiManager handles WiFi operations
 type WiFiManager interface {
 	Scan() ([]WiFiNetwork, error)
-	Connect(ssid, password, hostname string) error
-	ConnectWithBSSID(ssid, password, bssid, hostname string) error
+	// Connect and ConnectWithBSSID associate and obtain a lease. Cancelling ctx
+	// ends them promptly and tears down the half-made connection.
+	Connect(ctx context.Context, ssid, password, hostname string) error
+	ConnectWithBSSID(ctx context.Context, ssid, password, bssid, hostname string) error
 	Disconnect() error
 	ListConnections() ([]Connection, error)
 	GetInterface() string
@@ -348,9 +350,11 @@ type NetworkManager interface {
 	SetIP(iface, addr, gateway string, metric int) error
 	AddRoute(iface, destination, gateway string) error
 	FlushRoutes(iface string) error
-	StartDHCP(iface string, hostname string) error
+	StartDHCP(ctx context.Context, iface string, hostname string) error
 	DHCPRenew(iface string, hostname string) error
-	ConnectToConfiguredNetwork(config *NetworkConfig, password string, wifiMgr WiFiManager) error
+	// ConnectToConfiguredNetwork brings up a configured network. Cancelling ctx
+	// ends it promptly and stops before addresses, routes and DNS.
+	ConnectToConfiguredNetwork(ctx context.Context, config *NetworkConfig, password string, wifiMgr WiFiManager) error
 	GetConnectionInfo(iface string) (*Connection, error)
 	// Disconnect releases DHCP, flushes addresses/routes, and brings the link down
 	// for a single interface. Safe to call on an already-down interface.
@@ -400,7 +404,9 @@ type DHCPManager interface {
 // DHCPClientManager handles DHCP client operations (obtaining leases from a server)
 // This is distinct from DHCPManager which handles DHCP server operations
 type DHCPClientManager interface {
-	Acquire(iface string, hostname string) error
+	// Acquire obtains a lease on iface. Cancelling ctx kills the running client
+	// and skips the retry.
+	Acquire(ctx context.Context, iface string, hostname string) error
 	Release(iface string) error
 	Renew(iface string, hostname string) error
 }

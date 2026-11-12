@@ -1,6 +1,7 @@
 package dhcpclient
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,7 +75,7 @@ func newHookTestManager(t *testing.T) (*Manager, *mockExecutor) {
 func TestAcquire_DhclientInstallsEnterHook(t *testing.T) {
 	manager, executor := newHookTestManager(t)
 
-	require.NoError(t, manager.Acquire("eth0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "eth0", ""))
 
 	hook := filepath.Join(manager.hooksDir, DhclientEnterHookName)
 	content, err := os.ReadFile(hook)
@@ -92,7 +93,7 @@ func TestAcquire_DhclientWithoutHooksDirStillRuns(t *testing.T) {
 	manager, executor := newHookTestManager(t)
 	manager.hooksDir = filepath.Join(manager.hooksDir, "missing")
 
-	require.NoError(t, manager.Acquire("eth0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "eth0", ""))
 
 	_, err := os.Stat(manager.hooksDir)
 	assert.True(t, os.IsNotExist(err), "net must not create the hooks dir")
@@ -104,7 +105,7 @@ func TestAcquire_DhclientRefusesSharedHooksDir(t *testing.T) {
 	manager, executor := newHookTestManager(t)
 	require.NoError(t, os.Chmod(manager.hooksDir, 0777))
 
-	require.NoError(t, manager.Acquire("eth0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "eth0", ""))
 
 	_, err := os.Stat(filepath.Join(manager.hooksDir, DhclientEnterHookName))
 	assert.True(t, os.IsNotExist(err))

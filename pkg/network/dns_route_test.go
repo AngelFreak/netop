@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -42,7 +43,7 @@ func connectWithLease(t *testing.T, routes *fake.RouteManager, config *types.Net
 	}
 	wifi := &mockWiFiManagerImpl{onConnect: func() error { lease(); return nil }}
 	manager.dhcpClient = &scriptedDHCPClient{onAcquire: lease}
-	require.NoError(t, manager.ConnectToConfiguredNetwork(config, "", wifi))
+	require.NoError(t, manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifi))
 }
 
 func TestConnectToConfiguredNetwork_ShadowedDHCPDNSIsRoutedViaConnectedInterface(t *testing.T) {

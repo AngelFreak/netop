@@ -3,6 +3,7 @@
 package wifi
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +82,7 @@ func TestWiFiConnect_Integration(t *testing.T) {
 	manager := NewManager(executor, &testLogger{t: t}, clientRadio.Interface, nil) // nil for DHCP manager
 
 	t.Run("connect to WPA2 network", func(t *testing.T) {
-		err := manager.Connect("ConnectTestAP", "securepassword", "")
+		err := manager.Connect(context.Background(), "ConnectTestAP", "securepassword", "")
 		if err != nil {
 			// Connection might fail in hwsim environment, log but don't fail
 			t.Logf("Connection attempt result: %v", err)
@@ -177,7 +178,7 @@ func TestWiFiBSSIDPinning_Integration(t *testing.T) {
 	manager := NewManager(executor, &testLogger{t: t}, clientRadio.Interface, nil)
 
 	// Try to connect with BSSID
-	err = manager.Connect("BSSIDTestAP", "testpassword", bssid)
+	err = manager.Connect(context.Background(), "BSSIDTestAP", "testpassword", bssid)
 	if err != nil {
 		t.Logf("BSSID connection attempt: %v", err)
 	}

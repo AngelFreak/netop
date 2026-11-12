@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"net"
@@ -53,6 +54,9 @@ type Manager struct {
 	// a net.InterfaceByName lookup; overridable in tests, which have no real
 	// interface to read.
 	currentMACFn func(iface string) string
+	// hasCarrierFn reports whether an interface has link carrier. Defaults to
+	// a sysfs read; overridable in tests, which have no real interface.
+	hasCarrierFn func(iface string) bool
 }
 
 // NewManager creates a new network manager
@@ -69,6 +73,7 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		setImmutable:     system.SetImmutable,
 		rxPacketsFn:      rxPackets,
 		currentMACFn:     readCurrentMAC,
+		hasCarrierFn:     hasCarrier,
 	}
 }
 
@@ -561,8 +566,8 @@ func (m *Manager) SetHostname(hostname string) error {
 
 // StartDHCP performs initial DHCP lease acquisition
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname
-func (m *Manager) StartDHCP(iface string, hostname string) error {
-	return m.dhcpClient.Acquire(iface, hostname)
+func (m *Manager) StartDHCP(ctx context.Context, iface string, hostname string) error {
+	return m.dhcpClient.Acquire(ctx, iface, hostname)
 }
 
 // DHCPRenew performs DHCP renewal
@@ -579,7 +584,7 @@ func (m *Manager) DHCPRenew(iface string, hostname string) error {
 }
 
 // detectInterface detects the appropriate network interface for the given configuration
-func (m *Manager) detectInterface(config *types.NetworkConfig) string {
+func (m *Manager) detectInterface(ctx context.Context, config *types.NetworkConfig) string {
 	if config.Interface != "" {
 		m.logger.Debug("Using configured interface", "interface", config.Interface)
 		return config.Interface
@@ -649,7 +654,7 @@ func (m *Manager) detectInterface(config *types.NetworkConfig) string {
 				continue
 			}
 			// Poll for carrier detection (up to 3 seconds, 100ms intervals)
-			if m.waitForCarrier(candidate, 3*time.Second) {
+			if m.waitForCarrier(ctx, candidate, 3*time.Second) {
 				m.logger.Info("Detected wired interface with carrier after bringing up", "interface", candidate)
 				return candidate
 			}
@@ -885,15 +890,21 @@ func atomicWrite(path, content string) error {
 
 // waitForCarrier polls for carrier detection on an interface
 // Returns true if carrier is detected within the timeout, false otherwise
-func (m *Manager) waitForCarrier(iface string, timeout time.Duration) bool {
+func (m *Manager) waitForCarrier(ctx context.Context, iface string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	pollInterval := 100 * time.Millisecond
+	carrier := m.hasCarrierFn
+	if carrier == nil {
+		carrier = hasCarrier
+	}
 
 	for time.Now().Before(deadline) {
-		if hasCarrier(iface) {
+		if carrier(iface) {
 			return true
 		}
-		time.Sleep(pollInterval)
+		if system.Sleep(ctx, pollInterval) != nil {
+			return false
+		}
 	}
 	return false
 }
@@ -952,13 +963,21 @@ func (m *Manager) describeDHCPSilence(rx int64) string {
 }
 
 // ConnectToConfiguredNetwork connects to a network based on the provided configuration
-func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
+//
+// Cancelling ctx (an interrupt) ends the connect promptly at whichever step
+// it is in (carrier wait, settle delay, association, DHCP) and stops before
+// any later step (addresses, routes, DNS), so interrupt cleanup undoes a
+// settled connect instead of racing it (#89).
+func (m *Manager) ConnectToConfiguredNetwork(ctx context.Context, config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	// Detect interface if not configured
 	if config.Interface == "" {
-		config.Interface = m.detectInterface(config)
+		config.Interface = m.detectInterface(ctx, config)
 		if config.Interface == "" {
 			return fmt.Errorf("no suitable interface detected for network configuration")
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	m.logger.Debug("Connecting to configured network", "interface", config.Interface, "ssid", config.SSID, "addr", config.Addr)
@@ -1014,12 +1033,12 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		// Use BSSID pinning if ap-addr is configured
 		if config.ApAddr != "" {
 			m.logger.Info("Using AP address pinning", "bssid", config.ApAddr)
-			err := wifiMgr.ConnectWithBSSID(config.SSID, password, config.ApAddr, config.Hostname)
+			err := wifiMgr.ConnectWithBSSID(ctx, config.SSID, password, config.ApAddr, config.Hostname)
 			if err != nil {
 				return fmt.Errorf("failed to connect to WiFi: %w", err)
 			}
 		} else {
-			err := wifiMgr.Connect(config.SSID, password, config.Hostname)
+			err := wifiMgr.Connect(ctx, config.SSID, password, config.Hostname)
 			if err != nil {
 				return fmt.Errorf("failed to connect to WiFi: %w", err)
 			}
@@ -1058,14 +1077,19 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 			}
 
 			// Wait for link carrier before starting DHCP (poll up to 5 seconds)
-			if !m.waitForCarrier(config.Interface, 5*time.Second) {
+			if !m.waitForCarrier(ctx, config.Interface, 5*time.Second) {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				m.logger.Warn("No carrier detected on interface, proceeding anyway", "interface", config.Interface)
 			}
 
 			// USB ethernet adapters frequently report carrier=1 before they
 			// can reliably forward L2 frames; sleeping briefly avoids losing
 			// the first DHCP DISCOVER. See wiredSettleDelay docs.
-			time.Sleep(wiredSettleDelay)
+			if err := system.Sleep(ctx, wiredSettleDelay); err != nil {
+				return err
+			}
 
 			if config.Addr == "" {
 				m.logger.Info("Obtaining DHCP lease on wired interface", "interface", config.Interface)
@@ -1073,7 +1097,11 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				// arrived while DHCP was running, the port never forwarded to
 				// us, which is a different problem from a silent DHCP server.
 				rxBefore := m.rxCount(config.Interface)
-				err := m.StartDHCP(config.Interface, config.Hostname)
+				err := m.StartDHCP(ctx, config.Interface, config.Hostname)
+				if err != nil && ctx.Err() != nil {
+					// Interrupted, not a silent DHCP server: no diagnosis.
+					return fmt.Errorf("DHCP on %s interrupted: %w", config.Interface, err)
+				}
 				if err != nil {
 					// Surface the failure instead of reporting a successful
 					// connection with no lease. The WiFi path already errors
@@ -1094,6 +1122,12 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 				m.applyDefaultRouteMetric(config.Interface, config.DefaultRouteMetric())
 			}
 		}
+	}
+
+	// The link is up. Stop here if interrupted, before addresses, routes and
+	// DNS, so cleanup does not race them.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Set static IP if configured

@@ -315,7 +315,7 @@ type mockDHCPClient struct {
 	renewErr   error
 }
 
-func (m *mockDHCPClient) Acquire(iface string, hostname string) error {
+func (m *mockDHCPClient) Acquire(_ context.Context, iface string, hostname string) error {
 	return m.acquireErr
 }
 
@@ -740,7 +740,7 @@ func TestStartDHCP(t *testing.T) {
 		dhcpClient := &mockDHCPClient{}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), dhcpClient: dhcpClient}
 
-		err := manager.StartDHCP("wlan0", "test-hostname")
+		err := manager.StartDHCP(context.Background(), "wlan0", "test-hostname")
 		assert.NoError(t, err)
 	})
 
@@ -748,7 +748,7 @@ func TestStartDHCP(t *testing.T) {
 		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhcp failed")}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), dhcpClient: dhcpClient}
 
-		err := manager.StartDHCP("wlan0", "")
+		err := manager.StartDHCP(context.Background(), "wlan0", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "dhcp failed")
 	})
@@ -1005,7 +1005,7 @@ func TestDetectInterface(t *testing.T) {
 	t.Run("configured interface", func(t *testing.T) {
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), logger: &mockLogger{}}
 		config := &types.NetworkConfig{Interface: "eth0"}
-		result := manager.detectInterface(config)
+		result := manager.detectInterface(context.Background(), config)
 		assert.Equal(t, "eth0", result)
 	})
 
@@ -1014,7 +1014,7 @@ func TestDetectInterface(t *testing.T) {
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}}
 		config := &types.NetworkConfig{SSID: "test-network"}
 		// This will try to detect from actual system interfaces
-		result := manager.detectInterface(config)
+		result := manager.detectInterface(context.Background(), config)
 		// Result could be empty or a detected interface
 		assert.True(t, result == "" || len(result) > 0)
 	})
@@ -1024,7 +1024,7 @@ func TestDetectInterface(t *testing.T) {
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), executor: executor, logger: &mockLogger{}}
 		config := &types.NetworkConfig{}
 		// This will try to detect from actual system interfaces
-		result := manager.detectInterface(config)
+		result := manager.detectInterface(context.Background(), config)
 		// Result could be empty or a detected interface
 		assert.True(t, result == "" || len(result) > 0)
 	})
@@ -1052,7 +1052,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			logger:   logger,
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifiManager)
 		assert.NoError(t, err)
 		// Verify MAC was set before connection (critical ordering)
 		assert.Contains(t, links.SetMACCalls, fake.MACCall{Iface: "wlan0", MAC: "aa:bb:cc:dd:ee:ff"})
@@ -1075,7 +1075,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			logger:   logger,
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifiManager)
 		assert.NoError(t, err)
 	})
 
@@ -1094,7 +1094,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			// No SSID means wired, no Addr means DHCP
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 		// Verify interface was brought up
 		assert.Contains(t, links.Upped, "eth0")
@@ -1118,7 +1118,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			Interface: "eth0",
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 
 		// Stale state is flushed before the interface is brought up: address
@@ -1140,7 +1140,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			Gateway:   "192.168.1.1",
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 		// Static address added via the AddrManager.
 		assert.Contains(t, addrs.Added, fake.AddrCall{Iface: "eth0", CIDR: "192.168.1.100/24"})
@@ -1163,7 +1163,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			Routes:    []string{"default", "10.0.0.0/24 -> 192.168.1.254"},
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 		// Custom route added via the RouteManager.
 		assert.Contains(t, routes.Added, fake.AddCall{Iface: "eth0", Destination: "10.0.0.0/24", Gw: "192.168.1.254"})
@@ -1188,7 +1188,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			DNS:       []string{"8.8.8.8", "1.1.1.1"},
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 	})
 
@@ -1214,7 +1214,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			DNS:       []string{"dhcp"},
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 
 		got, readErr := os.ReadFile(resolv)
@@ -1259,7 +1259,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			PSK:       "password",
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifiManager)
 		assert.NoError(t, err)
 
 		// Verify the sequence: unlock -> clear -> (DHCP via wifi connect) -> lock
@@ -1284,7 +1284,7 @@ func TestConnectToConfiguredNetwork(t *testing.T) {
 			// Auto-detect may succeed or fail depending on system
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		// If no wired interface is detected, should error
 		// If one is found, it will try DHCP which may fail
 		// Either way, this tests the flow doesn't panic with nil config.Interface
@@ -1309,14 +1309,14 @@ func (m *mockWiFiManagerImpl) Scan() ([]types.WiFiNetwork, error) {
 	return nil, nil
 }
 
-func (m *mockWiFiManagerImpl) Connect(ssid, password, hostname string) error {
+func (m *mockWiFiManagerImpl) Connect(_ context.Context, ssid, password, hostname string) error {
 	if m.onConnect != nil {
 		return m.onConnect()
 	}
 	return nil
 }
 
-func (m *mockWiFiManagerImpl) ConnectWithBSSID(ssid, password, bssid, hostname string) error {
+func (m *mockWiFiManagerImpl) ConnectWithBSSID(_ context.Context, ssid, password, bssid, hostname string) error {
 	return nil
 }
 
@@ -1408,7 +1408,7 @@ func TestStartDHCP_ErrorPath(t *testing.T) {
 		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhclient failed")}
 		manager := &Manager{routeMgr: newFakeRoutes(), addrMgr: newFakeAddrs(), linkMgr: newFakeLinks(), dhcpClient: dhcpClient}
 
-		err := manager.StartDHCP("eth0", "")
+		err := manager.StartDHCP(context.Background(), "eth0", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "dhclient failed")
 	})
@@ -1436,7 +1436,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureReturnsError(t *testing.T) {
 
 	config := &types.NetworkConfig{Interface: "eth0"} // wired: no SSID, no static Addr
 
-	err := manager.ConnectToConfiguredNetwork(config, "", nil)
+	err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
 }
@@ -1612,7 +1612,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			MAC:       "aa:bb:cc:dd:ee:ff",
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to set MAC")
 	})
@@ -1635,7 +1635,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 
 		wifiManager := &mockWiFiManagerFailing{}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifiManager)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to connect to WiFi")
 	})
@@ -1659,7 +1659,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 
 		wifiManager := &mockWiFiManagerFailing{}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifiManager)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to connect to WiFi")
 	})
@@ -1677,7 +1677,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 			Gateway:   "192.168.1.1",
 		}
 
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to set IP")
 	})
@@ -1701,7 +1701,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 		}
 
 		// Should warn but not fail
-		err := manager.ConnectToConfiguredNetwork(config, "", nil)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 		assert.NoError(t, err)
 	})
 
@@ -1721,7 +1721,7 @@ func TestConnectToConfiguredNetwork_ErrorPaths(t *testing.T) {
 		wifiManager := &mockWiFiManagerImpl{executor: executor, logger: logger}
 
 		// Password should come from config.PSK when empty
-		err := manager.ConnectToConfiguredNetwork(config, "", wifiManager)
+		err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", wifiManager)
 		assert.NoError(t, err)
 	})
 }
@@ -1804,11 +1804,11 @@ func (m *mockWiFiManagerFailing) Scan() ([]types.WiFiNetwork, error) {
 	return nil, assert.AnError
 }
 
-func (m *mockWiFiManagerFailing) Connect(ssid, password, hostname string) error {
+func (m *mockWiFiManagerFailing) Connect(_ context.Context, ssid, password, hostname string) error {
 	return assert.AnError
 }
 
-func (m *mockWiFiManagerFailing) ConnectWithBSSID(ssid, password, bssid, hostname string) error {
+func (m *mockWiFiManagerFailing) ConnectWithBSSID(_ context.Context, ssid, password, bssid, hostname string) error {
 	return assert.AnError
 }
 
@@ -1927,7 +1927,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureReportsBlockingLayer(t *test
 		rxPacketsFn:  func(string) int64 { return 0 }, // port not forwarding
 	}
 
-	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+	err := manager.ConnectToConfiguredNetwork(context.Background(), &types.NetworkConfig{Interface: "eth0"}, "", nil)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
@@ -1952,7 +1952,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureL2Alive(t *testing.T) {
 		}(),
 	}
 
-	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+	err := manager.ConnectToConfiguredNetwork(context.Background(), &types.NetworkConfig{Interface: "eth0"}, "", nil)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "128 frames were received")
@@ -1971,7 +1971,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureNoCounterNoClaim(t *testing.
 		rxPacketsFn:  func(string) int64 { return -1 }, // unreadable
 	}
 
-	err := manager.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0"}, "", nil)
+	err := manager.ConnectToConfiguredNetwork(context.Background(), &types.NetworkConfig{Interface: "eth0"}, "", nil)
 
 	assert.Error(t, err)
 	assert.NotContains(t, err.Error(), "802.1X")
@@ -2018,7 +2018,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureDiagnosesRandomizedMAC(t *te
 	// mac: default -> randomized Apple-OUI MAC, as `common: mac: default` yields.
 	config := &types.NetworkConfig{Interface: "eth0", MAC: "default"}
 
-	err := manager.ConnectToConfiguredNetwork(config, "", nil)
+	err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
@@ -2048,7 +2048,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureNoMACAdviceWhenPermanent(t *
 
 	config := &types.NetworkConfig{Interface: "eth0", MAC: "permanent"}
 
-	err := manager.ConnectToConfiguredNetwork(config, "", nil)
+	err := manager.ConnectToConfiguredNetwork(context.Background(), config, "", nil)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to obtain DHCP lease")
@@ -2116,7 +2116,7 @@ func randomizedMACManager(rx func(string) int64) *Manager {
 func TestConnectToConfiguredNetwork_WiredDHCPFailureBlockedPortSkipsMACHint(t *testing.T) {
 	m := randomizedMACManager(func(string) int64 { return 0 })
 
-	err := m.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0", MAC: "default"}, "", nil)
+	err := m.ConnectToConfiguredNetwork(context.Background(), &types.NetworkConfig{Interface: "eth0", MAC: "default"}, "", nil)
 
 	if !assert.Error(t, err) {
 		return
@@ -2131,7 +2131,7 @@ func TestConnectToConfiguredNetwork_WiredDHCPFailureL2AliveAddsMACHint(t *testin
 	n := int64(1000)
 	m := randomizedMACManager(func(string) int64 { n += 64; return n })
 
-	err := m.ConnectToConfiguredNetwork(&types.NetworkConfig{Interface: "eth0", MAC: "default"}, "", nil)
+	err := m.ConnectToConfiguredNetwork(context.Background(), &types.NetworkConfig{Interface: "eth0", MAC: "default"}, "", nil)
 
 	if !assert.Error(t, err) {
 		return

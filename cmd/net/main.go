@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -207,14 +206,14 @@ func main() {
 	// cleanupRegistry.register call sites in app.go) — read-only commands
 	// register nothing, so interrupting a scan/list/status leaves a healthy
 	// connection untouched.
-	ctx, cancel := context.WithCancel(context.Background())
+	//
+	// The handler cancels the in-flight command first (it runs under
+	// defaultCleanups' context), waits for it to return, and only then runs
+	// the cleanups, so they undo a settled state instead of racing it (#89).
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		// stage 2 propagates ctx to running executor calls so cleanup runs
-		// against a settled command; cancel now so nothing new starts.
-		cancel()
 		fmt.Fprintln(os.Stderr, "interrupt received, cleaning up")
 		// A second signal during cleanup means the user wants out now —
 		// abandon remaining cleanup and exit immediately.
@@ -222,10 +221,9 @@ func main() {
 			<-sigCh
 			os.Exit(130)
 		}()
-		defaultCleanups.run(5 * time.Second)
+		defaultCleanups.handleInterrupt(5*time.Second, 5*time.Second)
 		os.Exit(130) // Standard exit code for SIGINT
 	}()
-	_ = ctx // stage 2 will pass this to ExecuteContext for cooperative cancel
 
 	if err := rootCmd.Execute(); err != nil {
 		// Every command uses Run (not RunE), so an Execute error is a
