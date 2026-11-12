@@ -109,6 +109,11 @@ func (ns *TestNamespace) ExecOutput(name string, args ...string) (string, error)
 // Run executes a function inside the network namespace.
 // This uses setns to switch the current thread to the namespace.
 // Note: The function runs in a locked OS thread to ensure namespace isolation.
+//
+// The goroutine exits without unlocking, so the runtime terminates the
+// thread. Unlocking would hand a thread still inside the test namespace back
+// to the scheduler, and a later exec.Command forked from it would run there
+// (e.g. `ip link add` creating a veth pair in a stale namespace).
 func (ns *TestNamespace) Run(fn func()) error {
 	// Get the namespace file descriptor
 	nsPath := fmt.Sprintf("/var/run/netns/%s", ns.Name)
@@ -116,9 +121,9 @@ func (ns *TestNamespace) Run(fn func()) error {
 	errCh := make(chan error, 1)
 
 	go func() {
-		// Lock this goroutine to its OS thread so setns only affects this thread
+		// Lock this goroutine to its OS thread so setns only affects this
+		// thread. Deliberately never unlocked: see above.
 		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
 
 		// Open the namespace
 		fd, err := unix.Open(nsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
