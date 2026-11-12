@@ -9,6 +9,9 @@ on:
 jobs:
   integration:
     runs-on: ubuntu-latest
+    # Fail fast instead of the 6h default if the runner loses connectivity (#66).
+    # Covers the 10m go test timeout below plus setup.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
@@ -70,6 +73,8 @@ jobs:
   # Separate job for tests that don't need special capabilities
   integration-basic:
     runs-on: ubuntu-latest
+    # Fail fast instead of the 6h default if the runner loses connectivity (#66).
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
