@@ -22,6 +22,15 @@ import (
 // can shrink it without affecting production behavior.
 var wiredSettleDelay = 1500 * time.Millisecond
 
+// defaultResolvConf and defaultDNSOwned are the files a Manager uses unless a
+// test sets its own. Package variables only so this package's TestMain can
+// point them at a temp dir: CI runs these tests as root, and a test that
+// reached the real resolv.conf cut the runner off from GitHub (#66).
+var (
+	defaultResolvConf = "/etc/resolv.conf"
+	defaultDNSOwned   = types.DNSOwnedPath
+)
+
 // Manager implements the NetworkManager interface
 type Manager struct {
 	executor         types.SystemExecutor
@@ -55,8 +64,8 @@ func NewManager(executor types.SystemExecutor, logger types.Logger, dhcpClient t
 		routeMgr:         netlink.NewRouteManager(),
 		addrMgr:          netlink.NewAddrManager(),
 		linkMgr:          netlink.NewLinkManager(),
-		dnsOwnershipPath: types.DNSOwnedPath,
-		resolvConfPath:   "/etc/resolv.conf",
+		dnsOwnershipPath: defaultDNSOwned,
+		resolvConfPath:   defaultResolvConf,
 		setImmutable:     system.SetImmutable,
 		rxPacketsFn:      rxPackets,
 		currentMACFn:     readCurrentMAC,
@@ -68,7 +77,7 @@ func (m *Manager) resolvConf() string {
 	if m.resolvConfPath != "" {
 		return m.resolvConfPath
 	}
-	return "/etc/resolv.conf"
+	return defaultResolvConf
 }
 
 // immutable applies the immutable flag via the injected setter (defaults to
@@ -101,7 +110,7 @@ func (m *Manager) dnsOwnedPath() string {
 	if m.dnsOwnershipPath != "" {
 		return m.dnsOwnershipPath
 	}
-	return types.DNSOwnedPath
+	return defaultDNSOwned
 }
 
 func (m *Manager) markDNSOwned() {

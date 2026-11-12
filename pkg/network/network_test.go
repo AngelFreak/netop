@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/angelfreak/net/pkg/netlink/fake"
+	"github.com/angelfreak/net/pkg/system"
 	"github.com/angelfreak/net/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -47,7 +48,29 @@ func TestMain(m *testing.M) {
 	// hardware workaround that adds 1.5s per wired connect path and would
 	// inflate test runtime.
 	wiredSettleDelay = 0
-	os.Exit(m.Run())
+	os.Exit(runWithTestDNSFiles(m))
+}
+
+// The package defaults as production sets them, captured before
+// runWithTestDNSFiles replaces them.
+var productionResolvConf, productionDNSOwned = defaultResolvConf, defaultDNSOwned
+
+// runWithTestDNSFiles points the default resolv.conf and DNS-ownership marker
+// at a temp dir for the whole run, so no test touches the host's DNS (#66).
+func runWithTestDNSFiles(m *testing.M) int {
+	dir, err := os.MkdirTemp("", "netop-network-test-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "creating test DNS dir: %v\n", err)
+		return 1
+	}
+	defaultResolvConf = filepath.Join(dir, "resolv.conf")
+	defaultDNSOwned = filepath.Join(dir, "dns-owned")
+	defer func() {
+		// Running as root, a test may have locked the file immutable.
+		_ = system.SetImmutable(defaultResolvConf, false)
+		_ = os.RemoveAll(dir)
+	}()
+	return m.Run()
 }
 
 // immutableRecorder records lock/unlock intent. The immutable flag on
@@ -508,7 +531,7 @@ func TestDHCPRenew_UnlocksResolvConf(t *testing.T) {
 
 	err := manager.DHCPRenew("eth0", "")
 	assert.NoError(t, err)
-	assert.True(t, rec.sawUnlock("/etc/resolv.conf"), "DHCPRenew must unlock resolv.conf")
+	assert.True(t, rec.sawUnlock(manager.resolvConf()), "DHCPRenew must unlock resolv.conf")
 	assert.False(t, manager.isDNSOwned(), "ownership must be released so DHCP DNS takes effect")
 }
 
