@@ -400,7 +400,9 @@ type DHCPManager interface {
 // DHCPClientManager handles DHCP client operations (obtaining leases from a server)
 // This is distinct from DHCPManager which handles DHCP server operations
 type DHCPClientManager interface {
-	Acquire(iface string, hostname string) error
+	// Acquire obtains a lease on iface. Cancelling ctx kills the running client
+	// and skips the retry.
+	Acquire(ctx context.Context, iface string, hostname string) error
 	Release(iface string) error
 	Renew(iface string, hostname string) error
 }

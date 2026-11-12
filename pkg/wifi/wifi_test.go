@@ -127,7 +127,7 @@ type mockDHCPClient struct {
 	renewErr   error
 }
 
-func (m *mockDHCPClient) Acquire(iface string, hostname string) error {
+func (m *mockDHCPClient) Acquire(_ context.Context, iface string, hostname string) error {
 	return m.acquireErr
 }
 

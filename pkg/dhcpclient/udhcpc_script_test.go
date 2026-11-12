@@ -1,6 +1,7 @@
 package dhcpclient
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -176,7 +177,7 @@ func TestAcquire_UdhcpcUsesNetScript(t *testing.T) {
 	manager, tmp := newScriptTestManager(t, executor)
 	scriptPath := manager.scriptDir + "/udhcpc.script"
 
-	require.NoError(t, manager.Acquire("wlan0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "wlan0", ""))
 
 	executor.assertCommandExecuted(t, udhcpcCmd(tmp)+" -s "+scriptPath)
 	probeIdx := slices.Index(executor.executedCmds, scriptPath+" probe")
@@ -200,7 +201,7 @@ func TestAcquire_UdhcpcFallsBackWhenScriptCannotRun(t *testing.T) {
 	manager, tmp := newScriptTestManager(t, executor)
 	executor.errors[manager.scriptDir+"/udhcpc.script probe"] = errors.New("fork/exec: permission denied")
 
-	require.NoError(t, manager.Acquire("wlan0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "wlan0", ""))
 	assert.Contains(t, executor.executedCmds, udhcpcCmd(tmp))
 	executor.assertCommandNotExecuted(t, " -s ")
 }
@@ -213,7 +214,7 @@ func TestAcquire_UdhcpcFallsBackWhenScriptDirUnwritable(t *testing.T) {
 	require.NoError(t, os.WriteFile(blocker, nil, 0600))
 	manager.scriptDir = filepath.Join(blocker, "lib")
 
-	require.NoError(t, manager.Acquire("wlan0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "wlan0", ""))
 	assert.Contains(t, executor.executedCmds, udhcpcCmd(tmp))
 }
 
@@ -226,7 +227,7 @@ func TestAcquire_UdhcpcRefusesSharedScriptDir(t *testing.T) {
 	require.NoError(t, os.MkdirAll(manager.scriptDir, 0755))
 	require.NoError(t, os.Chmod(manager.scriptDir, 0777))
 
-	require.NoError(t, manager.Acquire("wlan0", ""))
+	require.NoError(t, manager.Acquire(context.Background(), "wlan0", ""))
 	assert.Contains(t, executor.executedCmds, udhcpcCmd(tmp))
 	executor.assertCommandNotExecuted(t, " -s ")
 }

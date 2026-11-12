@@ -39,7 +39,7 @@ type mockExecutor struct {
 	errors       map[string]error
 	hasCommands  map[string]bool
 	executedCmds []string
-	// timeoutByCmd records the deadline passed to ExecuteWithTimeout, keyed by
+	// timeoutByCmd records the deadline a command ran under (see recordTimeout), keyed by
 	// the full command string, so tests can assert the executor deadline.
 	timeoutByCmd map[string]time.Duration
 }
@@ -66,16 +66,25 @@ func (m *mockExecutor) Execute(cmd string, args ...string) (string, error) {
 }
 
 func (m *mockExecutor) ExecuteContext(ctx context.Context, cmd string, args ...string) (string, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		m.recordTimeout(cmd, args, time.Until(deadline))
+	}
 	return m.Execute(cmd, args...)
 }
 
 func (m *mockExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
+	m.recordTimeout(cmd, args, timeout)
+	return m.Execute(cmd, args...)
+}
+
+// recordTimeout stores the deadline a command ran under: the timeout given to
+// ExecuteWithTimeout, or what remained of the context's deadline for
+// ExecuteContext.
+func (m *mockExecutor) recordTimeout(cmd string, args []string, timeout time.Duration) {
 	if m.timeoutByCmd == nil {
 		m.timeoutByCmd = make(map[string]time.Duration)
 	}
-	fullCmd := strings.TrimSpace(cmd + " " + strings.Join(args, " "))
-	m.timeoutByCmd[fullCmd] = timeout
-	return m.Execute(cmd, args...)
+	m.timeoutByCmd[strings.TrimSpace(cmd+" "+strings.Join(args, " "))] = timeout
 }
 
 func (m *mockExecutor) ExecuteWithInput(cmd string, input string, args ...string) (string, error) {
@@ -161,7 +170,7 @@ func TestAcquire_ValidatesInterfaceName(t *testing.T) {
 			manager := NewManager(executor, logger)
 			manager.hooksDir = t.TempDir()
 
-			err := manager.Acquire(tt.iface, "")
+			err := manager.Acquire(context.Background(), tt.iface, "")
 			if tt.expectErr {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), "invalid interface")
@@ -204,7 +213,7 @@ func TestAcquire_ValidatesHostname(t *testing.T) {
 			manager := NewManager(executor, logger)
 			manager.hooksDir = t.TempDir()
 
-			err := manager.Acquire("wlan0", tt.hostname)
+			err := manager.Acquire(context.Background(), "wlan0", tt.hostname)
 			if tt.expectErr {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), "invalid hostname")
@@ -233,7 +242,7 @@ func TestAcquire_UsesUdhcpcWhenAvailable(t *testing.T) {
 	manager.runtimeDir = tmp
 	manager.scriptDir = tmp + "/lib"
 
-	err := manager.Acquire("wlan0", "")
+	err := manager.Acquire(context.Background(), "wlan0", "")
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "udhcpc -i wlan0 -n -p "+tmp+"/udhcpc.wlan0.pid -R -B -t 6 -T 3 -A 10 -s "+tmp+"/lib/udhcpc.script")
 	// Note: pkill for dhclient is still called during Release() cleanup,
@@ -255,7 +264,7 @@ func TestAcquire_UsesDhclientAsFallback(t *testing.T) {
 	manager := NewManager(executor, logger)
 	manager.hooksDir = t.TempDir()
 
-	err := manager.Acquire("wlan0", "")
+	err := manager.Acquire(context.Background(), "wlan0", "")
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "dhclient -v -1 wlan0")
 }
@@ -272,7 +281,7 @@ func TestAcquireDhclient_ExecutorDeadlineExceedsInnerTimeout(t *testing.T) {
 	manager := NewManager(executor, &mockLogger{})
 	manager.hooksDir = t.TempDir()
 
-	err := manager.Acquire("wlan0", "")
+	err := manager.Acquire(context.Background(), "wlan0", "")
 	assert.NoError(t, err)
 
 	got := executor.timeoutByCmd["timeout 60 dhclient -v -1 wlan0"]
@@ -296,7 +305,7 @@ func TestAcquire_WithHostname_Udhcpc(t *testing.T) {
 	manager.runtimeDir = tmp
 	manager.scriptDir = tmp + "/lib"
 
-	err := manager.Acquire("wlan0", "myhost")
+	err := manager.Acquire(context.Background(), "wlan0", "myhost")
 	assert.NoError(t, err)
 	executor.assertCommandExecuted(t, "hostname:myhost")
 }
@@ -319,7 +328,7 @@ func TestAcquire_WithHostname_Dhclient(t *testing.T) {
 	manager.runtimeDir = tmp
 	manager.scriptDir = tmp + "/lib"
 
-	err := manager.Acquire("wlan0", "myhost")
+	err := manager.Acquire(context.Background(), "wlan0", "myhost")
 	assert.NoError(t, err)
 	// The dhclient config (written natively) is referenced via -cf.
 	executor.assertCommandExecuted(t, "-cf "+conf)
@@ -361,8 +370,8 @@ func TestAcquire_InterfaceSpecificConfigPath(t *testing.T) {
 	manager2 := NewManager(executor2, logger2)
 	manager2.runtimeDir = tmp2
 
-	err1 := manager1.Acquire("eth0", "host1")
-	err2 := manager2.Acquire("wlan0", "host2")
+	err1 := manager1.Acquire(context.Background(), "eth0", "host1")
+	err2 := manager2.Acquire(context.Background(), "wlan0", "host2")
 
 	assert.NoError(t, err1)
 	assert.NoError(t, err2)
@@ -385,7 +394,7 @@ func TestAcquire_DhcpClientFails(t *testing.T) {
 	manager := NewManager(executor, logger)
 	manager.hooksDir = t.TempDir()
 
-	err := manager.Acquire("wlan0", "")
+	err := manager.Acquire(context.Background(), "wlan0", "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dhclient failed")
 }
@@ -576,7 +585,7 @@ func TestAcquire_DhclientConfigCreationFailure(t *testing.T) {
 	manager.runtimeDir = filepath.Join(t.TempDir(), "does-not-exist")
 
 	// When hostname is specified, config creation failure should be a hard error
-	err := manager.Acquire("wlan0", "myhost")
+	err := manager.Acquire(context.Background(), "wlan0", "myhost")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to create dhclient config")
 }
@@ -599,7 +608,7 @@ func TestAcquire_CleansUpOnUdhcpcFailure(t *testing.T) {
 	manager.runtimeDir = tmp
 	manager.scriptDir = tmp + "/lib"
 
-	err := manager.Acquire("wlan0", "")
+	err := manager.Acquire(context.Background(), "wlan0", "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "udhcpc failed")
 
@@ -629,7 +638,7 @@ func TestAcquire_CleansUpOnDhclientFailure(t *testing.T) {
 	manager := NewManager(executor, logger)
 	manager.hooksDir = t.TempDir()
 
-	err := manager.Acquire("wlan0", "")
+	err := manager.Acquire(context.Background(), "wlan0", "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dhclient failed")
 
@@ -717,7 +726,7 @@ func TestAcquire_AnnouncesAttemptWindow(t *testing.T) {
 	logger := &mockLogger{}
 	m := &Manager{executor: executor, logger: logger}
 
-	err := m.Acquire("eth0", "")
+	err := m.Acquire(context.Background(), "eth0", "")
 	assert.Error(t, err)
 
 	all := strings.Join(append(append([]string{}, logger.infoMsgs...), logger.warnMsgs...), "\n")

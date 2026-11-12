@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"net"
@@ -562,7 +563,7 @@ func (m *Manager) SetHostname(hostname string) error {
 // StartDHCP performs initial DHCP lease acquisition
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname
 func (m *Manager) StartDHCP(iface string, hostname string) error {
-	return m.dhcpClient.Acquire(iface, hostname)
+	return m.dhcpClient.Acquire(context.Background(), iface, hostname)
 }
 
 // DHCPRenew performs DHCP renewal

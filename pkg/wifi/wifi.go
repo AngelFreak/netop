@@ -1,6 +1,7 @@
 package wifi
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -586,7 +587,7 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 }
 
 func (m *Manager) obtainDHCP(hostname string) error {
-	return m.dhcpClient.Acquire(m.iface, hostname)
+	return m.dhcpClient.Acquire(context.Background(), m.iface, hostname)
 }
 
 func (m *Manager) getCurrentSSID() (string, error) {

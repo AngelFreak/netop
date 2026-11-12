@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,7 +78,7 @@ type scriptedDHCPClient struct {
 	onAcquire func()
 }
 
-func (c *scriptedDHCPClient) Acquire(iface, hostname string) error {
+func (c *scriptedDHCPClient) Acquire(_ context.Context, iface, hostname string) error {
 	c.onAcquire()
 	return nil
 }
