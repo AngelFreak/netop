@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -333,6 +332,15 @@ func (a *App) RunConnect(name, password string) error {
 	// deregister funcs; settled() drops them at establishment so an interrupt
 	// during the portal check or VPN bring-up keeps the connection (VPN-failure
 	// semantics), and the defer covers error returns.
+	//
+	// The connect runs under the registry's interrupt context, so an
+	// interrupt cancels it rather than racing it (#89). The handler waits for
+	// this run to end before undoing it, and a cancelled run keeps its
+	// cleanups registered for the handler instead of dropping them on the
+	// error return.
+	reg := a.cleanupRegistry()
+	ctx := reg.context()
+	defer reg.begin()()
 	var undo []func()
 	settled := func() {
 		for _, deregister := range undo {
@@ -340,9 +348,13 @@ func (a *App) RunConnect(name, password string) error {
 		}
 		undo = nil
 	}
-	defer settled()
+	defer func() {
+		if ctx.Err() == nil {
+			settled()
+		}
+	}()
 	registerCleanup := func(name string, fn func()) {
-		undo = append(undo, a.cleanupRegistry().register(name, fn))
+		undo = append(undo, reg.register(name, fn))
 	}
 
 	// Disconnect any active VPN before connecting to new network
@@ -403,7 +415,7 @@ func (a *App) RunConnect(name, password string) error {
 		// flushes addrs/routes, brings the iface down, and removes the temp
 		// wpa config.
 		registerCleanup("abort-connect", func() { _ = a.WiFiMgr.Disconnect() })
-		err = a.WiFiMgr.Connect(context.Background(), name, password, "")
+		err = a.WiFiMgr.Connect(ctx, name, password, "")
 		if err != nil {
 			a.Logger.Error("Failed to connect to WiFi", "error", err)
 			a.errorf("Error: %v\n", err)
@@ -463,7 +475,7 @@ func (a *App) RunConnect(name, password string) error {
 			}
 		})
 		registerCleanup("unlock-resolv.conf", func() { _ = a.NetworkMgr.UnlockDNS() })
-		err = a.NetworkMgr.ConnectToConfiguredNetwork(context.Background(), networkConfig, password, a.WiFiMgr)
+		err = a.NetworkMgr.ConnectToConfiguredNetwork(ctx, networkConfig, password, a.WiFiMgr)
 		if err != nil {
 			a.Logger.Error("Failed to connect to configured network", "error", err)
 			a.errorf("Error: %v\n", err)
