@@ -52,27 +52,39 @@ fi
 
 # Install default config if it doesn't already exist
 if [ ! -f "$CONFIG_FILE" ]; then
-    if [ -f ".net/config.yaml" ]; then
-        echo "Installing default config to: $CONFIG_FILE"
-        cp ".net/config.yaml" "$CONFIG_FILE"
-        echo "Default configuration installed. Edit $CONFIG_FILE to customize your settings."
+    if [ -f "config.example" ]; then
+        echo "Installing example config to: $CONFIG_FILE"
+        # Owner-only: the config holds WiFi passwords and VPN keys.
+        install -m 600 "config.example" "$CONFIG_FILE"
+        echo "Example configuration installed. Edit $CONFIG_FILE and replace the placeholders"
+        echo "(networks, passwords, VPN keys) with your own settings."
     else
-        echo "Warning: Default config file (.net/config.yaml) not found. Skipping config installation."
+        echo "Warning: config.example not found (run this script from the repository root). Skipping config installation."
     fi
 else
     echo "Existing config found at $CONFIG_FILE - not overwriting."
 fi
 
-# Check for dhclient (DHCP client)
-echo "Checking for dhclient..."
-if ! command -v dhclient &> /dev/null; then
-    echo "Warning: dhclient not found."
-    echo "Please install isc-dhcp-client:"
-    echo "  Debian/Ubuntu: sudo apt install isc-dhcp-client"
+# Check for a DHCP client: net uses udhcpc (BusyBox) or dhclient, whichever
+# is installed, preferring udhcpc on WiFi and dhclient on wired. Both live in
+# sbin, which is on root's PATH (net runs as root) but often not on a user's,
+# so look there too.
+has_root_cmd() {
+    PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin" command -v "$1" &> /dev/null
+}
+echo "Checking for a DHCP client..."
+if has_root_cmd udhcpc || has_root_cmd dhclient; then
+    for client in udhcpc dhclient; do
+        if has_root_cmd "$client"; then
+            echo "$client is available."
+        fi
+    done
+else
+    echo "Warning: no DHCP client found. net needs udhcpc or dhclient:"
+    echo "  Debian/Ubuntu: sudo apt install udhcpc        (or isc-dhcp-client)"
+    echo "  Alpine:        included in busybox"
     echo "  Fedora/RHEL:   sudo dnf install dhcp-client"
     echo "  Arch:          sudo pacman -S dhclient"
-else
-    echo "dhclient is available."
 fi
 
 echo ""

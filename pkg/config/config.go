@@ -640,7 +640,7 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 	}
 
 	var config types.Config
-	if err := v.Unmarshal(&config); err != nil {
+	if err := v.Unmarshal(&config, decodeOptions); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
@@ -682,7 +682,7 @@ func (m *Manager) LoadConfig(path string) (*types.Config, error) {
 			subV := v.Sub(topKey)
 			if subV != nil {
 				var netConfig types.NetworkConfig
-				if err := subV.Unmarshal(&netConfig); err == nil {
+				if err := subV.Unmarshal(&netConfig, decodeOptions); err == nil {
 					config.Networks[topKey] = netConfig
 					if m.logger != nil {
 						m.logger.Debug("Loaded network config", "network", topKey)
@@ -779,7 +779,7 @@ func (m *Manager) GetNetworkConfig(name string) (*types.NetworkConfig, error) {
 
 	var netConfig types.NetworkConfig
 
-	if err := subV.Unmarshal(&netConfig); err != nil {
+	if err := subV.Unmarshal(&netConfig, decodeOptions); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal network config '%s': %w", name, err)
 	}
 
@@ -830,7 +830,7 @@ func (m *Manager) resolveAlias(name string, maxDepth int) (*types.NetworkConfig,
 
 	// Found a real config — unmarshal it
 	var netConfig types.NetworkConfig
-	if err := subV.Unmarshal(&netConfig); err != nil {
+	if err := subV.Unmarshal(&netConfig, decodeOptions); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal network config '%s': %w", name, err)
 	}
 	return &netConfig, nil
