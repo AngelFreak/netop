@@ -101,28 +101,43 @@ func TestHWSimGuardSkipsRatherThanFails(t *testing.T) {
 // that thread is reused by later goroutines, and an `exec.Command("ip", "link",
 // "add", ...)` forked from it creates the link inside a stale test namespace.
 // That broke AddVethPair in whichever test ran next ("failed to move
-// veth-ns-dns to namespace"). A goroutine that exits while still locked has
-// its thread terminated, so the thread Run used must disappear.
+// veth-ns-dns to namespace").
+//
+// A goroutine that exits while still locked has its thread terminated, except
+// the main thread (tid == pid), which the runtime parks forever instead. So
+// across several Runs at most one may land on the main thread, and every
+// other thread must exit. Without the fix, threads survive or the main thread
+// is reused, and this fails either way.
 func TestRunDoesNotReturnItsThreadToThePool(t *testing.T) {
 	SkipIfNotRoot(t)
 	SkipIfNoNetNS(t)
 
 	ns := NewTestNamespace(t)
-	var tid int
-	if err := ns.Run(func() { tid = unix.Gettid() }); err != nil {
-		t.Fatalf("Run: %v", err)
+	pid := unix.Getpid()
+	onMain := 0
+	for i := 0; i < 3; i++ {
+		var tid int
+		if err := ns.Run(func() { tid = unix.Gettid() }); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if tid == pid {
+			onMain++
+			continue
+		}
+		// The thread exits just after Run's result is sent, so wait for it.
+		task := fmt.Sprintf("/proc/self/task/%d", tid)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(task); os.IsNotExist(err) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("thread %d that entered namespace %s is still alive: Run returned it to the scheduler", tid, ns.Name)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-
-	// The thread exits just after Run's result is sent, so wait for it.
-	task := fmt.Sprintf("/proc/self/task/%d", tid)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(task); os.IsNotExist(err) {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("thread %d that entered namespace %s is still alive: Run returned it to the scheduler", tid, ns.Name)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if onMain > 1 {
+		t.Fatalf("Run used the main thread %d times: it was returned to the scheduler instead of parked", onMain)
 	}
 }
