@@ -197,7 +197,12 @@ type testNetworkManager struct {
 	connectionErr   error
 	disconnected    []string // interfaces passed to Disconnect, in order
 	unlockDNSCalled bool
-	lockDNSHook     func() // runs inside LockDNS, to model an interrupt there
+	lockDNSHook     func()   // runs inside LockDNS, to model an interrupt there
+	pinnedDNSRoutes []string // interfaces passed to PinDNSRoutes, in order
+}
+
+func (n *testNetworkManager) PinDNSRoutes(iface string) {
+	n.pinnedDNSRoutes = append(n.pinnedDNSRoutes, iface)
 }
 
 func (n *testNetworkManager) UnlockDNS() error {
@@ -2281,4 +2286,19 @@ func TestApp_RunVPN_InterruptLeavesWiFiAlone(t *testing.T) {
 			assert.False(t, netMgr.unlockDNSCalled)
 		})
 	}
+}
+
+// An unconfigured (plain SSID) network takes DNS from DHCP like any other, so
+// its lease's DNS servers need the same protection against an overlapping
+// local subnet as a configured network's.
+func TestApp_RunConnect_PlainSSIDPinsDHCPDNSRoutesOnWiFiInterface(t *testing.T) {
+	app, _, _ := newTestApp()
+	app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+	netMgr := &testNetworkManager{}
+	app.NetworkMgr = netMgr
+	wifi := &testWiFiManager{}
+	app.WiFiMgr = wifi
+
+	require.NoError(t, app.RunConnect("RegHGaest", ""))
+	assert.Equal(t, []string{wifi.GetInterface()}, netMgr.pinnedDNSRoutes)
 }
