@@ -97,11 +97,3 @@ func TestAI_JSONModeEmitsGuide(t *testing.T) {
 	assert.Equal(t, "ai", env.Command)
 	assert.Contains(t, string(env.Data), "--json")
 }
-
-// TestAI_DocFileMatchesGuide keeps docs/AI.md honest: it is generated from
-// the same source, so a drifted checked-in copy fails here.
-func TestAI_DocFileMatchesGuide(t *testing.T) {
-	onDisk, err := readDocsAI()
-	require.NoError(t, err, "docs/AI.md must exist; regenerate with: go generate ./cmd/net")
-	assert.Equal(t, aiGuide(), onDisk, "docs/AI.md is stale; regenerate with: go generate ./cmd/net")
-}

@@ -1,19 +1,13 @@
 package main
 
-//go:generate go run . ai --write-docs
-
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
-
-// docsAIPath is the checked-in copy of the guide, relative to the repo root.
-const docsAIPath = "docs/AI.md"
 
 // aiCommandNote is the per-command guidance the cobra tree cannot supply:
 // what the command changes on the system, and what an agent should watch out
@@ -135,40 +129,6 @@ func aiCommandLines() []string {
 	return lines
 }
 
-// findDocsAI locates the checked-in guide by searching upward from the
-// working directory, so both the test and `go generate` (which runs in
-// cmd/net) find the repo-root copy.
-func findDocsAI() (string, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	for {
-		candidate := filepath.Join(dir, docsAIPath)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("%s not found from working directory", docsAIPath)
-		}
-		dir = parent
-	}
-}
-
-// readDocsAI reads the checked-in guide.
-func readDocsAI() (string, error) {
-	path, err := findDocsAI()
-	if err != nil {
-		return "", err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
 // RunAI prints the agent guide. It touches no managers and no config, so it
 // works before anything is configured and without privileges.
 func (a *App) RunAI() error {
@@ -189,18 +149,6 @@ the privilege rule, and what each command changes on the system.
 
 Needs no privileges and no config file.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if write, _ := cmd.Flags().GetBool("write-docs"); write {
-			path, err := findDocsAI()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(exitFailed)
-			}
-			if err := os.WriteFile(path, []byte(aiGuide()), 0o644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(exitFailed)
-			}
-			return
-		}
 		if err := createApp().RunAI(); err != nil {
 			os.Exit(exitCode(err))
 		}
@@ -208,7 +156,5 @@ Needs no privileges and no config file.`,
 }
 
 func init() {
-	aiCmd.Flags().Bool("write-docs", false, "Write the guide to "+docsAIPath+" (used by go generate)")
-	_ = aiCmd.Flags().MarkHidden("write-docs")
 	rootCmd.AddCommand(aiCmd)
 }
