@@ -417,6 +417,9 @@ func (a *App) RunConnect(name, password string) error {
 		registerCleanup("abort-connect", func() { _ = a.WiFiMgr.Disconnect() })
 		err = a.WiFiMgr.Connect(ctx, name, password, "")
 		if err != nil {
+			if ctx.Err() != nil {
+				return err // interrupted: the handler reports it and cleans up
+			}
 			a.Logger.Error("Failed to connect to WiFi", "error", err)
 			a.errorf("Error: %v\n", err)
 			return err
@@ -477,6 +480,9 @@ func (a *App) RunConnect(name, password string) error {
 		registerCleanup("unlock-resolv.conf", func() { _ = a.NetworkMgr.UnlockDNS() })
 		err = a.NetworkMgr.ConnectToConfiguredNetwork(ctx, networkConfig, password, a.WiFiMgr)
 		if err != nil {
+			if ctx.Err() != nil {
+				return err // interrupted: the handler reports it and cleans up
+			}
 			a.Logger.Error("Failed to connect to configured network", "error", err)
 			a.errorf("Error: %v\n", err)
 			return err

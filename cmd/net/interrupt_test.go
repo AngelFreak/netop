@@ -207,3 +207,27 @@ func TestHandleInterrupt_RunsCleanupsAfterTheWaitBudget(t *testing.T) {
 
 	assert.True(t, ran)
 }
+
+// The interrupt handler already says "interrupt received, cleaning up"; the
+// cancelled connect must not add an error message for it.
+func TestRunConnect_InterruptedConnectPrintsNoError(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		log := &eventLog{}
+		reg := &cleanupRegistry{}
+		app, _, stderr := newTestApp()
+		app.cleanups = reg
+		app.NoVPN = true
+		entered := make(chan struct{})
+		if configured {
+			app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkConfig: &types.NetworkConfig{}}
+			app.NetworkMgr = &stuckNetwork{log: log, entered: entered}
+		} else {
+			app.ConfigMgr = &testConfigManager{config: &types.Config{}, networkErr: errors.New("not found")}
+			app.WiFiMgr = &stuckWiFi{log: log, entered: entered}
+		}
+
+		interruptDuring(t, reg, entered, log, func() error { return app.RunConnect("Cafe", "") })
+
+		assert.NotContains(t, stderr.String(), "Error", "configured=%v", configured)
+	}
+}
