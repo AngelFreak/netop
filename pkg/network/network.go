@@ -1015,12 +1015,12 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 		// Use BSSID pinning if ap-addr is configured
 		if config.ApAddr != "" {
 			m.logger.Info("Using AP address pinning", "bssid", config.ApAddr)
-			err := wifiMgr.ConnectWithBSSID(config.SSID, password, config.ApAddr, config.Hostname)
+			err := wifiMgr.ConnectWithBSSID(context.Background(), config.SSID, password, config.ApAddr, config.Hostname)
 			if err != nil {
 				return fmt.Errorf("failed to connect to WiFi: %w", err)
 			}
 		} else {
-			err := wifiMgr.Connect(config.SSID, password, config.Hostname)
+			err := wifiMgr.Connect(context.Background(), config.SSID, password, config.Hostname)
 			if err != nil {
 				return fmt.Errorf("failed to connect to WiFi: %w", err)
 			}

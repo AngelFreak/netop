@@ -94,6 +94,12 @@ func (r *recordingExecutor) Execute(cmd string, args ...string) (string, error) 
 	return r.mockSystemExecutor.Execute(cmd, args...)
 }
 
+// ExecuteContext records too: the connect path runs its commands under a
+// context (#89), and the embedded mock's ExecuteContext would bypass Execute.
+func (r *recordingExecutor) ExecuteContext(_ context.Context, cmd string, args ...string) (string, error) {
+	return r.ExecuteWithTimeout(0, cmd, args...)
+}
+
 func (r *recordingExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {
 	fullCmd := cmd
 	for _, arg := range args {
@@ -256,7 +262,7 @@ SSID: OtherSSID`,
 		manager.routeMgr = &fake.RouteManager{}
 		manager.runtimeDir = tmp
 
-		err := manager.Connect("TestSSID", "password", "")
+		err := manager.Connect(context.Background(), "TestSSID", "password", "")
 		assert.NoError(t, err)
 	})
 
@@ -283,7 +289,7 @@ SSID: OtherSSID`,
 		manager.routeMgr = &fake.RouteManager{}
 		manager.runtimeDir = tmp
 
-		err := manager.Connect("TestSSID", "password", "")
+		err := manager.Connect(context.Background(), "TestSSID", "password", "")
 		assert.NoError(t, err)
 	})
 
@@ -307,7 +313,7 @@ SSID: OtherSSID`,
 		manager.runtimeDir = tmp
 		manager.associationTimeout = 1 * time.Second // Short timeout for test
 
-		err := manager.Connect("UnavailableSSID", "password", "")
+		err := manager.Connect(context.Background(), "UnavailableSSID", "password", "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "timeout waiting for association")
 	})
@@ -329,7 +335,7 @@ freq: 2412
 	manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 	manager.linkMgr = &fake.LinkManager{}
 
-	err := manager.Connect("WEPNetwork", "password", "")
+	err := manager.Connect(context.Background(), "WEPNetwork", "password", "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "WEP networks are not supported")
 }
@@ -359,7 +365,7 @@ func TestConnectFlushesStaleStateBeforeConnect(t *testing.T) {
 	manager.routeMgr = routes
 	manager.runtimeDir = tmp
 
-	err := manager.Connect("TestSSID", "password", "")
+	err := manager.Connect(context.Background(), "TestSSID", "password", "")
 	assert.NoError(t, err)
 
 	// Verify stale addresses and routes were flushed via the netlink managers.
@@ -637,7 +643,7 @@ freq: 5180
 			logger:   &mockLogger{},
 			linkMgr:  &fake.LinkManager{},
 		}
-		security := manager.detectNetworkSecurity("MyWPA3AP")
+		security := manager.detectNetworkSecurity(context.Background(), "MyWPA3AP")
 		assert.Equal(t, "WPA3", security)
 	})
 
@@ -661,7 +667,7 @@ freq: 2412
 			logger:   &mockLogger{},
 			linkMgr:  &fake.LinkManager{},
 		}
-		security := manager.detectNetworkSecurity("TransitionAP")
+		security := manager.detectNetworkSecurity(context.Background(), "TransitionAP")
 		assert.Equal(t, "WPA2/WPA3", security)
 	})
 
@@ -687,7 +693,7 @@ freq: 2412
 			logger:   &mockLogger{},
 			linkMgr:  &fake.LinkManager{},
 		}
-		security := manager.detectNetworkSecurity("NotFound")
+		security := manager.detectNetworkSecurity(context.Background(), "NotFound")
 		assert.Equal(t, "", security)
 	})
 
@@ -705,7 +711,7 @@ freq: 2412
 			logger:   &mockLogger{},
 			linkMgr:  &fake.LinkManager{},
 		}
-		security := manager.detectNetworkSecurity("AnyNetwork")
+		security := manager.detectNetworkSecurity(context.Background(), "AnyNetwork")
 		assert.Equal(t, "", security)
 	})
 
@@ -731,7 +737,7 @@ freq: 5180
 			logger:   &mockLogger{},
 			linkMgr:  &fake.LinkManager{},
 		}
-		security := manager.detectNetworkSecurity("Lanso iPhone")
+		security := manager.detectNetworkSecurity(context.Background(), "Lanso iPhone")
 		assert.Equal(t, "WPA3", security)
 	})
 }
@@ -973,7 +979,7 @@ func TestObtainDHCP(t *testing.T) {
 		dhcpClient := &mockDHCPClient{}
 		manager := &Manager{dhcpClient: dhcpClient, iface: "wlan0"}
 
-		err := manager.obtainDHCP("")
+		err := manager.obtainDHCP(context.Background(), "")
 		assert.NoError(t, err)
 	})
 
@@ -981,7 +987,7 @@ func TestObtainDHCP(t *testing.T) {
 		dhcpClient := &mockDHCPClient{acquireErr: fmt.Errorf("dhcp failed")}
 		manager := &Manager{dhcpClient: dhcpClient, iface: "wlan0"}
 
-		err := manager.obtainDHCP("")
+		err := manager.obtainDHCP(context.Background(), "")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "dhcp failed")
 	})
@@ -1324,7 +1330,7 @@ func TestWaitForAssociationPollingDetectsCrash(t *testing.T) {
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.associationTimeout = 5 * time.Second
 
-		err := manager.waitForAssociation("TestSSID")
+		err := manager.waitForAssociation(context.Background(), "TestSSID")
 
 		assert.Error(t, err)
 		// Should detect crash quickly, not wait the full 5s timeout
@@ -1352,7 +1358,7 @@ func TestWaitForAssociationPollingDetectsCrash(t *testing.T) {
 		manager := NewManager(executor, logger, "wlan0", &mockDHCPClient{})
 		manager.associationTimeout = 5 * time.Second
 
-		err := manager.waitForAssociation("TestSSID")
+		err := manager.waitForAssociation(context.Background(), "TestSSID")
 
 		assert.NoError(t, err)
 	})
@@ -1376,6 +1382,12 @@ func (c *countingExecutor) Execute(cmd string, args ...string) (string, error) {
 		return c.statusFunc(n)
 	}
 	return c.mockSystemExecutor.Execute(cmd, args...)
+}
+
+// ExecuteContext goes through the same scripted status responses: the
+// association wait runs wpa_cli under a context (#89).
+func (c *countingExecutor) ExecuteContext(_ context.Context, cmd string, args ...string) (string, error) {
+	return c.ExecuteWithTimeout(0, cmd, args...)
 }
 
 func (c *countingExecutor) ExecuteWithTimeout(timeout time.Duration, cmd string, args ...string) (string, error) {

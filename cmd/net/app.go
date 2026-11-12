@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -402,7 +403,7 @@ func (a *App) RunConnect(name, password string) error {
 		// flushes addrs/routes, brings the iface down, and removes the temp
 		// wpa config.
 		registerCleanup("abort-connect", func() { _ = a.WiFiMgr.Disconnect() })
-		err = a.WiFiMgr.Connect(name, password, "")
+		err = a.WiFiMgr.Connect(context.Background(), name, password, "")
 		if err != nil {
 			a.Logger.Error("Failed to connect to WiFi", "error", err)
 			a.errorf("Error: %v\n", err)

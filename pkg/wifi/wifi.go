@@ -122,13 +122,17 @@ func (m *Manager) Scan() ([]types.WiFiNetwork, error) {
 }
 
 // Connect connects to a WiFi network without BSSID pinning
-func (m *Manager) Connect(ssid, password, hostname string) error {
-	return m.ConnectWithBSSID(ssid, password, "", hostname)
+func (m *Manager) Connect(ctx context.Context, ssid, password, hostname string) error {
+	return m.ConnectWithBSSID(ctx, ssid, password, "", hostname)
 }
 
 // ConnectWithBSSID connects to a WiFi network with optional BSSID pinning
 // hostname is optional - if provided, it will be sent in DHCP requests without changing system hostname
-func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error {
+//
+// Cancelling ctx (an interrupt) ends the connect promptly: the association
+// wait and DHCP stop, nothing new starts, and the half-made connection is
+// torn down before returning, so interrupt cleanup never races it (#89).
+func (m *Manager) ConnectWithBSSID(ctx context.Context, ssid, password, bssid, hostname string) error {
 	// Validate inputs
 	if err := types.ValidateSSID(ssid); err != nil {
 		return fmt.Errorf("invalid SSID: %w", err)
@@ -140,6 +144,10 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 		if err := types.ValidateHostname(hostname); err != nil {
 			return fmt.Errorf("invalid hostname: %w", err)
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	var err error
@@ -159,7 +167,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 
 	// Detect AP security type from cached scan results to generate the correct
 	// wpa_supplicant config (WPA3 needs SAE key_mgmt and required PMF)
-	security := m.detectNetworkSecurity(ssid)
+	security := m.detectNetworkSecurity(ctx, ssid)
 	if security != "" {
 		m.logger.Debug("Detected AP security type", "ssid", ssid, "security", security)
 	}
@@ -172,6 +180,11 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	// Warn if AP requires encryption but no password was provided
 	if password == "" && (security == "WPA3" || security == "WPA2/WPA3" || security == "WPA2") {
 		m.logger.Warn("Network requires encryption but no password provided - check config file (YAML '#' starts a comment, quote passwords containing '#')", "ssid", ssid, "security", security)
+	}
+
+	// Last point before the connect starts changing the interface.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Create wpa_supplicant config with optional BSSID pinning
@@ -217,18 +230,18 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 
 	// Start wpa_supplicant — ctrl_interface is set in the config file,
 	// don't also pass -C which can conflict and cause crashes with SAE.
-	_, err = m.executor.Execute("wpa_supplicant", "-B", "-i", m.iface, "-c", tempConfig)
+	_, err = system.ExecuteWithin(ctx, m.executor, system.DefaultCommandTimeout, "wpa_supplicant", "-B", "-i", m.iface, "-c", tempConfig)
 	if err != nil {
 		return fmt.Errorf("failed to start wpa_supplicant: %w", err)
 	}
 
 	// Wait for wpa_supplicant to be ready (polls up to 1 second, usually ready in <100ms)
-	if !m.waitForWpaSupplicantReady(1 * time.Second) {
+	if !m.waitForWpaSupplicantReady(ctx, 1*time.Second) {
 		m.logger.Warn("wpa_supplicant may not be fully ready, proceeding anyway")
 	}
 
 	// Wait for association with the access point
-	err = m.waitForAssociation(ssid)
+	err = m.waitForAssociation(ctx, ssid)
 	if err != nil {
 		// Clean up wpa_supplicant on failure (interface-specific)
 		m.terminateWpaSupplicant()
@@ -239,7 +252,7 @@ func (m *Manager) ConnectWithBSSID(ssid, password, bssid, hostname string) error
 	}
 
 	// Get DHCP lease with optional hostname
-	err = m.obtainDHCP(hostname)
+	err = m.obtainDHCP(ctx, hostname)
 	if err != nil {
 		// Clean up wpa_supplicant on failure (interface-specific)
 		m.terminateWpaSupplicant()
@@ -478,9 +491,9 @@ func isValidBSSID(bssid string) bool {
 // Tries cached scan results first (fast), falls back to a fresh scan if
 // the cache is empty (e.g. after interface was cycled for MAC change).
 // Returns "WPA3", "WPA2/WPA3", "WPA2", or "" if not found.
-func (m *Manager) detectNetworkSecurity(ssid string) string {
+func (m *Manager) detectNetworkSecurity(ctx context.Context, ssid string) string {
 	// Try cached results first (instant)
-	if sec := m.findSecurityInScan(ssid, "iw", m.iface, "scan", "dump"); sec != "" {
+	if sec := m.findSecurityInScan(ctx, ssid, "iw", m.iface, "scan", "dump"); sec != "" {
 		return sec
 	}
 
@@ -489,15 +502,15 @@ func (m *Manager) detectNetworkSecurity(ssid string) string {
 	// Ensure interface is up first — SetMAC may have cycled it.
 	m.linkMgr.SetUp(m.iface)
 	// Brief delay for the driver to initialize after interface up
-	time.Sleep(200 * time.Millisecond)
+	_ = system.Sleep(ctx, 200*time.Millisecond)
 	m.logger.Debug("Scan cache empty, running fresh scan for security detection")
-	return m.findSecurityInScan(ssid, "iw", m.iface, "scan")
+	return m.findSecurityInScan(ctx, ssid, "iw", m.iface, "scan")
 }
 
 // findSecurityInScan runs the given iw scan command and returns the security
 // type for the given SSID, or "" if not found.
-func (m *Manager) findSecurityInScan(ssid string, cmd ...string) string {
-	output, err := m.executor.ExecuteWithTimeout(10*time.Second, cmd[0], cmd[1:]...)
+func (m *Manager) findSecurityInScan(ctx context.Context, ssid string, cmd ...string) string {
+	output, err := system.ExecuteWithin(ctx, m.executor, 10*time.Second, cmd[0], cmd[1:]...)
 	if err != nil {
 		m.logger.Debug("Scan failed during security detection", "error", err)
 		return ""
@@ -586,8 +599,8 @@ func (m *Manager) generateWPAConfig(ssid, password string, bssid string, securit
 	return config
 }
 
-func (m *Manager) obtainDHCP(hostname string) error {
-	return m.dhcpClient.Acquire(context.Background(), m.iface, hostname)
+func (m *Manager) obtainDHCP(ctx context.Context, hostname string) error {
+	return m.dhcpClient.Acquire(ctx, m.iface, hostname)
 }
 
 func (m *Manager) getCurrentSSID() (string, error) {
@@ -720,23 +733,25 @@ func (m *Manager) terminateDhcpClients() {
 
 // waitForWpaSupplicantReady polls until wpa_supplicant responds to wpa_cli
 // Returns true if ready within timeout, false otherwise
-func (m *Manager) waitForWpaSupplicantReady(timeout time.Duration) bool {
+func (m *Manager) waitForWpaSupplicantReady(ctx context.Context, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	pollInterval := 50 * time.Millisecond // Fast polling since wpa_supplicant is usually quick
 
 	for time.Now().Before(deadline) {
 		// wpa_cli status returns 0 when wpa_supplicant is responsive
 		// Use 2s timeout - wpa_cli typically responds in <100ms
-		_, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "status")
+		_, err := system.ExecuteWithin(ctx, m.executor, 2*time.Second, "wpa_cli", "-i", m.iface, "status")
 		if err == nil {
 			return true
 		}
-		time.Sleep(pollInterval)
+		if system.Sleep(ctx, pollInterval) != nil {
+			return false
+		}
 	}
 	return false
 }
 
-func (m *Manager) waitForAssociation(expectedSSID string) error {
+func (m *Manager) waitForAssociation(ctx context.Context, expectedSSID string) error {
 	timeout := m.associationTimeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
@@ -744,9 +759,12 @@ func (m *Manager) waitForAssociation(expectedSSID string) error {
 
 	// Try event-based waiting first (faster)
 	start := time.Now()
-	err := m.waitForAssociationEvents(expectedSSID, timeout)
+	err := m.waitForAssociationEvents(ctx, expectedSSID, timeout)
 	if err == nil {
 		return nil
+	}
+	if ctx.Err() != nil {
+		return err // interrupted: do not fall back to polling
 	}
 
 	// Event-based failed (likely wpa_cli doesn't support wait_event), fall back to polling.
@@ -756,14 +774,14 @@ func (m *Manager) waitForAssociation(expectedSSID string) error {
 		return fmt.Errorf("timeout waiting for association with %q", expectedSSID)
 	}
 	m.logger.Debug("Event-based association wait failed, using polling", "error", err, "remaining", remaining)
-	return m.waitForAssociationPolling(expectedSSID, remaining)
+	return m.waitForAssociationPolling(ctx, expectedSSID, remaining)
 }
 
 // waitForAssociationEvents uses wpa_cli wait_event for instant notification
-func (m *Manager) waitForAssociationEvents(expectedSSID string, timeout time.Duration) error {
+func (m *Manager) waitForAssociationEvents(ctx context.Context, expectedSSID string, timeout time.Duration) error {
 	// wpa_cli wait_event blocks until one of the specified events occurs
 	// This is much faster than polling as we get notified immediately
-	output, err := m.executor.ExecuteWithTimeout(timeout, "wpa_cli", "-i", m.iface,
+	output, err := system.ExecuteWithin(ctx, m.executor, timeout, "wpa_cli", "-i", m.iface,
 		"wait_event", "CTRL-EVENT-CONNECTED", "CTRL-EVENT-ASSOC-REJECT",
 		"CTRL-EVENT-DISCONNECTED", "CTRL-EVENT-TEMP-DISABLED", "CTRL-EVENT-AUTH-REJECT")
 
@@ -795,7 +813,7 @@ func (m *Manager) waitForAssociationEvents(expectedSSID string, timeout time.Dur
 }
 
 // waitForAssociationPolling uses polling as a fallback
-func (m *Manager) waitForAssociationPolling(expectedSSID string, timeout time.Duration) error {
+func (m *Manager) waitForAssociationPolling(ctx context.Context, expectedSSID string, timeout time.Duration) error {
 	timeoutCh := time.After(timeout)
 	// Use 300ms poll interval - balances responsiveness with overhead
 	ticker := time.NewTicker(300 * time.Millisecond)
@@ -806,10 +824,12 @@ func (m *Manager) waitForAssociationPolling(expectedSSID string, timeout time.Du
 
 	for {
 		select {
+		case <-ctx.Done():
+			return fmt.Errorf("association wait for %s abandoned: %w", expectedSSID, ctx.Err())
 		case <-timeoutCh:
 			return fmt.Errorf("timeout waiting for association to %s", expectedSSID)
 		case <-ticker.C:
-			associated, reachable := m.checkAssociationStatus(expectedSSID)
+			associated, reachable := m.checkAssociationStatus(ctx, expectedSSID)
 			if associated {
 				m.logger.Debug("Successfully associated with access point", "ssid", expectedSSID)
 				return nil
@@ -829,8 +849,8 @@ func (m *Manager) waitForAssociationPolling(expectedSSID string, timeout time.Du
 // checkAssociationStatus returns (associated, wpaSupplicantReachable).
 // associated is true when the SSID matches and wpa_state=COMPLETED.
 // wpaSupplicantReachable is true when wpa_cli can communicate with wpa_supplicant.
-func (m *Manager) checkAssociationStatus(expectedSSID string) (bool, bool) {
-	output, err := m.executor.ExecuteWithTimeout(2*time.Second, "wpa_cli", "-i", m.iface, "status")
+func (m *Manager) checkAssociationStatus(ctx context.Context, expectedSSID string) (bool, bool) {
+	output, err := system.ExecuteWithin(ctx, m.executor, 2*time.Second, "wpa_cli", "-i", m.iface, "status")
 	if err != nil {
 		return false, false
 	}

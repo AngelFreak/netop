@@ -311,8 +311,10 @@ type PortalDetector interface {
 // WiFiManager handles WiFi operations
 type WiFiManager interface {
 	Scan() ([]WiFiNetwork, error)
-	Connect(ssid, password, hostname string) error
-	ConnectWithBSSID(ssid, password, bssid, hostname string) error
+	// Connect and ConnectWithBSSID associate and obtain a lease. Cancelling ctx
+	// ends them promptly and tears down the half-made connection.
+	Connect(ctx context.Context, ssid, password, hostname string) error
+	ConnectWithBSSID(ctx context.Context, ssid, password, bssid, hostname string) error
 	Disconnect() error
 	ListConnections() ([]Connection, error)
 	GetInterface() string

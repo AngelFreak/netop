@@ -1309,14 +1309,14 @@ func (m *mockWiFiManagerImpl) Scan() ([]types.WiFiNetwork, error) {
 	return nil, nil
 }
 
-func (m *mockWiFiManagerImpl) Connect(ssid, password, hostname string) error {
+func (m *mockWiFiManagerImpl) Connect(_ context.Context, ssid, password, hostname string) error {
 	if m.onConnect != nil {
 		return m.onConnect()
 	}
 	return nil
 }
 
-func (m *mockWiFiManagerImpl) ConnectWithBSSID(ssid, password, bssid, hostname string) error {
+func (m *mockWiFiManagerImpl) ConnectWithBSSID(_ context.Context, ssid, password, bssid, hostname string) error {
 	return nil
 }
 
@@ -1804,11 +1804,11 @@ func (m *mockWiFiManagerFailing) Scan() ([]types.WiFiNetwork, error) {
 	return nil, assert.AnError
 }
 
-func (m *mockWiFiManagerFailing) Connect(ssid, password, hostname string) error {
+func (m *mockWiFiManagerFailing) Connect(_ context.Context, ssid, password, hostname string) error {
 	return assert.AnError
 }
 
-func (m *mockWiFiManagerFailing) ConnectWithBSSID(ssid, password, bssid, hostname string) error {
+func (m *mockWiFiManagerFailing) ConnectWithBSSID(_ context.Context, ssid, password, bssid, hostname string) error {
 	return assert.AnError
 }
 

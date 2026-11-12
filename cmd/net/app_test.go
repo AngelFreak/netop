@@ -132,11 +132,11 @@ func (w *testWiFiManager) Scan() ([]types.WiFiNetwork, error) {
 	return w.networks, nil
 }
 
-func (w *testWiFiManager) Connect(ssid, password, hostname string) error {
+func (w *testWiFiManager) Connect(_ context.Context, ssid, password, hostname string) error {
 	return w.connectErr
 }
 
-func (w *testWiFiManager) ConnectWithBSSID(ssid, password, bssid, hostname string) error {
+func (w *testWiFiManager) ConnectWithBSSID(_ context.Context, ssid, password, bssid, hostname string) error {
 	return w.connectErr
 }
 
@@ -2093,7 +2093,7 @@ type interruptingWiFiManager struct {
 	reg *cleanupRegistry
 }
 
-func (w *interruptingWiFiManager) Connect(ssid, password, hostname string) error {
+func (w *interruptingWiFiManager) Connect(_ context.Context, ssid, password, hostname string) error {
 	w.reg.run(time.Second) // interrupt fires mid-connect
 	return w.connectErr
 }
