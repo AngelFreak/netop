@@ -112,8 +112,11 @@ func TestConnectToConfiguredNetwork_DHCPDNSAfterOwnedDNSTakesLeaseServers(t *tes
 	}
 }
 
-// Production wiring: both sides default to the same marker path.
+// Production wiring: both sides default to the same marker path. NewManager
+// uses the package default, which outside tests is the marker the udhcpc
+// script and dhclient hook check (tests point it at a temp dir, see TestMain).
 func TestDNSOwnership_DefaultMarkerIsSharedWithUdhcpcScript(t *testing.T) {
 	m := NewManager(newMockExecutor(), &mockLogger{}, nil)
-	assert.Equal(t, types.DNSOwnedPath, m.dnsOwnedPath())
+	assert.Equal(t, defaultDNSOwned, m.dnsOwnedPath())
+	assert.Equal(t, types.DNSOwnedPath, productionDNSOwned)
 }
