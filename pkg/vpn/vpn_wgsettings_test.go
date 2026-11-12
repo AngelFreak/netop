@@ -142,6 +142,7 @@ func (f *fakeNetworkManager) ClearDNS() error                                   
 func (f *fakeNetworkManager) ClearDNSIfOwned() (bool, error)                      { return false, nil }
 func (f *fakeNetworkManager) LockDNS()                                            {}
 func (f *fakeNetworkManager) UnlockDNS() error                                    { return nil }
+func (f *fakeNetworkManager) PinDNSRoutes(iface string)                           {}
 func (f *fakeNetworkManager) SetMAC(iface, mac string) error                      { return nil }
 func (f *fakeNetworkManager) GetMAC(iface string) (string, error)                 { return "", nil }
 func (f *fakeNetworkManager) SetIP(iface, addr, gateway string, metric int) error { return nil }

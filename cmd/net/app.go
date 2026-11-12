@@ -417,6 +417,10 @@ func (a *App) RunConnect(name, password string) error {
 		// no claim that a later `net stop` would act on.
 		registerCleanup("unlock-resolv.conf", func() { _ = a.NetworkMgr.UnlockDNS() })
 
+		// The lease's DNS servers must be reached through this link even when
+		// a local subnet (Docker bridge, VM network) covers their address.
+		a.NetworkMgr.PinDNSRoutes(connectedIface)
+
 		// Lock resolv.conf after DHCP writes DNS to prevent external tools
 		// (like netbird) from overwriting with their own DNS servers
 		a.NetworkMgr.LockDNS()

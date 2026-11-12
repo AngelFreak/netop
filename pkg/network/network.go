@@ -233,6 +233,71 @@ func (m *Manager) unlockResolvConf() error {
 	return m.immutable(m.resolvConf(), false)
 }
 
+// PinDNSRoutes makes the DNS servers a DHCP lease on iface supplied reachable
+// through iface. Such a server belongs to that network, but when it is not on
+// the connected subnet the kernel picks its path by longest prefix, and an
+// unrelated local subnet covering the address (a Docker bridge on
+// 172.18.0.0/16, say) swallows every query: the lease is fine and nothing
+// resolves, so a captive portal never loads. For each server in that
+// position a host route via iface's gateway is installed; it lives on iface
+// and goes away when the interface's routes are flushed. Servers reached
+// through the default route or on iface's own subnet are left alone.
+// Best-effort: failures are logged and never fail the connect.
+func (m *Manager) PinDNSRoutes(iface string) {
+	servers, err := m.GetDNS()
+	if err != nil || len(servers) == 0 {
+		return
+	}
+	routes, err := m.routeMgr.ListRoutes()
+	if err != nil {
+		m.logger.Debug("Cannot check DNS server routes", "error", err)
+		return
+	}
+	for _, server := range servers {
+		ip := net.ParseIP(server).To4()
+		if ip == nil {
+			continue // IPv6 or unparsable: ListRoutes covers the IPv4 main table only
+		}
+		shadow := mostSpecificRoute(routes, ip)
+		if shadow == nil || shadow.Iface == iface {
+			continue
+		}
+		gateway, err := m.routeMgr.GetDefaultRouteForIface(iface)
+		if err != nil {
+			m.logger.Warn("DNS server from DHCP is routed to another interface and there is no gateway to route it through",
+				"server", server, "interface", iface, "route", shadow.Dst, "routedVia", shadow.Iface)
+			continue
+		}
+		if err := m.routeMgr.ReplaceRoute(iface, server+"/32", gateway.Gw); err != nil {
+			m.logger.Warn("Failed to route DNS server via the connected interface",
+				"server", server, "interface", iface, "error", err)
+			continue
+		}
+		m.logger.Warn("DNS server from DHCP overlaps a local subnet; routing it via the connected interface. Other addresses in that subnet still go to the local one",
+			"server", server, "interface", iface, "subnet", shadow.Dst, "subnetInterface", shadow.Iface)
+	}
+}
+
+// mostSpecificRoute returns the non-default route with the longest prefix
+// that covers ip, or nil when only a default route (or nothing) does.
+func mostSpecificRoute(routes []types.Route, ip net.IP) *types.Route {
+	var best *types.Route
+	bestLen := -1
+	for i := range routes {
+		if routes[i].IsDefault() {
+			continue
+		}
+		_, dst, err := net.ParseCIDR(routes[i].Dst)
+		if err != nil || !dst.Contains(ip) {
+			continue
+		}
+		if ones, _ := dst.Mask.Size(); ones > bestLen {
+			best, bestLen = &routes[i], ones
+		}
+	}
+	return best
+}
+
 // resolvConfHasNameserver reports whether /etc/resolv.conf currently contains
 // at least one active "nameserver" line (ignoring comments/blank lines).
 func (m *Manager) resolvConfHasNameserver() bool {
@@ -1080,6 +1145,9 @@ func (m *Manager) ConnectToConfiguredNetwork(config *types.NetworkConfig, passwo
 	// with zero nameservers and an immutable file.
 	if useDHCPForDNS {
 		if m.resolvConfHasNameserver() {
+			// The lease's servers must be reached through this link even when
+			// a local subnet (Docker bridge, VM network) covers their address.
+			m.PinDNSRoutes(config.Interface)
 			// LockDNS marks ownership so ClearDNS/net stop can later unlock it.
 			// A raw chattr +i here would leave resolv.conf immutable forever.
 			m.LockDNS()

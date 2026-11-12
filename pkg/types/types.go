@@ -339,6 +339,10 @@ type NetworkManager interface {
 	// /etc/resolv.conf and drops netop's ownership marker. Used when a connect
 	// is aborted so a later `net stop` does not believe netop still owns DNS.
 	UnlockDNS() error
+	// PinDNSRoutes routes the DNS servers a DHCP lease on iface supplied via
+	// iface when a more specific route on another interface (an overlapping
+	// local subnet) would otherwise capture them. Best-effort.
+	PinDNSRoutes(iface string)
 	SetMAC(iface, mac string) error
 	GetMAC(iface string) (string, error)
 	SetIP(iface, addr, gateway string, metric int) error
