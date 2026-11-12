@@ -463,7 +463,7 @@ func (a *App) RunConnect(name, password string) error {
 			}
 		})
 		registerCleanup("unlock-resolv.conf", func() { _ = a.NetworkMgr.UnlockDNS() })
-		err = a.NetworkMgr.ConnectToConfiguredNetwork(networkConfig, password, a.WiFiMgr)
+		err = a.NetworkMgr.ConnectToConfiguredNetwork(context.Background(), networkConfig, password, a.WiFiMgr)
 		if err != nil {
 			a.Logger.Error("Failed to connect to configured network", "error", err)
 			a.errorf("Error: %v\n", err)

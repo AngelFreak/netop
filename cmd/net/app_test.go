@@ -244,7 +244,7 @@ func (n *testNetworkManager) DHCPRenew(iface, hostname string) error {
 	return n.dhcpErr
 }
 
-func (n *testNetworkManager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
+func (n *testNetworkManager) ConnectToConfiguredNetwork(_ context.Context, config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	// Simulate real behavior: auto-detect sets config.Interface
 	if config.Interface == "" {
 		if config.SSID != "" {
@@ -264,7 +264,7 @@ func (n *testNetworkManager) FlushRoutes(iface string) error {
 	return nil
 }
 
-func (n *testNetworkManager) StartDHCP(iface string, hostname string) error {
+func (n *testNetworkManager) StartDHCP(_ context.Context, iface string, hostname string) error {
 	return nil
 }
 
@@ -2176,7 +2176,7 @@ type interruptingNetworkManager struct {
 	reg *cleanupRegistry
 }
 
-func (n *interruptingNetworkManager) ConnectToConfiguredNetwork(config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
+func (n *interruptingNetworkManager) ConnectToConfiguredNetwork(_ context.Context, config *types.NetworkConfig, password string, wifiMgr types.WiFiManager) error {
 	if config.SSID != "" {
 		config.Interface = "wlan0"
 	} else {

@@ -350,9 +350,11 @@ type NetworkManager interface {
 	SetIP(iface, addr, gateway string, metric int) error
 	AddRoute(iface, destination, gateway string) error
 	FlushRoutes(iface string) error
-	StartDHCP(iface string, hostname string) error
+	StartDHCP(ctx context.Context, iface string, hostname string) error
 	DHCPRenew(iface string, hostname string) error
-	ConnectToConfiguredNetwork(config *NetworkConfig, password string, wifiMgr WiFiManager) error
+	// ConnectToConfiguredNetwork brings up a configured network. Cancelling ctx
+	// ends it promptly and stops before addresses, routes and DNS.
+	ConnectToConfiguredNetwork(ctx context.Context, config *NetworkConfig, password string, wifiMgr WiFiManager) error
 	GetConnectionInfo(iface string) (*Connection, error)
 	// Disconnect releases DHCP, flushes addresses/routes, and brings the link down
 	// for a single interface. Safe to call on an already-down interface.
